@@ -27,14 +27,12 @@ app.post("/send-otp", async (req, res) => {
   }
 
   const otp = Math.floor(100000 + Math.random() * 900000);
-
-  // ✅ Save OTP
   otpStore[email] = otp;
 
   console.log(`OTP for ${email}: ${otp}`);
 
   try {
-    await transporter.sendMail({
+    const info = await transporter.sendMail({
       from: '"Process Finder System" <processfinder.rts@gmail.com>',
       to: email,
       subject: "[Process Finder] Your OTP Code",
@@ -52,13 +50,20 @@ Regards,
 Process Finder Team`
     });
 
+    console.log("✅ Email sent:", info.response);
+
     res.json({ success: true });
 
   } catch (err) {
-    console.error("Email send error:", err);
-    res.status(500).json({ error: "Failed to send OTP email" });
+    console.error("❌ Email error:", err);
+
+    res.status(500).json({
+      error: "Email failed",
+      details: err.message
+    });
   }
 });
+
 
 // ✅ VERIFY OTP
 app.post("/verify-otp", (req, res) => {
