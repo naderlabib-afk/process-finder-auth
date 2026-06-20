@@ -14,7 +14,7 @@ const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
     user: "processfinder.rts@gmail.com",
-    pass: "YOUR_APP_PASSWORD_HERE" // 🔴 replace this
+    pass: "jkyzuahmqwepdjro" // 🔴 replace this
   }
 });
 
