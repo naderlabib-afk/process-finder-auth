@@ -1,28 +1,16 @@
 const express = require("express");
 const cors = require("cors");
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// ✅ Store OTPs temporarily (in-memory)
+// ✅ Temporary OTP storage
 let otpStore = {};
 
-// ✅ Configure Gmail transporter
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false,
-  auth: {
-    user: "processfinder.rts@gmail.com",
-    pass: "jkyzuahmqwepdjro"
-  },
-  connectionTimeout: 10000, // ✅ 10 seconds
-  greetingTimeout: 10000,
-  socketTimeout: 10000
-});
-
+// ✅ Your Resend API key
+const resend = new Resend("re_Box5mtoF_QBTuqKKhJbLXZNXBhLK8txTC");
 
 // ✅ SEND OTP
 app.post("/send-otp", async (req, res) => {
@@ -38,8 +26,8 @@ app.post("/send-otp", async (req, res) => {
   console.log(`OTP for ${email}: ${otp}`);
 
   try {
-    const info = await transporter.sendMail({
-      from: '"Process Finder System" <processfinder.rts@gmail.com>',
+    const { data, error } = await resend.emails.send({
+      from: "Process Finder <onboarding@resend.dev>",
       to: email,
       subject: "[Process Finder] Your OTP Code",
       text: `Hello,
@@ -56,20 +44,20 @@ Regards,
 Process Finder Team`
     });
 
-    console.log("✅ Email sent:", info.response);
+    if (error) {
+      console.error("❌ Resend error:", error);
+      return res.status(500).json({ error: "Email failed" });
+    }
+
+    console.log("✅ Email sent successfully via Resend");
 
     res.json({ success: true });
 
   } catch (err) {
-    console.error("❌ Email error:", err);
-
-    res.status(500).json({
-      error: "Email failed",
-      details: err.message
-    });
+    console.error("❌ Exception:", err);
+    res.status(500).json({ error: err.message });
   }
 });
-
 
 // ✅ VERIFY OTP
 app.post("/verify-otp", (req, res) => {
@@ -79,10 +67,8 @@ app.post("/verify-otp", (req, res) => {
     return res.status(400).json({ error: "Missing email or OTP" });
   }
 
-  // ✅ Check OTP
   if (otpStore[email] && otpStore[email] == otp) {
-    delete otpStore[email]; // ✅ remove after use
-
+    delete otpStore[email]; // ✅ one-time use
     return res.json({
       success: true,
       message: "OTP verified successfully"
