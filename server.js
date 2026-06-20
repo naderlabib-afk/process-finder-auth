@@ -13,12 +13,16 @@ let otpStore = {};
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
   port: 587,
-  secure: false, // ✅ important
+  secure: false,
   auth: {
     user: "processfinder.rts@gmail.com",
     pass: "jkyzuahmqwepdjro"
-  }
+  },
+  connectionTimeout: 10000, // ✅ 10 seconds
+  greetingTimeout: 10000,
+  socketTimeout: 10000
 });
+
 
 // ✅ SEND OTP
 app.post("/send-otp", async (req, res) => {
