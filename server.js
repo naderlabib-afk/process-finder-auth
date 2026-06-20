@@ -21,16 +21,16 @@ app.post("/send-otp", async (req, res) => {
   }
 
   const otp = Math.floor(100000 + Math.random() * 900000);
-  otpStore[email] = otp;
+otpStore[email] = otp;
 
-  console.log(`OTP for ${email}: ${otp}`);
+console.log(`OTP for ${email}: ${otp}`);
 
-  try {
-    const { data, error } = await resend.emails.send({
-      from: "Process Finder <onboarding@resend.dev>",
-      to: email,
-      subject: "[Process Finder] Your OTP Code",
-      text: `Hello,
+try {
+  const { data, error } = await resend.emails.send({
+    from: "Process Finder <noreply@processfinder.xyz>",
+    to: email,
+    subject: "[Process Finder] Your OTP Code",
+    text: `Hello,
 
 Your verification code is:
 
@@ -42,7 +42,7 @@ If you did not request this, please ignore this email.
 
 Regards,
 Process Finder Team`
-    });
+  });
 
     if (error) {
       console.error("❌ Resend error:", error);
