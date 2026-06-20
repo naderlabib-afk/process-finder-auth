@@ -11,10 +11,12 @@ let otpStore = {};
 
 // ✅ Configure Gmail transporter
 const transporter = nodemailer.createTransport({
-  service: "gmail",
+  host: "smtp.gmail.com",
+  port: 587,
+  secure: false, // ✅ important
   auth: {
     user: "processfinder.rts@gmail.com",
-    pass: "jkyzuahmqwepdjro" // 🔴 replace this
+    pass: "jkyzuahmqwepdjro"
   }
 });
 
