@@ -13,7 +13,7 @@ let otpStore = {};
 const resend = new Resend("re_Box5mtoF_QBTuqKKhJbLXZNXBhLK8txTC");
 
 // ✅ Your USERS.JSON URL (IMPORTANT: adjust if needed)
-const USERS_URL = "https://pages.github.ibm.com/NLABIB/process-finder/dev/config/users.json";
+const USERS_URL = "https://pages.github.ibm.com/NLABIB/process-finder/config/users.json";
 
 // ✅ SEND OTP
 app.post("/send-otp", async (req, res) => {
