@@ -13,9 +13,6 @@ let otpStore = {};
 // ✅ Your Resend API key
 const resend = new Resend("re_Box5mtoF_QBTuqKKhJbLXZNXBhLK8txTC");
 
-// ✅ Your USERS.JSON URL (IMPORTANT: adjust if needed)
-const USERS_URL = "https://pages.github.ibm.com/NLABIB/process-finder/config/users.json";
-
 // ✅ SEND OTP
 app.post("/send-otp", async (req, res) => {
   const { email } = req.body;
@@ -27,25 +24,12 @@ app.post("/send-otp", async (req, res) => {
   const normalizedEmail = email.trim().toLowerCase();
 
   try {
-    // ✅ ✅ STEP 1: FETCH users.json
+    // ✅ Load users from LOCAL file
     const users = JSON.parse(
-  fs.readFileSync("./users.json", "utf-8")
-);
+      fs.readFileSync("./users.json", "utf-8")
+    );
 
-const user = users.find(
-  u => u.email.toLowerCase() === normalizedEmail
-);
-
-if (!user || !["OL", "Manager", "Admin"].includes(user.role)) {
-  console.log(`🚫 Unauthorized OTP request: ${normalizedEmail}`);
-
-  return res.status(403).json({
-    error: "Unauthorized email"
-  });
-}
-    const users = await usersRes.json();
-
-    // ✅ ✅ STEP 2: VALIDATE USER
+    // ✅ Validate user
     const user = users.find(
       u => u.email.toLowerCase() === normalizedEmail
     );
@@ -58,14 +42,14 @@ if (!user || !["OL", "Manager", "Admin"].includes(user.role)) {
       });
     }
 
-    // ✅ ✅ STEP 3: GENERATE OTP (ONLY VALID USERS)
+    // ✅ Generate OTP
     const otp = Math.floor(100000 + Math.random() * 900000);
 
     otpStore[normalizedEmail] = otp;
 
     console.log(`OTP for ${normalizedEmail}: ${otp}`);
 
-    // ✅ ✅ STEP 4: SEND EMAIL
+    // ✅ Send email
     const { data, error } = await resend.emails.send({
       from: "Process Finder <noreply@processfinder.xyz>",
       to: normalizedEmail,
@@ -86,7 +70,10 @@ Process Finder Team`
 
     if (error) {
       console.error("❌ Resend error:", error);
-      return res.status(500).json({ error: "Email failed" });
+
+      return res.status(500).json({
+        error: "Email failed"
+      });
     }
 
     console.log("✅ Email sent successfully via Resend");
@@ -95,7 +82,10 @@ Process Finder Team`
 
   } catch (err) {
     console.error("❌ Exception:", err);
-    res.status(500).json({ error: err.message });
+
+    res.status(500).json({
+      error: "Server error"
+    });
   }
 });
 
@@ -104,7 +94,9 @@ app.post("/verify-otp", (req, res) => {
   const { email, otp } = req.body;
 
   if (!email || !otp) {
-    return res.status(400).json({ error: "Missing email or OTP" });
+    return res.status(400).json({
+      error: "Missing email or OTP"
+    });
   }
 
   const normalizedEmail = email.trim().toLowerCase();
@@ -131,6 +123,7 @@ app.get("/", (req, res) => {
 
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
 });
