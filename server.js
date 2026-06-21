@@ -12,6 +12,9 @@ let otpStore = {};
 // ✅ Your Resend API key
 const resend = new Resend("re_Box5mtoF_QBTuqKKhJbLXZNXBhLK8txTC");
 
+// ✅ Your USERS.JSON URL (IMPORTANT: adjust if needed)
+const USERS_URL = "https://pages.github.ibm.com/NLABIB/process-finder/dev/config/users.json";
+
 // ✅ SEND OTP
 app.post("/send-otp", async (req, res) => {
   const { email } = req.body;
@@ -20,17 +23,39 @@ app.post("/send-otp", async (req, res) => {
     return res.status(400).json({ error: "Email is required" });
   }
 
-  const otp = Math.floor(100000 + Math.random() * 900000);
-otpStore[email] = otp;
+  const normalizedEmail = email.trim().toLowerCase();
 
-console.log(`OTP for ${email}: ${otp}`);
+  try {
+    // ✅ ✅ STEP 1: FETCH users.json
+    const usersRes = await fetch(USERS_URL + "?t=" + Date.now());
+    const users = await usersRes.json();
 
-try {
-  const { data, error } = await resend.emails.send({
-    from: "Process Finder <noreply@processfinder.xyz>",
-    to: email,
-    subject: "[Process Finder] Your OTP Code",
-    text: `Hello,
+    // ✅ ✅ STEP 2: VALIDATE USER
+    const user = users.find(
+      u => u.email.toLowerCase() === normalizedEmail
+    );
+
+    if (!user || !["OL", "Manager", "Admin"].includes(user.role)) {
+      console.log(`🚫 Unauthorized OTP request: ${normalizedEmail}`);
+
+      return res.status(403).json({
+        error: "Unauthorized email"
+      });
+    }
+
+    // ✅ ✅ STEP 3: GENERATE OTP (ONLY VALID USERS)
+    const otp = Math.floor(100000 + Math.random() * 900000);
+
+    otpStore[normalizedEmail] = otp;
+
+    console.log(`OTP for ${normalizedEmail}: ${otp}`);
+
+    // ✅ ✅ STEP 4: SEND EMAIL
+    const { data, error } = await resend.emails.send({
+      from: "Process Finder <noreply@processfinder.xyz>",
+      to: normalizedEmail,
+      subject: "[Process Finder] Your OTP Code",
+      text: `Hello,
 
 Your verification code is:
 
@@ -42,7 +67,7 @@ If you did not request this, please ignore this email.
 
 Regards,
 Process Finder Team`
-  });
+    });
 
     if (error) {
       console.error("❌ Resend error:", error);
@@ -67,8 +92,11 @@ app.post("/verify-otp", (req, res) => {
     return res.status(400).json({ error: "Missing email or OTP" });
   }
 
-  if (otpStore[email] && otpStore[email] == otp) {
-    delete otpStore[email]; // ✅ one-time use
+  const normalizedEmail = email.trim().toLowerCase();
+
+  if (otpStore[normalizedEmail] && otpStore[normalizedEmail] == otp) {
+    delete otpStore[normalizedEmail]; // ✅ one-time use
+
     return res.json({
       success: true,
       message: "OTP verified successfully"
