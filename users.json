@@ -1,1 +1,37 @@
-
+[
+  {
+    "email": "nlabib@eg.ibm.com",
+    "name": "Nader Labib",
+    "role": "Admin"
+  },
+  {
+    "email": "ahmedabd@eg.ibm.com",
+    "name": "Ahmed Abdul Hamid",
+    "role": "OL",
+    "countries": ["italy"]
+  },
+  {
+    "email": "aalsaqqa@eg.ibm.com",
+    "name": "Ahmed El Sakka",
+    "role": "OL",
+    "countries": ["spain"]
+  },
+  {
+    "email": "narges.rabie.saad@ibm.com",
+    "name": "Narges Rabie Saad",
+    "role": "OL",
+    "countries": ["turkey", "mea"]
+  },
+  {
+    "email": "bassel.mohamed@ibm.com",
+    "name": "Bassel Ayman",
+    "role": "OL",
+    "countries": ["uk"]
+  },
+  {
+    "email": "madboush@eg.ibm.com",
+    "name": "Sherif Madbouly",
+    "role": "Manager",
+    "countries": ["france", "italy", "spain", "turkey", "mea", "uk"]
+  }
+]
