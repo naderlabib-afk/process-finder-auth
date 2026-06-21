@@ -1,3 +1,4 @@
+const fs = require("fs");
 const express = require("express");
 const cors = require("cors");
 const { Resend } = require("resend");
@@ -27,7 +28,21 @@ app.post("/send-otp", async (req, res) => {
 
   try {
     // ✅ ✅ STEP 1: FETCH users.json
-    const usersRes = await fetch(USERS_URL + "?t=" + Date.now());
+    const users = JSON.parse(
+  fs.readFileSync("./users.json", "utf-8")
+);
+
+const user = users.find(
+  u => u.email.toLowerCase() === normalizedEmail
+);
+
+if (!user || !["OL", "Manager", "Admin"].includes(user.role)) {
+  console.log(`🚫 Unauthorized OTP request: ${normalizedEmail}`);
+
+  return res.status(403).json({
+    error: "Unauthorized email"
+  });
+}
     const users = await usersRes.json();
 
     // ✅ ✅ STEP 2: VALIDATE USER
