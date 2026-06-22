@@ -1,3 +1,4 @@
+const { getUsersFromGitHub } = require("./services/github");
 const express = require("express");
 const cors = require("cors");
 const { Resend } = require("resend");
@@ -101,6 +102,27 @@ app.post("/verify-otp", (req, res) => {
 
 app.get("/", (req, res) => {
   res.send("✅ API running (OTP service active)");
+});
+// ✅ TEST: Fetch users from GitHub
+app.get("/test-users", async (req, res) => {
+  try {
+    const users = await getUsersFromGitHub();
+
+    console.log("✅ Users from GitHub:", users);
+
+    res.json({
+      success: true,
+      users
+    });
+
+  } catch (error) {
+    console.error("❌ Error fetching users:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch users"
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
