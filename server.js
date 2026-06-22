@@ -105,6 +105,25 @@ app.post("/verify-otp", (req, res) => {
 app.get("/", (req, res) => {
   res.send("✅ API running (OTP service active)");
 });
+// ✅ ✅ WHOAMI (auto-detect IBM user)
+app.get("/whoami", (req, res) => {
+
+  // Try common IBM SSO headers
+  const email =
+    req.headers["x-forwarded-user"] ||
+    req.headers["x-remote-user"] ||
+    req.headers["iv-user"] ||
+    null;
+
+  console.log("🔎 WHOAMI headers check:");
+  console.log("x-forwarded-user:", req.headers["x-forwarded-user"]);
+  console.log("x-remote-user:", req.headers["x-remote-user"]);
+  console.log("iv-user:", req.headers["iv-user"]);
+
+  res.json({
+    email: email
+  });
+});
 
 // ✅ TEST USERS (keep for debugging ✅)
 app.get("/test-users", async (req, res) => {
