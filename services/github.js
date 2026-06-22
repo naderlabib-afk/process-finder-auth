@@ -16,18 +16,28 @@ async function getUsersFromGitHub() {
       }
     );
 
+    // ✅ FIX 1: Handle HTTP errors properly
+    if (!response.ok) {
+      throw new Error(`GitHub API error: ${response.status}`);
+    }
+
     const data = await response.json();
 
+    // ✅ Validate response structure
     if (!data.content) {
-      throw new Error("Invalid response from GitHub");
+      throw new Error("Invalid response from GitHub (missing content)");
     }
 
     // ✅ Decode base64 content
     const decoded = Buffer.from(data.content, "base64").toString("utf-8");
 
-    const users = JSON.parse(decoded);
+    const parsed = JSON.parse(decoded);
 
-    return users;
+    // ✅ FIX 2: Normalize structure (VERY IMPORTANT)
+    // Ensures frontend always receives { users: [...] }
+    return Array.isArray(parsed)
+      ? { users: parsed }
+      : parsed;
 
   } catch (error) {
     console.error("❌ GitHub fetch error:", error);
@@ -36,4 +46,3 @@ async function getUsersFromGitHub() {
 }
 
 module.exports = { getUsersFromGitHub };
-
