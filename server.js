@@ -7,6 +7,11 @@ const crypto = require('crypto');
 const fetch = require('node-fetch');
 
 const app = express();
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 const port = process.env.PORT || 3000;
 const dataRoot = path.join(__dirname, 'data');
 const configRoot = path.join(__dirname, 'config');
