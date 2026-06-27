@@ -44,16 +44,11 @@ const TOKEN_TTL = 8 * 60 * 60;
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 // Restrict to your IBM GHE Pages origin in production via CORS_ORIGIN env var.
 // Default allows all during local development.
-const corsOptions = process.env.CORS_ORIGIN
-  ? { origin: process.env.CORS_ORIGIN }
-  : {};
-app.use(cors(corsOptions));
+
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname)));
-
 // ─── Minimal JWT helpers (no external dependency) ────────────────────────────
 // Format: base64url(header).base64url(payload).base64url(signature)
-
 function b64url(buf) {
   return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 }
