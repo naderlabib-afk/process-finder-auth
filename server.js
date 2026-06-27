@@ -1,5 +1,4 @@
 const express = require('express');
-const cors = require('cors');
 const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
@@ -7,15 +6,17 @@ const crypto = require('crypto');
 const fetch = require('node-fetch');
 
 const app = express();
-app.use(cors({
-  origin: function(origin, callback) {
-    console.log('[CORS] Origin:', origin);
-    callback(null, origin || '*');
-  },
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+
+  next();
+});
 const port = process.env.PORT || 3000;
 const dataRoot = path.join(__dirname, 'data');
 const configRoot = path.join(__dirname, 'config');
