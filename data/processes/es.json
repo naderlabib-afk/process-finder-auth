@@ -1,0 +1,118 @@
+{
+  "lastUpdated": "2026-06-26T16:29:57.858Z",
+  "country": "es",
+  "processes": [
+    {
+      "category": "Location",
+      "machineType": "",
+      "issue": "Andorra",
+      "process": "No CRU parts allowed for Andorra. We only handle Andabank and Morabank. The rest of customers are being handled by France.",
+      "id": "es_20260610_1011_001"
+    },
+    {
+      "category": "Machine Type",
+      "machineType": "6415 6559 6682 6684 7D1S 7D5J 7D8P 7D9J 7DB4 7DHN",
+      "issue": "Brocade Gen2",
+      "process": "Wrong routing in Lenovo web for Brocade Gen2 tickets:\nTeam,\nIf you see any of the below Brocade MT in MSD, this was routed mistakenly, tickets created in Lenovo web for MTs listed below will land in OCPM and moved to CSP for Brocade gen2\nteam to handle\n\n6415\n6559\n6682\n6684\n7D1S\n7D5J\n7D8P\n7D9J\n7DB4\n7DHN",
+      "id": "es_20260610_1011_002"
+    },
+    {
+      "category": "Customer",
+      "machineType": "7D7M / 1410",
+      "issue": "BSC",
+      "process": "BSC – Barcelona Supercomputing Center\nBSC is the largest client in Spain and follows a specific process:\n•\tAll cases must be submitted with an SSR.\n•\tNo CRU parts should be shipped to the customer. All parts must be delivered to the designated Lenovo PUDO.\n•\tThe PUDO is automatically selected for this client:\no\tFNX-ESTANC TABACS PEDRALBES\nCALLE ALFAMBRA 15 LOCAL\nBARCELONA – 08034\n•\tNo need to confirm the address with the customer. All servers are located within the same data center:\n•\tPlaça d'Eusebi Güell, 1-3 – Barcelona – 08034",
+      "id": "es_20260610_1011_003"
+    },
+    {
+      "category": "Part",
+      "machineType": "All",
+      "issue": "CDU support",
+      "process": "Hello Team,\nKindly be informed that Any CDU issue is out of scope for IBM, Premier Support, or other Delivery teams. Vertiv is the CDU manufacturer.\n\nWhenever you have a case for a CDU, please refer client to his Lenovo HPC sales and include Lenovo SDM and then cancel the case. No need to PD with the customer or ask him for\nany details related to the CDU.\n\nThe information in Glosse LINK refers to CUD support team, however this team is not responding at all and doesn’t provide any support.\nhttps://glosse4lenovo.lenovo.com/wiki/glosse4lenovo/view/Pages/MREF/ThinkSystem/Rack Cabinets/MREF_Neptune_DWC_InRackCoolantDistributionUnit /\n\nPlease note that CDU devices are not Lenovo branded. Most of them are Cooltera branded and are covered by a separate support model, which means they should not be handled by Lenovo\nISG support.\nPlease review the evidence and the handling process below. In case of any discussion, disagreement, or concerns raised by the customer when you share this process,\nplease involve your local Lenovo Country SDM for alignment and support.",
+      "id": "es_20260610_1011_004"
+    },
+    {
+      "category": "Location",
+      "machineType": "All",
+      "issue": "Ceuta & Melilla",
+      "process": "Ceuta & Melilla\n•\tAll CRU and Onsite cases for Ceuta & Melilla are handled by the Spain team.\n•\tNo customs issues are expected for parts shipped from Spain.\n•\tMelilla has an IBM office available for onsite support.",
+      "id": "es_20260610_1011_005"
+    },
+    {
+      "category": "Part",
+      "machineType": "all",
+      "issue": "CMOS Battery replacement",
+      "process": "Eva Schoos has given out a new guideline applicable as of now, that CMOS batteries will no longer (as she stated July last year, see screenshot from her email)\nhandled as CRU/ONS.New guideline:\n\n• CMOS batteries as CRU only (regardless of warranty or maintenance)\n• if customer requests ONS this requires OVD approval by SDM",
+      "id": "es_20260610_1011_006"
+    },
+    {
+      "category": "Contract",
+      "machineType": "All",
+      "issue": "Gibraltar Process",
+      "process": "Gibraltar\n•\tCases for Gibraltar are managed by the UKI team. Premier cases are handled by LSPOC.\n•\tThe case must be opened under country: UK, not Spain.\n•\tNo MSD changes are required. The country code and contract type (Standard vs Premier) will automatically route the case to the correct team.\n•\tNo CRU parts for Gibraltar.\n•\tAll parts (including ONS) must be ordered and shipped to the Lenovo ASP address in Málaga. They must not be shipped directly to UKI or Gibraltar.\n•\tThe ASP is responsible for cross-border delivery to Gibraltar.\n•\tASP contact details and shipping address will be available in the MSD case. Once “Ship to Customer: No” is selected, the system will populate the correct ASP address in Málaga for onsite coordination.",
+      "id": "es_20260610_1011_007"
+    },
+    {
+      "category": "Part",
+      "machineType": "all",
+      "issue": "Low-cost disc",
+      "process": "Update Golden Rules: Low-cost disc* and obvious error policy:\nfor the avoidance of doubt what a low-cost disc is, the golden rules have been updated accordingly here: https://w3.ibm.com/w3publisher/lenovo-isg/process-documents/ibm-rts-golden-rules\nThe idea behind was that whenever an issue is obvious, the customer has technical expertise we trust.\nwe do not expect customer to provide logs but just send the disc, as we have seen complaints at that time when we discussed about the request of logs even though the issue was obvious.",
+      "id": "es_20260610_1011_008"
+    },
+    {
+      "category": "Location",
+      "machineType": "All",
+      "issue": "Malta",
+      "process": "Malta\n•\tMalta cases are handled by the Spain team to avoid managing an additional queue.\n•\tCommunication and documentation for Malta must be in English, not Spanish.\n•\tParts are shipped only to the BP partner in Malta, who is responsible for final delivery to the end user.\nShipping Address:\nPHILIP TOLEDO LIMITED\n1923, Valletta Road\nMarsa, Malta\nMRS3000\nContact: Damian Sciberras\nPhone: +356 2144 5566",
+      "id": "es_20260610_1011_009"
+    },
+    {
+      "category": "Part",
+      "machineType": "All",
+      "issue": "Networking adapters with SFPs",
+      "process": "Networking adapters with SFPs - SSR (IBM) MUST RETURN THE SFP\nWe have created a TIFF message and need get the communication out that the SFP in the adapter needs to be returned.\nAll of these Adapter FRU parts come with the SFP already installed so the SFP in the “bad” adapter being returned must also be returned to the Reverse Hub:\nFRU PN\tDescription\tTIFF Message\n03NC419\tThinkSystem QLogic QLE2872 64Gb 2-Port PCIe Fibre Channel Adapter(Generic FW)\tThe SFP must be returned with the adapter to the Reverse Hub\n01KR585\tQLogic 16Gb Enhanced  FC Single-port HBA（2690）PCIE\tThe SFP must be returned with the adapter to the Reverse Hub\n01KR586 \tQLogic 16Gb Enhanced  FC Dual-port HBA（2692）PCIE\tThe SFP must be returned with the adapter to the Reverse Hub\n00YK541\tThinkSystem QLogic QLE2740 PCIe 32Gb 1-Port SFP+ Fibre Channel Adapter\tThe SFP must be returned with the adapter to the Reverse Hub\n00YK542\tThinkSystem QLogic QLE2742 PCIe 32Gb 2-Port SFP+ Fibre Channel Adapter\tThe SFP must be returned with the adapter to the Reverse Hub\n00YK543\tThinkSystem QLogic QML2692 Mezz 16Gb 2-Port Fibre Channel Adapter\tThe SFP must be returned with the adapter to the Reverse Hub\n01KR590 \tThinkSystem QLogic QLE2770 32Gb 1-Port PCIe Fibre Channel Adapter\tThe SFP must be returned with the adapter to the Reverse Hub\n01KR591 \tThinkSystem QLogic QLE2772 32Gb 2-Port PCIe Fibre Channel Adapter\tThe SFP must be returned with the adapter to the Reverse Hub",
+      "id": "es_20260610_1011_010"
+    },
+    {
+      "category": "Location",
+      "machineType": "Parts",
+      "issue": "Parts shipping",
+      "process": "Parts Shipping Guidelines – Regional Handling Overview\nOut-of-Hours (OOH) & Weekend Protocol\nDuring OOH or weekends, parts must be shipped directly to the customer’s location, as Lenovo PUDOs are closed.",
+      "id": "es_20260610_1011_011"
+    },
+    {
+      "category": "Machine Type",
+      "machineType": "all",
+      "issue": "Repeat Repair Reason Code",
+      "process": "Repeat Repair Reason Code \"Unrelated First Repair\" on workorder level:\nTo minimize the risk of missed situations that are relevant for billing, pls make sure the below is understood and adhered to by all RTS teams.\nWe have already shared this communication in Q1/2024 however we still do see cases with multiple workorders where the repeat reason code \"unrelated first repair\"\nis selected for second/subsequent workorder.\nIf that is accidentally wrongly chose, please make sure you select the correct one, if it really is an unrelated repair, make sure you have a second case created.",
+      "id": "es_20260610_1011_012"
+    },
+    {
+      "category": "Part",
+      "machineType": "All",
+      "issue": "Sales Process",
+      "process": "Parts Sales, Customer asking for parts prices:\nPlease use the below link to direct the customer to part prices.\nhttps://lenovoisgpartsales.com/\n\nIf need help check with Sam.",
+      "id": "es_20260610_1011_013"
+    },
+    {
+      "category": "Machine Type",
+      "machineType": "6559 7D8P 6415 7D1S 7DHN 7D5J 7D9J 6684 6682 7DB4 3873 7D2S 7DBU 4587 JBOD 4588 4599 4617 4619 6100 6411 6411 6413 7DAH 6160 6171 6173 6173 6741 6190 6096 6099 6194 6195 6535 6536",
+      "issue": "San Switches",
+      "process": "SAN switches for EMEA are handled by the IBM Storage RTS team, which is separate from Lenovo RTS. They use MSD only for escalation to ATS or part ordering,\nwhile case handling with customer and ONS support are managed through CSP cases under their own OOH process. We will not follow or alert them for such cases.",
+      "id": "es_20260610_1011_014"
+    },
+    {
+      "category": "Machine Type",
+      "machineType": "all",
+      "issue": "T&M Cases",
+      "process": "No CRU for T&M cases -\nI know that you are already aware about this process, but it was received from Lenovo SDMs as a kind reminder.\nWe don’t provide CRU for T&M cases; we only provide FOP & field support only.",
+      "id": "es_20260610_1011_015"
+    },
+    {
+      "category": "Customer",
+      "machineType": "All ThinkAgile Cases",
+      "issue": "ThinkAgile cases handling process",
+      "process": "Handling of Expired Premier / ThinkAgile Contract Cases – Sherif Thu 2/5/2026 5:55 PM\n•\tFor Premier or ThinkAgile cases where the contract has expired, IBM will inform the customer that the serial number is out of warranty.\n•\tThe customer will be referred to the Lenovo Sales team for contract renewal.\n•\tIBM will notify the assigned CSM and SDM via email, including the customer name and case number.\n•\tIBM will not share the Time & Materials (T&M) document.\n•\tIBM will not wait for customer confirmation and will proceed with case cancellation accordingly.\n\nLenovo confirmed that IBM should NOT work on any cases for ThinkAgile. Currently, Lenovo route all products with expired warranty/maintenance to IBM and they don’t have a process to automatically route ThinkAgile with expired warranty/maintenance to LSPOC and all other products to IBM. We are asked to notify the people below when this happens. They will create new case manually and will route it to their LSPOC teams/missions, and we have to cancel the original case. I’m in touch with Lenovo on this topic to implement automatic solution.\n\ncmackenzie@lenovo.com\nnyanev@lenovo.com\nsdurieu1@lenovo.com\nastoyanov@lenovo.com\ntsmith7@lenovo.com\n\nAlthough the message below is not related to the countries our team supports, I’d like to use it as a reminder of an important rule.\nWe are not authorized to handle ThinkAgile or Premier cases under any circumstances, even if:\n•\tThe contract is expired\n•\tThe customer agrees to T&M\n•\tA Lenovo SDM approves OVD\nAny case with a Premier contract (active or expired) must not be handled by our team.\nPlease ensure strict adherence to this guideline.",
+      "id": "es_20260610_1011_016"
+    }
+  ]
+}

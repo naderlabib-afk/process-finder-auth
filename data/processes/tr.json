@@ -1,0 +1,41 @@
+{
+  "lastUpdated": "2026-06-26T16:29:57.861Z",
+  "country": "tr",
+  "processes": [
+    {
+      "category": "Customer",
+      "machineType": "",
+      "issue": "Cloud4C Customer",
+      "process": "- The primary contact is located in India.\n- Send the part with SSR, ship it to the PUDO. Never send the part to the customer’s address.\n- Confirm the machine location address and obtain a valid onsite phone contact before creating the WO.\n- There is no need to order with SLA SBD, as it always takes time to deliver the part and assign the SSR.",
+      "id": "tr_20260612_1310_001"
+    },
+    {
+      "category": "Customer",
+      "machineType": "",
+      "issue": "Control Center Team (RMC)",
+      "process": "Email:\ncc@tr.ibm.com\n\nSlack channel:\nhttps://ibm.enterprise.slack.com/archives/C0307R9KYR5",
+      "id": "tr_20260612_1310_002"
+    },
+    {
+      "category": "Location",
+      "machineType": "",
+      "issue": "PUDO availability",
+      "process": "If customer refuses to receive the part, we will not be able to use any address in Turkey rather than Lenovo PUDO\nWe change ship to address to “No” and the system will ship the part to Lenovo PUDO.\nMake sure to confirm the machine's address and add it to the WO, so the part will be delivered to the nearest PUDO.",
+      "id": "tr_20260612_1310_003"
+    },
+    {
+      "category": "Part",
+      "machineType": "",
+      "issue": "Tracking number",
+      "process": "There is no tracking number in TR.\nA PED request will be created to ask for it, if there is no reply for a couple of hours, contact\nRaisa Laura Mihaila by email and ask for the tracking number:\nrmihaila@lenovo.com",
+      "id": "tr_20260612_1310_004"
+    },
+    {
+      "category": "Part",
+      "machineType": "",
+      "issue": "Tubitack customer",
+      "process": "All the following are different names referring to the same company:\nTubitack\nTÜBİTAK\nÜLAKİM\nÜLABAKİM\nVAS\n\nProcess Guidelines:\n- If it is a simple issue, proceed with the replacement (PS or drives issue).\n- If there is any other issue, escalate it to L3.\n- All parts will be treated as FRU parts (SSR should replace them), even if it is only the HDD.\n- Parts should be sent to the PUDO. Do not ship directly to the customer.",
+      "id": "tr_20260612_1310_005"
+    }
+  ]
+}

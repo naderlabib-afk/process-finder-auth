@@ -1,0 +1,38 @@
+[
+  {
+    "key": "es",
+    "name": "Spain",
+    "code": "ES",
+    "flag": "🇪🇸"
+  },
+  {
+    "key": "fr",
+    "name": "France",
+    "code": "FR",
+    "flag": "🇫🇷"
+  },
+  {
+    "key": "it",
+    "name": "Italy",
+    "code": "IT",
+    "flag": "🇮🇹"
+  },
+  {
+    "key": "mea",
+    "name": "Middle East & Africa",
+    "code": "MEA",
+    "flag": "./assets/flags/globe.png"
+  },
+  {
+    "key": "tr",
+    "name": "Turkey",
+    "code": "TR",
+    "flag": "🇹🇷"
+  },
+  {
+    "key": "uk",
+    "name": "United Kingdom",
+    "code": "GB",
+    "flag": "🇬🇧"
+  }
+]
