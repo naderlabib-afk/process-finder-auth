@@ -1755,12 +1755,14 @@ async function _moveBufToHistoryAfterPR(country, validatedEntries, prResult, tri
   for (const entry of validatedEntries) {
     history[country].push({
       ...entry,
-      pr_status:  'pending_merge',
-      prUrl:      prResult.prUrl,
-      prNumber:   prResult.prNumber,
-      branchName: prResult.branchName,
+      pr_status:   'pending_merge',
+      prUrl:       prResult.prUrl,
+      prNumber:    prResult.prNumber,
+      branchName:  prResult.branchName,
       prCreatedAt: now,
-      prCreatedBy: triggeredBy
+      prCreatedBy: triggeredBy,
+      submittedAt: now,   // fix: was missing — now always populated on PR creation
+      submittedBy: triggeredBy
     });
   }
 
@@ -1936,7 +1938,8 @@ app.get('/api/ops/pr/status/:country', requireAuth, async (req, res) => {
   }
 
   try {
-    // Find all PRs (open + closed) for this country's branch prefix
+    // Find all PRs (open + closed) for this country's branch prefix.
+    // Matches both new naming (ops/<country>/<timestamp>) and legacy (<country>_<timestamp>).
     const openRes = await fetch(
       `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls?state=all&per_page=20`,
       { headers: ghHeaders() }
@@ -1944,7 +1947,10 @@ app.get('/api/ops/pr/status/:country', requireAuth, async (req, res) => {
     if (!openRes.ok) return res.json({ state: 'unknown' });
 
     const prs = await openRes.json();
-    const countryPRs = prs.filter(pr => pr.head?.ref?.startsWith(`${country}_`));
+    const countryPRs = prs.filter(pr => {
+      const ref = pr.head?.ref || '';
+      return ref.startsWith(`ops/${country}/`) || ref.startsWith(`${country}_`);
+    });
     if (!countryPRs.length) return res.json({ state: 'none' });
 
     // Most recent PR = highest number
@@ -1985,6 +1991,62 @@ app.get('/api/ops/pr/status/:country', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('[PR status] poll error:', err.message);
     res.json({ state: 'unknown', error: err.message });
+  }
+});
+
+// ─── PR details read endpoint (read-only, uses server-side GitHub token) ─────
+
+/**
+ * GET /api/ops/pr/details/:prNumber
+ * Returns full GitHub PR metadata + file list for a given PR number.
+ * Used by admin tooling and controlled tests — does not modify any state.
+ */
+app.get('/api/ops/pr/details/:prNumber', requireAuth, async (req, res) => {
+  const prNumber = parseInt(req.params.prNumber, 10);
+  if (!prNumber || isNaN(prNumber)) {
+    return res.status(400).json({ error: 'Valid PR number required' });
+  }
+  try {
+    const [prRes, filesRes] = await Promise.all([
+      fetch(`https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`, { headers: ghHeaders() }),
+      fetch(`https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/files`, { headers: ghHeaders() })
+    ]);
+
+    if (!prRes.ok) return res.status(prRes.status).json({ error: `GitHub returned ${prRes.status} for PR #${prNumber}` });
+
+    const pr    = await prRes.json();
+    const files = filesRes.ok ? await filesRes.json() : [];
+
+    const ALLOWED_PREFIX = 'data/processes/';
+    const fileList = (Array.isArray(files) ? files : []).map(f => ({
+      filename:  f.filename,
+      status:    f.status,
+      additions: f.additions,
+      deletions: f.deletions,
+      allowed:   f.filename.startsWith(ALLOWED_PREFIX)
+    }));
+    const blockedFiles = fileList.filter(f => !f.allowed).map(f => f.filename);
+
+    res.json({
+      prNumber:     pr.number,
+      prUrl:        pr.html_url,
+      state:        pr.state,
+      baseBranch:   pr.base.ref,
+      headBranch:   pr.head.ref,
+      title:        pr.title,
+      commits:      pr.commits,
+      changedFiles: pr.changed_files,
+      additions:    pr.additions,
+      deletions:    pr.deletions,
+      mergeable:    pr.mergeable,
+      mergeableState: pr.mergeable_state,
+      createdAt:    pr.created_at,
+      files:        fileList,
+      scopeClean:   blockedFiles.length === 0,
+      blockedFiles
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
