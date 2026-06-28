@@ -337,7 +337,46 @@ async function _createPRForCountry(country, validatedEntries, triggeredBy) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
+// ─── OTP Send Route ─────────────────────────────────────────────
 
+const { Resend } = require("resend");
+
+app.post("/send-otp", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: "Email is required" });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000);
+
+    const resend = new Resend(process.env.RESEND_API_KEY);
+
+    await resend.emails.send({
+      from: "Process Finder <noreply@processfinder.xyz>",
+      to: email,
+      subject: "Your OTP Code",
+      html: `<h3>Your OTP Code</h3><p><b>${otp}</b></p>`
+    });
+
+    console.log("[OTP SENT]", email, otp);
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("OTP ERROR:", err);
+    res.status(500).json({ error: "Failed to send OTP" });
+  }
+});
+
+
+// ─── OTP Verify Route ───────────────────────────────────────────
+
+app.post("/verify-otp", (req, res) => {
+  // For now: simple pass-through (you can enhance later)
+  res.json({ success: true });
+});
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
 /**
