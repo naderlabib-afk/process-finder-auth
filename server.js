@@ -2050,6 +2050,123 @@ app.get('/api/ops/pr/details/:prNumber', requireAuth, async (req, res) => {
   }
 });
 
+// ─── Admin history entry delete (Admin only, surgical) ───────────────────────
+
+/**
+ * DELETE /api/ops/history/entry
+ * Removes exactly ONE specific history entry identified by country + id.
+ * Admin only.
+ *
+ * Safety rules enforced server-side:
+ *   1. Loads history fresh from GitHub (never trusts client payload).
+ *   2. Finds entries matching { country, id }.
+ *   3. Refuses if 0 matches found.
+ *   4. Refuses if > 1 match found (ambiguous — must not bulk-delete).
+ *   5. Refuses if the single match does not also match the provided
+ *      confirmIssue field (extra identity check).
+ *   6. Writes back to GitHub only after all checks pass.
+ *   7. Returns before/after counts.
+ */
+app.delete('/api/ops/history/entry', requireAuth, async (req, res) => {
+  // ── Guard 1: Admin only ────────────────────────────────────────────────────
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+
+  const { country, id, confirmIssue, reason } = req.body;
+
+  // ── Guard 2: All fields required, including reason ─────────────────────────
+  if (!country || !id || !confirmIssue || !reason) {
+    return res.status(400).json({
+      error: 'country, id, confirmIssue, and reason are all required'
+    });
+  }
+  if (typeof reason !== 'string' || !reason.trim()) {
+    return res.status(400).json({ error: 'reason must be a non-empty string' });
+  }
+  if (!validateCountry(country)) {
+    return res.status(400).json({ error: 'Invalid country' });
+  }
+
+  try {
+    // ── 1. Load fresh from source of truth ──────────────────────────────────
+    const history = await fetchGitHubJson('data/ops/history.json', {});
+    const countryHistory = Array.isArray(history[country]) ? history[country] : [];
+
+    // ── 2. Find matches ──────────────────────────────────────────────────────
+    const matches = countryHistory.filter(e => e.id === id);
+
+    // ── 3. Refuse if no match ────────────────────────────────────────────────
+    if (matches.length === 0) {
+      return res.status(404).json({
+        error: `No history entry found with id="${id}" for country="${country}"`
+      });
+    }
+
+    // ── 4. Refuse if ambiguous (more than one entry with same id) ────────────
+    if (matches.length > 1) {
+      return res.status(409).json({
+        error: `Found ${matches.length} entries matching id="${id}" — refusing ambiguous delete`,
+        matchCount: matches.length
+      });
+    }
+
+    const target = matches[0];
+
+    // ── 5. Confirm issue field matches exactly ───────────────────────────────
+    const actualIssue = target.process?.issue || target.issue || '';
+    if (actualIssue !== confirmIssue) {
+      return res.status(409).json({
+        error: `Issue field mismatch — expected "${confirmIssue}", found "${actualIssue}". Delete aborted.`
+      });
+    }
+
+    // ── 6. Remove and write back ─────────────────────────────────────────────
+    const beforeCount = countryHistory.length;
+    history[country]  = countryHistory.filter(e => e.id !== id);
+    const afterCount  = history[country].length;
+
+    const committed = await commitJsonToMainBranch(
+      'data/ops/history.json',
+      history,
+      `ops: admin remove history entry "${id}" from ${country} — ${reason}`
+    );
+
+    if (!committed) {
+      return res.status(503).json({ error: 'GitHub write failed — please retry' });
+    }
+
+    // ── 7. Write admin audit entry AFTER successful deletion ─────────────────
+    await appendAdminAudit({
+      action:        'history_entry_delete',
+      performedBy:   req.user.email,
+      role:          req.user.role,
+      country,
+      entryId:       id,
+      confirmIssue,
+      reason:        reason.trim(),
+      deletedEntry:  target,   // full snapshot of the removed record
+      beforeCount,
+      afterCount
+    });
+
+    console.log(`[Admin] History entry "${id}" removed from "${country}" by ${req.user.email} — reason: ${reason}`);
+    res.json({
+      success:      true,
+      country,
+      removedId:    id,
+      removedIssue: actualIssue,
+      reason:       reason.trim(),
+      beforeCount,
+      afterCount
+    });
+
+  } catch (err) {
+    console.error('[Admin history delete] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Admin PR close + branch delete (Admin only) ─────────────────────────────
 
 /**
