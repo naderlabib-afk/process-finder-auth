@@ -626,10 +626,8 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
   const targetUser = req.body.user;
   if (!targetUser) return res.status(400).json({ error: 'user field required to identify buffer queue' });
 
-  const [buffer, history] = await Promise.all([
-    fetchGitHubJson('data/ops/buffer.json', {}),
-    fetchGitHubJson('data/ops/history.json', {})
-  ]);
+  // Fetch buffer only here — history is re-fetched fresh right before its write
+  const buffer = await fetchGitHubJson('data/ops/buffer.json', {});
 
   const entries = (buffer[country] && buffer[country][targetUser]) || [];
 
@@ -687,6 +685,8 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
     entry.after           = after;
     entry.previousProcess = before;
 
+    // Re-fetch history immediately before write to get the latest GitHub SHA
+    const history = await fetchGitHubJson('data/ops/history.json', {});
     if (!history[country]) history[country] = [];
     history[country].push(entry);
 
@@ -708,6 +708,7 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
     console.log(`[OPS validate] Entry "${entry.id}" validated by ${validator} for country "${country}"`);
 
     // ── Auto-create PR after validation ──────────────────────────────────────
+    // Use the history we just committed (already contains the new entry)
     const validatedEntries = (history[country] || []).filter(
       h => h.status === 'validated' || h.status === 'pending'
     );
@@ -779,32 +780,33 @@ app.post('/api/ops/rollback', requireAuth, async (req, res) => {
     return res.status(403).json({ error: 'Only Admin can rollback entries' });
   }
 
-  const history = await fetchGitHubJson('data/ops/history.json', {});
+  // First fetch: read the entry to validate it exists and capture item metadata
+  const historyForRead = await fetchGitHubJson('data/ops/history.json', {});
 
-  if (!history[country] || !history[country][historyIndex]) {
+  if (!historyForRead[country] || !historyForRead[country][historyIndex]) {
     return res.status(404).json({ error: 'History item not found' });
   }
 
-  const item = history[country][historyIndex];
-  const now  = new Date().toISOString();
-  item.rolledBackAt = now;
-  item.rolledBackBy = req.user.email;
-  item.status       = 'rolled_back';
+  // Capture a snapshot of the item fields needed for the rollback — do NOT mutate yet
+  const itemSnapshot = historyForRead[country][historyIndex];
+  const now          = new Date().toISOString();
+  const beforeSnap   = itemSnapshot.before ?? itemSnapshot.previousProcess ?? null;
+  const afterSnap    = itemSnapshot.after  ?? itemSnapshot.process         ?? null;
+  const itemType     = itemSnapshot.type;
+  const itemId       = itemSnapshot.id;
+  const itemProcess  = itemSnapshot.process;
 
   const processesData = await readProcessData(country);
   if (processesData) {
     const arr = processesData.data;
 
-    const beforeSnap = item.before ?? item.previousProcess ?? null;
-    const afterSnap  = item.after  ?? item.process         ?? null;
-
-    if (item.type === 'create') {
+    if (itemType === 'create') {
       const removeIdx = arr.findIndex(
         p => p.id === afterSnap?.id || p.issue === afterSnap?.issue
       );
       if (removeIdx !== -1) arr.splice(removeIdx, 1);
 
-    } else if (item.type === 'update') {
+    } else if (itemType === 'update') {
       if (beforeSnap) {
         const restoreIdx = arr.findIndex(
           p => p.id === afterSnap?.id || p.issue === afterSnap?.issue
@@ -813,7 +815,7 @@ app.post('/api/ops/rollback', requireAuth, async (req, res) => {
         else arr.push(beforeSnap);
       }
 
-    } else if (item.type === 'delete') {
+    } else if (itemType === 'delete') {
       if (beforeSnap) {
         const alreadyExists = arr.some(
           p => p.id === beforeSnap.id || p.issue === beforeSnap.issue
@@ -825,35 +827,48 @@ app.post('/api/ops/rollback', requireAuth, async (req, res) => {
     await writeProcessData(country, arr, processesData.meta);
   }
 
+  // Re-fetch history immediately before write — captures any concurrent writes
+  // that occurred during the writeProcessData round-trip above.
+  const history = await fetchGitHubJson('data/ops/history.json', {});
+
+  // Stamp the original entry in-place in the freshly fetched copy
+  const item = history[country] && history[country][historyIndex];
+  if (item) {
+    item.rolledBackAt = now;
+    item.rolledBackBy = req.user.email;
+    item.status       = 'rolled_back';
+  }
+
   const rollbackLogEntry = {
-    id:          `rollback_${item.id || historyIndex}_${Date.now()}`,
+    id:          `rollback_${itemId || historyIndex}_${Date.now()}`,
     type:        'rollback',
     status:      'approved',
     user:        req.user.email,
     validatedAt: now,
     validatedBy: req.user.email,
     country,
-    referenceId: item.id || null,
-    process:     item.process,
-    before:      item.after  ?? item.process ?? null,
-    after:       item.before ?? item.previousProcess ?? null,
+    referenceId: itemId || null,
+    process:     itemProcess,
+    before:      afterSnap,
+    after:       beforeSnap,
   };
+  if (!history[country]) history[country] = [];
   history[country].push(rollbackLogEntry);
 
-  await commitJsonToMainBranch('data/ops/history.json', history, `ops: rollback entry ${item.id || historyIndex} for ${country}`);
+  await commitJsonToMainBranch('data/ops/history.json', history, `ops: rollback entry ${itemId || historyIndex} for ${country}`);
 
   appendAdminAudit({
     action:      'rollback-executed',
     by:          req.user.email,
     country,
     historyIndex,
-    entryId:     item.id,
-    type:        item.type,
-    before:      item.after  ?? item.process ?? null,
-    after:       item.before ?? item.previousProcess ?? null
+    entryId:     itemId,
+    type:        itemType,
+    before:      afterSnap,
+    after:       beforeSnap
   });
 
-  res.json({ success: true, item });
+  res.json({ success: true, item: item || itemSnapshot });
 });
 
 /**
@@ -987,16 +1002,22 @@ app.post('/api/ops/approve-and-merge', requireAuth, async (req, res) => {
     if (!prResult.success) throw new Error(prResult.error);
 
     const approvedAt = new Date().toISOString();
-    validatedEntries.forEach(h => {
-      h.status     = 'approved';
-      h.approvedAt = approvedAt;
-      h.approvedBy = approver;
-      h.prUrl      = prResult.prUrl;
-      h.prNumber   = prResult.prNumber;
-      h.branchName = prResult.branchName;
+
+    // Re-fetch history after the PR call — _createPRForCountry involves multiple
+    // async GitHub round-trips during which concurrent writes may have landed.
+    const latestHistory = await fetchGitHubJson('data/ops/history.json', {});
+    (latestHistory[country] || []).forEach(h => {
+      if (h.status === 'validated' || h.status === 'pending') {
+        h.status     = 'approved';
+        h.approvedAt = approvedAt;
+        h.approvedBy = approver;
+        h.prUrl      = prResult.prUrl;
+        h.prNumber   = prResult.prNumber;
+        h.branchName = prResult.branchName;
+      }
     });
 
-    await commitJsonToMainBranch('data/ops/history.json', history, `ops: approve entries for ${country} PR #${prResult.prNumber}`);
+    await commitJsonToMainBranch('data/ops/history.json', latestHistory, `ops: approve entries for ${country} PR #${prResult.prNumber}`);
 
     appendAdminAudit({
       action:     'pr-approved',
@@ -1408,12 +1429,9 @@ app.get('/api/readme', async (req, res) => {
 async function _runExpirationSweep() {
   console.log('[OPS scheduler] Running expiration sweep');
 
-  const [buffer, history] = await Promise.all([
-    fetchGitHubJson('data/ops/buffer.json', {}),
-    fetchGitHubJson('data/ops/history.json', {})
-  ]);
-
-  const now = Date.now();
+  // Fetch only buffer here — history is re-fetched fresh per-country right before each write
+  const buffer = await fetchGitHubJson('data/ops/buffer.json', {});
+  const now    = Date.now();
 
   // Group expired entries by country so we fire one PR per country.
   const expiredByCountry = {};
@@ -1455,7 +1473,8 @@ async function _runExpirationSweep() {
     }
     const arr = processesData.data;
 
-    if (!history[country]) history[country] = [];
+    // Collect validated entries in memory for this country
+    const newlyValidated = [];
 
     for (const { userEmail, entry, idx } of expired) {
       _processingEntries.add(entry.id);
@@ -1495,7 +1514,7 @@ async function _runExpirationSweep() {
         freshEntry.previousProcess = before;
         freshEntry.autoExpired     = true;
 
-        history[country].push(freshEntry);
+        newlyValidated.push(freshEntry);
 
         appendAdminAudit({
           action:  'buffer-auto-expired',
@@ -1516,7 +1535,15 @@ async function _runExpirationSweep() {
       }
     }
 
-    // Write process file, buffer, and history once per country
+    if (!newlyValidated.length) continue;
+
+    // Re-fetch history immediately before write — avoids overwriting concurrent writes
+    // that occurred during the readProcessData / per-entry processing above.
+    const history = await fetchGitHubJson('data/ops/history.json', {});
+    if (!history[country]) history[country] = [];
+    newlyValidated.forEach(e => history[country].push(e));
+
+    // Commit process file, buffer, and history together
     await Promise.all([
       writeProcessData(country, arr, processesData.meta),
       commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `ops: scheduler — remove expired entries for ${country}`),
@@ -1533,9 +1560,9 @@ async function _runExpirationSweep() {
     if (prResult.success) {
       console.log(`[OPS PR] Success: ${prResult.prUrl}`);
       const approvedAt = new Date().toISOString();
-      // Re-fetch history to avoid stale state after async PR call
-      const hist2 = await fetchGitHubJson('data/ops/history.json', {});
-      (hist2[country] || []).forEach(h => {
+      // Re-fetch history after the multi-step PR creation round-trips
+      const histAfterPr = await fetchGitHubJson('data/ops/history.json', {});
+      (histAfterPr[country] || []).forEach(h => {
         if (h.status === 'validated' || h.status === 'pending') {
           h.status     = 'approved';
           h.approvedAt = approvedAt;
@@ -1545,7 +1572,7 @@ async function _runExpirationSweep() {
           h.branchName = prResult.branchName;
         }
       });
-      await commitJsonToMainBranch('data/ops/history.json', hist2, `ops: scheduler — mark entries approved after PR #${prResult.prNumber}`);
+      await commitJsonToMainBranch('data/ops/history.json', histAfterPr, `ops: scheduler — mark entries approved after PR #${prResult.prNumber}`);
       appendAdminAudit({
         action:     'pr-auto-created',
         by:         'system@ops',
