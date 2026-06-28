@@ -154,7 +154,16 @@ async function createGitHubBranch(branchName) {
 async function commitToGitHub(branchName, commits) {
   try {
     for (const { filePath, content, message } of commits) {
-      const fileInfo = await getGitHubFileContent(filePath);
+      // Fetch the SHA from the TARGET branch, not from GITHUB_BRANCH (main).
+      // The file (e.g. pre-live/data/processes/fr.json) lives on feature/pre-live,
+      // not on main, so reading from main always returns null and causes a full
+      // file creation instead of an update — meaning the PR diff shows no deletions.
+      const fileInfoRes = await fetch(
+        `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}?ref=${branchName}`,
+        { headers: ghHeaders() }
+      );
+      const fileInfo = fileInfoRes.ok ? await fileInfoRes.json() : null;
+
       await fetch(
         `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
         {
