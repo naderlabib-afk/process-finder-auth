@@ -78,6 +78,13 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
   req.user = { email: payload.email, role: payload.role };
+  // Hybrid lazy trigger: any authenticated request wakes the PR executor.
+  // Defined later in the file; safe to call here because Node hoists function
+  // declarations — but _runScheduledPRExecutor is an async function expression,
+  // so we guard with typeof to avoid ReferenceError during startup ordering.
+  if (typeof _runScheduledPRExecutor === 'function') {
+    _runScheduledPRExecutor().catch(() => {});
+  }
   next();
 }
 
@@ -529,7 +536,7 @@ function validateProcessEntry(p) {
  * Adds a new pending entry for req.user.email (identity from JWT, not body).
  */
 app.post('/api/ops/buffer', requireAuth, async (req, res) => {
-  const { country, type, process, holdHours = 4 } = req.body;
+  const { country, type, process } = req.body;
   const user = req.user.email;
 
   if (!country || !type || !process) {
@@ -560,7 +567,6 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
     process,
     user,
     createdAt: new Date().toISOString(),
-    holdHours,
     status: 'pending'
   };
 
@@ -584,11 +590,18 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
 
 /**
  * POST /api/ops/cancel
- * Removes a single buffer entry and archives it to history with status='cancelled'.
+ * Hard-deletes a single buffer entry. No history write, no audit log.
+ * New workflow: cancel = remove without trace.
+ *
+ * Permission rules:
+ *   OL      → can only remove their OWN entries with status="pending"
+ *   Manager → can remove any entry (pending or validated)
+ *   Admin   → can remove any entry (pending or validated)
  */
 app.post('/api/ops/cancel', requireAuth, async (req, res) => {
   const { country, user: targetUser, index } = req.body;
-  const canceller = req.user.email;
+  const canceller     = req.user.email;
+  const cancellerRole = req.user.role;
 
   if (!country || !targetUser || typeof index !== 'number') {
     return res.status(400).json({ error: 'country, user, and index are required' });
@@ -597,44 +610,42 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Invalid country' });
   }
 
-  const [buffer, history] = await Promise.all([
-    fetchGitHubJson('data/ops/buffer.json', {}),
-    fetchGitHubJson('data/ops/history.json', {})
-  ]);
-
+  const buffer  = await fetchGitHubJson('data/ops/buffer.json', {});
   const entries = (buffer[country] && buffer[country][targetUser]) || [];
+
   if (!entries[index]) {
     return res.status(404).json({ error: 'Buffer entry not found' });
   }
 
-  const entry = entries.splice(index, 1)[0];
-  entry.status      = 'cancelled';
-  entry.cancelledAt = new Date().toISOString();
-  entry.cancelledBy = canceller;
+  const entry = entries[index];
 
-  if (!history[country]) history[country] = [];
-  history[country].push(entry);
+  // OL permission check: can only remove own pending entries
+  if (cancellerRole === 'OL') {
+    const ownerEmail = (entry.user || targetUser || '').toLowerCase().trim();
+    if (ownerEmail !== canceller.toLowerCase().trim()) {
+      return res.status(403).json({ error: 'OL can only remove their own entries' });
+    }
+    if (entry.status === 'validated') {
+      return res.status(403).json({ error: 'OL cannot remove a validated entry' });
+    }
+  }
 
-  await Promise.all([
-    commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `ops: cancel buffer entry ${entry.id} for ${country}`),
-    commitJsonToMainBranch('data/ops/history.json', history, `ops: archive cancelled entry ${entry.id} for ${country}`)
-  ]);
+  // Splice out — no history write, no log entry
+  entries.splice(index, 1);
 
-  appendAdminAudit({
-    action:  'buffer-cancelled',
-    by:      canceller,
-    country,
-    entryId: entry.id,
-    type:    entry.type,
-    process: entry.process
-  });
+  await commitJsonToMainBranch('data/ops/buffer.json', buffer, `ops: remove buffer entry ${entry.id} for ${country}`);
 
   res.json({ success: true, entry });
 });
 
 /**
  * POST /api/ops/validate
- * Applies a buffer entry to the process file and moves it to history.
+ * Toggles a buffer entry between status="pending" and status="validated".
+ * The entry STAYS IN THE BUFFER — no history write, no PR trigger.
+ * Entries only move to history after the 10-minute scheduled PR executor fires.
+ *
+ * Available to: OL, Manager, Admin (all three roles).
+ * OL can validate any entry within their allowed countries.
  */
 app.post('/api/ops/validate', requireAuth, async (req, res) => {
   const { country, index } = req.body;
@@ -646,127 +657,60 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
   if (!validateCountry(country)) {
     return res.status(400).json({ error: 'Invalid country' });
   }
-  if (!['Manager', 'Admin'].includes(req.user.role)) {
-    return res.status(403).json({ error: 'Only Manager or Admin can validate entries' });
+  if (!['OL', 'Manager', 'Admin'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Only OL, Manager or Admin can validate entries' });
   }
 
   const targetUser = req.body.user;
   if (!targetUser) return res.status(400).json({ error: 'user field required to identify buffer queue' });
 
-  // Fetch buffer only here — history is re-fetched fresh right before its write
-  const buffer = await fetchGitHubJson('data/ops/buffer.json', {});
-
+  const buffer  = await fetchGitHubJson('data/ops/buffer.json', {});
   const entries = (buffer[country] && buffer[country][targetUser]) || [];
+  const entry   = entries[index];
 
-  const entryPeek = entries[index];
-  if (!entryPeek) {
+  if (!entry) {
     return res.status(404).json({ error: 'Buffer entry not found' });
   }
 
-  if (_processingEntries.has(entryPeek.id)) {
-    console.warn(`[OPS validate] Entry "${entryPeek.id}" is already being processed — skipping duplicate`);
+  if (_processingEntries.has(entry.id)) {
     return res.status(409).json({ error: 'Entry is already being processed' });
   }
-  _processingEntries.add(entryPeek.id);
-
-  const entry = entries.splice(index, 1)[0];
+  _processingEntries.add(entry.id);
 
   try {
-    // Process data is NOT written here — it is updated only when the PR is merged
-    // into main by GitHub. before/after snapshots are derived from the entry itself.
-    let before = entry.before ?? null;
-    let after  = entry.after  ?? null;
+    const now = new Date().toISOString();
 
-    // For entries that don't carry pre-computed snapshots, derive them from the
-    // process payload (mirrors the shape the UI expects in the diff block).
-    if (before === null && after === null) {
-      if (entry.type === 'create') {
-        after = { ...entry.process };
-      } else if (entry.type === 'update') {
-        after = { ...entry.process };
-      }
-      // delete: before unknown without reading the file — leave as null
+    if (entry.status === 'pending') {
+      // pending → validated
+      entry.status      = 'validated';
+      entry.validatedAt = now;
+      entry.validatedBy = validator;
+    } else {
+      // validated → pending (unvalidate)
+      entry.status = 'pending';
+      delete entry.validatedAt;
+      delete entry.validatedBy;
     }
 
-    const now             = new Date().toISOString();
-    entry.validatedAt     = now;
-    entry.validatedBy     = validator;
-    entry.status          = 'validated';
-    entry.before          = before;
-    entry.after           = after;
-    entry.previousProcess = before;
-
-    // Re-fetch history immediately before write to get the latest GitHub SHA
-    const history = await fetchGitHubJson('data/ops/history.json', {});
-    if (!history[country]) history[country] = [];
-    history[country].push(entry);
-
-    // Sequential writes — parallel commits to the same branch cause SHA conflicts
-    // where one PUT wins and the other silently fails with 422 (stale sha).
-    await commitJsonToMainBranch('data/ops/history.json', history, `ops: add validated entry ${entry.id} for ${country}`);
-    await commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `ops: remove validated entry ${entry.id} from buffer`);
-
-    appendAdminAudit({
-      action:  'buffer-validated',
-      by:      validator,
-      country,
-      entryId: entry.id,
-      type:    entry.type,
-      before:  entry.before,
-      after:   entry.after
-    });
-
-    console.log(`[OPS validate] Entry "${entry.id}" validated by ${validator} for country "${country}"`);
-
-    // ── Auto-create PR after validation ──────────────────────────────────────
-    // Use the history we just committed (already contains the new entry)
-    const validatedEntries = (history[country] || []).filter(
-      h => h.status === 'validated' || h.status === 'pending'
+    // Single write — entry stays in buffer, status toggled in-place
+    await commitJsonToMainBranch(
+      'data/ops/buffer.json', buffer,
+      `ops: ${entry.status === 'validated' ? 'validate' : 'unvalidate'} entry ${entry.id} for ${country}`
     );
 
-    (async () => {
-      try {
-        console.log(`[OPS PR] Creating PR for country: ${country.toUpperCase()} (${validatedEntries.length} entries)`);
-        const prResult = await _createPRForCountry(country, validatedEntries, validator);
-        if (prResult.success) {
-          console.log(`[OPS PR] Success: ${prResult.prUrl}`);
-          const approvedAt = new Date().toISOString();
-          const hist = await fetchGitHubJson('data/ops/history.json', {});
-          (hist[country] || []).forEach(h => {
-            if (h.status === 'validated' || h.status === 'pending') {
-              h.status     = 'approved';
-              h.approvedAt = approvedAt;
-              h.approvedBy = validator;
-              h.prUrl      = prResult.prUrl;
-              h.prNumber   = prResult.prNumber;
-              h.branchName = prResult.branchName;
-            }
-          });
-          await commitJsonToMainBranch('data/ops/history.json', hist, `ops: mark entries approved after PR #${prResult.prNumber}`);
-          appendAdminAudit({
-            action:     'pr-auto-created',
-            by:         validator,
-            country,
-            branchName: prResult.branchName,
-            prNumber:   prResult.prNumber,
-            prUrl:      prResult.prUrl,
-            entryCount: validatedEntries.length
-          });
-        } else {
-          console.error(`[OPS PR] Failed: ${prResult.error} — entries remain as "validated" for manual retry via approve-and-merge`);
-          appendAdminAudit({
-            action:     'pr-auto-failed',
-            by:         validator,
-            country,
-            error:      prResult.error,
-            entryCount: validatedEntries.length
-          });
-        }
-      } catch (prErr) {
-        console.error(`[OPS PR] Unexpected error for "${country}":`, prErr.message);
-      }
-    })();
+    // Log validation events only (not unvalidations — only impactful events go to logs)
+    if (entry.status === 'validated') {
+      appendActivityLog({
+        event:   'validation',
+        by:      validator,
+        country,
+        entryId: entry.id,
+        type:    entry.type,
+        issue:   entry.process?.issue || entry.process?.id || '?'
+      });
+    }
 
+    console.log(`[OPS validate] Entry "${entry.id}" → ${entry.status} by ${validator} for "${country}"`);
     res.json({ success: true, entry });
 
   } finally {
@@ -838,8 +782,8 @@ app.post('/api/ops/rollback', requireAuth, async (req, res) => {
 
   await commitJsonToMainBranch('data/ops/history.json', history, `ops: rollback entry ${itemId || historyIndex} for ${country}`);
 
-  appendAdminAudit({
-    action:      'rollback-executed',
+  appendActivityLog({
+    event:       'rollback',
     by:          req.user.email,
     country,
     historyIndex,
@@ -947,7 +891,10 @@ app.post('/api/ops/settings', requireAuth, async (req, res) => {
 
 /**
  * POST /api/ops/approve-and-merge
- * Manual Admin fallback: creates a PR for all validated-but-not-yet-approved entries.
+ * ⚠️  EMERGENCY OVERRIDE — Admin only.
+ * Bypasses the normal 10-minute scheduled PR flow and immediately creates a PR
+ * from all currently validated buffer entries for the given country.
+ * Use only when the scheduled executor has failed or been skipped.
  */
 app.post('/api/ops/approve-and-merge', requireAuth, async (req, res) => {
   const { country } = req.body;
@@ -960,65 +907,50 @@ app.post('/api/ops/approve-and-merge', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Invalid country' });
   }
   if (req.user.role !== 'Admin') {
-    return res.status(403).json({ error: 'Only Admin can approve and merge' });
+    return res.status(403).json({ error: 'Emergency override is Admin only' });
   }
   if (!GITHUB_TOKEN) {
     return res.status(500).json({ error: 'GitHub token not configured on server' });
   }
 
   try {
-    const history        = await fetchGitHubJson('data/ops/history.json', {});
-    const countryHistory = history[country] || [];
+    // Read validated entries directly from the buffer (not history)
+    const buffer         = await fetchGitHubJson('data/ops/buffer.json', {});
+    const countryBuf     = buffer[country] || {};
+    const validatedEntries = Object.values(countryBuf).flat().filter(e => e.status === 'validated');
 
-    const validatedEntries = countryHistory.filter(
-      h => h.status === 'validated' || h.status === 'pending'
-    );
     if (!validatedEntries.length) {
-      return res.status(400).json({ error: 'No validated changes to approve for this country' });
+      return res.status(400).json({ error: 'No validated entries in buffer for this country' });
     }
 
-    console.log(`[OPS approve-and-merge] Manual PR by ${approver} for "${country}" — ${validatedEntries.length} entries`);
+    console.log(`[OPS emergency-override] PR by ${approver} for "${country}" — ${validatedEntries.length} entries`);
 
     const prResult = await _createPRForCountry(country, validatedEntries, approver);
     if (!prResult.success) throw new Error(prResult.error);
 
-    const approvedAt = new Date().toISOString();
+    // Move validated entries from buffer to history as pending_merge
+    await _moveBufToHistoryAfterPR(country, validatedEntries, prResult, approver);
 
-    // Re-fetch history after the PR call — _createPRForCountry involves multiple
-    // async GitHub round-trips during which concurrent writes may have landed.
-    const latestHistory = await fetchGitHubJson('data/ops/history.json', {});
-    (latestHistory[country] || []).forEach(h => {
-      if (h.status === 'validated' || h.status === 'pending') {
-        h.status     = 'approved';
-        h.approvedAt = approvedAt;
-        h.approvedBy = approver;
-        h.prUrl      = prResult.prUrl;
-        h.prNumber   = prResult.prNumber;
-        h.branchName = prResult.branchName;
-      }
-    });
-
-    await commitJsonToMainBranch('data/ops/history.json', latestHistory, `ops: approve entries for ${country} PR #${prResult.prNumber}`);
-
-    appendAdminAudit({
-      action:     'pr-approved',
+    appendActivityLog({
+      event:      'pr-created',
       by:         approver,
       country,
       branchName: prResult.branchName,
       prNumber:   prResult.prNumber,
       prUrl:      prResult.prUrl,
-      entryCount: validatedEntries.length
+      entryCount: validatedEntries.length,
+      trigger:    'emergency-override'
     });
 
     res.json({
       success:    true,
-      message:    'PR created successfully',
+      message:    'Emergency PR created successfully',
       prUrl:      prResult.prUrl,
       prNumber:   prResult.prNumber,
       branchName: prResult.branchName
     });
   } catch (err) {
-    console.error('[OPS approve-and-merge] Error:', err.message);
+    console.error('[OPS emergency-override] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1401,158 +1333,383 @@ app.get('/api/readme', async (req, res) => {
   }
 });
 
-// ─── Expiration Scheduler ─────────────────────────────────────────────────────
+// ─── Activity Log helper ──────────────────────────────────────────────────────
 /**
- * Runs every 5 minutes. Reads buffer.json from GitHub and validates any entry
- * whose hold timer has elapsed. Uses the same validation + auto-PR logic as the
- * HTTP route.
+ * Appends an entry to data/logs/activity_logs.json on GitHub.
+ * Only called for impactful events: validation, PR scheduled, PR created,
+ * PR merged, PR refused, rollback.
+ * Never throws — log failure must never block the successful response.
  */
-async function _runExpirationSweep() {
-  console.log('[OPS scheduler] Running expiration sweep');
+async function appendActivityLog(entry) {
+  try {
+    const ghPath = 'data/logs/activity_logs.json';
+    const log    = await fetchGitHubJson(ghPath, []);
+    log.push({ ...entry, timestamp: new Date().toISOString() });
+    await commitJsonToMainBranch(ghPath, log, `log: ${entry.event || 'event'}`);
+  } catch (err) {
+    console.error('[activity log] write failed:', err.message);
+  }
+}
 
-  // Fetch only buffer here — history is re-fetched fresh per-country right before each write
-  const buffer = await fetchGitHubJson('data/ops/buffer.json', {});
-  const now    = Date.now();
+// ─── Shared helper: move validated buffer entries → history after PR ──────────
+/**
+ * After a PR is successfully created, removes the validated entries from the
+ * buffer and writes them to history with pr_status="pending_merge".
+ * Re-fetches both files fresh immediately before writing to avoid SHA conflicts.
+ */
+async function _moveBufToHistoryAfterPR(country, validatedEntries, prResult, triggeredBy) {
+  const entryIds = new Set(validatedEntries.map(e => e.id));
+  const now      = new Date().toISOString();
 
-  // Group expired entries by country so we fire one PR per country.
-  const expiredByCountry = {};
+  // Re-fetch both files fresh — the PR creation round-trips took time
+  const [buffer, history] = await Promise.all([
+    fetchGitHubJson('data/ops/buffer.json',  {}),
+    fetchGitHubJson('data/ops/history.json', {})
+  ]);
 
-  for (const [country, userMap] of Object.entries(buffer)) {
-    if (!userMap || typeof userMap !== 'object') continue;
-    for (const [userEmail, entries] of Object.entries(userMap)) {
-      if (!Array.isArray(entries)) continue;
-      for (let i = entries.length - 1; i >= 0; i--) {
-        const entry = entries[i];
-        if (!entry || !entry.createdAt) continue;
-        const holdHours = entry.holdHours || 4;
-        const expiresAt = new Date(entry.createdAt).getTime() + holdHours * 3600000;
-        if (now < expiresAt) continue;
-        if (_processingEntries.has(entry.id)) {
-          console.warn(`[OPS scheduler] Entry "${entry.id}" already in processing — skipping`);
-          continue;
-        }
-        if (!expiredByCountry[country]) expiredByCountry[country] = [];
-        expiredByCountry[country].push({ userEmail, entry, idx: i });
-      }
+  // Remove matched entries from buffer
+  if (buffer[country]) {
+    for (const userEmail of Object.keys(buffer[country])) {
+      buffer[country][userEmail] = (buffer[country][userEmail] || []).filter(
+        e => !entryIds.has(e.id)
+      );
     }
   }
 
-  const countryKeys = Object.keys(expiredByCountry);
-  if (!countryKeys.length) {
-    console.log('[OPS scheduler] No expired entries found');
-    return;
+  // Append to history as pending_merge
+  if (!history[country]) history[country] = [];
+  for (const entry of validatedEntries) {
+    history[country].push({
+      ...entry,
+      pr_status:  'pending_merge',
+      prUrl:      prResult.prUrl,
+      prNumber:   prResult.prNumber,
+      branchName: prResult.branchName,
+      prCreatedAt: now,
+      prCreatedBy: triggeredBy
+    });
   }
 
-  for (const country of countryKeys) {
-    const expired = expiredByCountry[country];
-    console.log(`[OPS scheduler] Found ${expired.length} expired entries (${country.toUpperCase()})`);
+  // Sequential writes to avoid SHA conflicts on the same branch
+  await commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `ops: clear ${country} buffer after PR #${prResult.prNumber}`);
+  await commitJsonToMainBranch('data/ops/history.json', history, `ops: add ${country} entries as pending_merge for PR #${prResult.prNumber}`);
+}
 
-    // Process data is NOT written here — it is updated only when the PR is merged.
-    // Collect validated entry stubs in memory; snapshots derived from entry payload.
-    const newlyValidated = [];
+// ─── PR Schedule helpers ──────────────────────────────────────────────────────
+const PR_DELAY_MS  = 10 * 60 * 1000; // 10 minutes
+const PR_SCHEDULE_PATH = 'data/ops/pr_schedule.json';
 
-    for (const { userEmail, entry } of expired) {
-      _processingEntries.add(entry.id);
-      try {
-        const userEntries = buffer[country][userEmail] || [];
-        const bufIdx = userEntries.findIndex(e => e.id === entry.id);
-        if (bufIdx === -1) {
-          console.log(`[OPS scheduler] Entry "${entry.id}" already removed from buffer — skipping`);
-          continue;
-        }
-
-        const freshEntry = userEntries.splice(bufIdx, 1)[0];
-
-        // Derive before/after snapshots from the entry payload (no file read)
-        let before = freshEntry.before ?? null;
-        let after  = freshEntry.after  ?? null;
-        if (before === null && after === null) {
-          if (freshEntry.type === 'create' || freshEntry.type === 'update') {
-            after = { ...freshEntry.process };
-          }
-        }
-
-        const validatedAt          = new Date().toISOString();
-        freshEntry.validatedAt     = validatedAt;
-        freshEntry.validatedBy     = 'system@ops';
-        freshEntry.status          = 'validated';
-        freshEntry.before          = before;
-        freshEntry.after           = after;
-        freshEntry.previousProcess = before;
-        freshEntry.autoExpired     = true;
-
-        newlyValidated.push(freshEntry);
-
-        appendAdminAudit({
-          action:  'buffer-auto-expired',
-          by:      'system@ops',
-          country,
-          entryId: freshEntry.id,
-          type:    freshEntry.type,
-          before,
-          after
-        });
-
-        console.log(`[OPS scheduler] Entry "${freshEntry.id}" auto-validated for "${country}"`);
-
-      } catch (entryErr) {
-        console.error(`[OPS scheduler] Error processing entry "${entry.id}":`, entryErr.message);
-      } finally {
-        _processingEntries.delete(entry.id);
-      }
-    }
-
-    if (!newlyValidated.length) continue;
-
-    // Re-fetch history immediately before write to get the latest GitHub SHA.
-    const history = await fetchGitHubJson('data/ops/history.json', {});
-    if (!history[country]) history[country] = [];
-    newlyValidated.forEach(e => history[country].push(e));
-
-    // Commit buffer and history — process file intentionally excluded
-    await Promise.all([
-      commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `ops: scheduler — remove expired entries for ${country}`),
-      commitJsonToMainBranch('data/ops/history.json', history, `ops: scheduler — add validated entries for ${country}`)
-    ]);
-
-    const validatedEntries = (history[country] || []).filter(
-      h => h.status === 'validated' || h.status === 'pending'
+/**
+ * Returns true if there is currently an open (not merged, not closed) PR
+ * for the given country by searching GitHub for PRs from branches matching
+ * the country prefix.
+ */
+async function _hasOpenPRForCountry(country) {
+  try {
+    const res = await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls?state=open&per_page=50`,
+      { headers: ghHeaders() }
     );
-    if (!validatedEntries.length) continue;
+    if (!res.ok) return false;
+    const prs = await res.json();
+    return prs.some(pr =>
+      pr.head && pr.head.ref && pr.head.ref.startsWith(`${country}_`)
+    );
+  } catch {
+    return false;
+  }
+}
 
-    console.log(`[OPS PR] Creating PR for country: ${country.toUpperCase()} (${validatedEntries.length} entries)`);
-    const prResult = await _createPRForCountry(country, validatedEntries, 'system@ops');
-    if (prResult.success) {
-      console.log(`[OPS PR] Success: ${prResult.prUrl}`);
-      const approvedAt = new Date().toISOString();
-      // Re-fetch history after the multi-step PR creation round-trips
-      const histAfterPr = await fetchGitHubJson('data/ops/history.json', {});
-      (histAfterPr[country] || []).forEach(h => {
-        if (h.status === 'validated' || h.status === 'pending') {
-          h.status     = 'approved';
-          h.approvedAt = approvedAt;
-          h.approvedBy = 'system@ops';
-          h.prUrl      = prResult.prUrl;
-          h.prNumber   = prResult.prNumber;
-          h.branchName = prResult.branchName;
-        }
-      });
-      await commitJsonToMainBranch('data/ops/history.json', histAfterPr, `ops: scheduler — mark entries approved after PR #${prResult.prNumber}`);
-      appendAdminAudit({
-        action:     'pr-auto-created',
-        by:         'system@ops',
-        country,
-        branchName: prResult.branchName,
-        prNumber:   prResult.prNumber,
-        prUrl:      prResult.prUrl,
-        trigger:    'expiration-scheduler'
-      });
-    } else {
-      console.error(`[OPS PR] Failed: ${prResult.error}`);
-    }
+// ─── PR Schedule routes ───────────────────────────────────────────────────────
+
+/**
+ * GET /api/ops/pr/schedule
+ * Returns the full pr_schedule.json so the frontend can render countdown timers.
+ */
+app.get('/api/ops/pr/schedule', async (req, res) => {
+  await _maybeTriggerScheduledPRs(); // lazy hybrid trigger
+  res.json(await fetchGitHubJson(PR_SCHEDULE_PATH, {}));
+});
+
+/**
+ * POST /api/ops/pr/schedule
+ * Schedules a PR for a country (10-minute delayed creation).
+ * All roles (OL, Manager, Admin) may call this.
+ *
+ * Blocked if:
+ *   - Any buffer entry for this country is still "pending" (not all validated)
+ *   - A PR job is already scheduled for this country
+ *   - A PR is already open on GitHub for this country
+ */
+app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
+  await _maybeTriggerScheduledPRs(); // lazy hybrid trigger
+
+  const { country } = req.body;
+  if (!country || !validateCountry(country)) {
+    return res.status(400).json({ error: 'Valid country is required' });
+  }
+  if (!['OL', 'Manager', 'Admin'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Only OL, Manager or Admin can schedule a PR' });
   }
 
-  console.log('[OPS scheduler] Sweep complete');
+  const [buffer, schedule] = await Promise.all([
+    fetchGitHubJson('data/ops/buffer.json', {}),
+    fetchGitHubJson(PR_SCHEDULE_PATH, {})
+  ]);
+
+  // Block if already scheduled
+  if (schedule[country]) {
+    return res.status(409).json({ error: 'A PR is already scheduled for this country', job: schedule[country] });
+  }
+
+  // Block if open PR exists on GitHub
+  const hasOpen = await _hasOpenPRForCountry(country);
+  if (hasOpen) {
+    return res.status(409).json({ error: 'A PR is already open on GitHub for this country' });
+  }
+
+  // Collect all entries for this country from the buffer
+  const countryBuf      = buffer[country] || {};
+  const allEntries      = Object.values(countryBuf).flat();
+  const validatedCount  = allEntries.filter(e => e.status === 'validated').length;
+  const pendingCount    = allEntries.filter(e => e.status === 'pending').length;
+
+  if (!validatedCount) {
+    return res.status(400).json({ error: 'No validated entries to create a PR for' });
+  }
+  if (pendingCount > 0) {
+    return res.status(400).json({
+      error: `${pendingCount} pending entr${pendingCount > 1 ? 'ies' : 'y'} must be validated or removed before scheduling a PR`
+    });
+  }
+
+  const now = new Date();
+  const job = {
+    country,
+    scheduled_at:  now.toISOString(),
+    execute_after: new Date(now.getTime() + PR_DELAY_MS).toISOString(),
+    created_by:    req.user.email,
+    delay_ms:      PR_DELAY_MS,
+    entry_count:   validatedCount
+  };
+
+  schedule[country] = job;
+  await commitJsonToMainBranch(PR_SCHEDULE_PATH, schedule, `ops: schedule PR for ${country} by ${req.user.email}`);
+
+  appendActivityLog({
+    event:       'pr-scheduled',
+    by:          req.user.email,
+    country,
+    execute_after: job.execute_after,
+    entryCount:  validatedCount
+  });
+
+  console.log(`[PR schedule] Scheduled PR for "${country}" to execute after ${job.execute_after}`);
+  res.json({ success: true, job });
+});
+
+/**
+ * DELETE /api/ops/pr/schedule/:country
+ * Cancels (undoes) a scheduled PR job. Available during the 10-minute window.
+ * All roles may undo a PR they can see.
+ */
+app.delete('/api/ops/pr/schedule/:country', requireAuth, async (req, res) => {
+  const country = (req.params.country || '').toLowerCase();
+  if (!validateCountry(country)) {
+    return res.status(400).json({ error: 'Invalid country' });
+  }
+
+  const schedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+  if (!schedule[country]) {
+    return res.status(404).json({ error: 'No scheduled PR found for this country' });
+  }
+
+  const job = schedule[country];
+  delete schedule[country];
+  await commitJsonToMainBranch(PR_SCHEDULE_PATH, schedule, `ops: undo PR schedule for ${country} by ${req.user.email}`);
+
+  console.log(`[PR schedule] PR for "${country}" cancelled by ${req.user.email}`);
+  res.json({ success: true, job });
+});
+
+/**
+ * GET /api/ops/pr/status/:country
+ * Polls GitHub for the current status of the most recent PR for a country.
+ * Returns { prNumber, prUrl, state: 'open'|'merged'|'closed', merged: bool }
+ * Also updates history pr_status if the PR has been merged or closed.
+ */
+app.get('/api/ops/pr/status/:country', requireAuth, async (req, res) => {
+  const country = (req.params.country || '').toLowerCase();
+  if (!validateCountry(country)) {
+    return res.status(400).json({ error: 'Invalid country' });
+  }
+
+  try {
+    // Find all PRs (open + closed) for this country's branch prefix
+    const openRes = await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls?state=all&per_page=20`,
+      { headers: ghHeaders() }
+    );
+    if (!openRes.ok) return res.json({ state: 'unknown' });
+
+    const prs = await openRes.json();
+    const countryPRs = prs.filter(pr => pr.head?.ref?.startsWith(`${country}_`));
+    if (!countryPRs.length) return res.json({ state: 'none' });
+
+    // Most recent PR = highest number
+    const pr = countryPRs.sort((a, b) => b.number - a.number)[0];
+    const state  = pr.state;          // 'open' | 'closed'
+    const merged = !!pr.merged_at;
+    const result = { prNumber: pr.number, prUrl: pr.html_url, state, merged };
+
+    // Sync history if PR has resolved
+    if (state === 'closed') {
+      const newPrStatus = merged ? 'merged' : 'refused';
+      const history = await fetchGitHubJson('data/ops/history.json', {});
+      let dirty = false;
+      (history[country] || []).forEach(h => {
+        if (h.prNumber === pr.number && h.pr_status === 'pending_merge') {
+          h.pr_status = newPrStatus;
+          if (merged) h.mergedAt = pr.merged_at;
+          else        h.closedAt = pr.closed_at;
+          dirty = true;
+        }
+      });
+      if (dirty) {
+        await commitJsonToMainBranch(
+          'data/ops/history.json', history,
+          `ops: sync pr_status=${newPrStatus} for ${country} PR #${pr.number}`
+        );
+        appendActivityLog({
+          event:     merged ? 'pr-merged' : 'pr-refused',
+          country,
+          prNumber:  pr.number,
+          prUrl:     pr.html_url,
+          by:        'system@poll'
+        });
+      }
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error('[PR status] poll error:', err.message);
+    res.json({ state: 'unknown', error: err.message });
+  }
+});
+
+// ─── Logs read endpoint ───────────────────────────────────────────────────────
+
+/**
+ * GET /api/ops/logs
+ * Returns activity_logs.json — the new structured log (validation, PR events, rollback).
+ */
+app.get('/api/ops/logs', async (req, res) => {
+  res.json(await fetchGitHubJson('data/logs/activity_logs.json', []));
+});
+
+// ─── Scheduled PR executor ────────────────────────────────────────────────────
+
+// Guard: prevent concurrent executions
+let _executorRunning = false;
+
+/**
+ * Core executor. Called by both setInterval and lazily on API requests.
+ * Scans pr_schedule.json, fires any jobs whose execute_after time has passed.
+ * For each due job:
+ *   1. Checks all buffer entries for the country are validated (no pending).
+ *   2. If not → silently cancels the job (writes log).
+ *   3. If yes → calls _createPRForCountry, moves entries to history, clears job.
+ */
+async function _runScheduledPRExecutor() {
+  if (_executorRunning) return;
+  _executorRunning = true;
+  try {
+    const schedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+    const now      = Date.now();
+    const due      = Object.entries(schedule).filter(
+      ([, job]) => new Date(job.execute_after).getTime() <= now
+    );
+
+    if (!due.length) return;
+    console.log(`[PR executor] ${due.length} job(s) due for execution`);
+
+    for (const [country, job] of due) {
+      console.log(`[PR executor] Executing scheduled PR for "${country}" (scheduled by ${job.created_by})`);
+
+      try {
+        const buffer     = await fetchGitHubJson('data/ops/buffer.json', {});
+        const countryBuf = buffer[country] || {};
+        const allEntries = Object.values(countryBuf).flat();
+        const validated  = allEntries.filter(e => e.status === 'validated');
+        const pending    = allEntries.filter(e => e.status === 'pending');
+
+        // Remove the job from the schedule regardless of outcome
+        const freshSchedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+        delete freshSchedule[country];
+        await commitJsonToMainBranch(PR_SCHEDULE_PATH, freshSchedule, `ops: complete PR schedule job for ${country}`);
+
+        if (pending.length > 0 || !validated.length) {
+          console.warn(`[PR executor] "${country}" has ${pending.length} pending / ${validated.length} validated — cancelling PR silently`);
+          appendActivityLog({
+            event:    'pr-cancelled-pending',
+            country,
+            pending:  pending.length,
+            validated: validated.length,
+            by:       'system@executor'
+          });
+          continue;
+        }
+
+        // Check for existing open PR (safety lock)
+        const hasOpen = await _hasOpenPRForCountry(country);
+        if (hasOpen) {
+          console.warn(`[PR executor] Open PR already exists for "${country}" — skipping`);
+          continue;
+        }
+
+        const prResult = await _createPRForCountry(country, validated, job.created_by);
+
+        if (prResult.success) {
+          console.log(`[PR executor] PR #${prResult.prNumber} created for "${country}" → ${prResult.prUrl}`);
+          await _moveBufToHistoryAfterPR(country, validated, prResult, job.created_by);
+
+          appendActivityLog({
+            event:      'pr-created',
+            by:         job.created_by,
+            country,
+            branchName: prResult.branchName,
+            prNumber:   prResult.prNumber,
+            prUrl:      prResult.prUrl,
+            entryCount: validated.length,
+            trigger:    'scheduled'
+          });
+        } else {
+          console.error(`[PR executor] PR creation failed for "${country}": ${prResult.error}`);
+          appendActivityLog({
+            event:   'pr-create-failed',
+            country,
+            error:   prResult.error,
+            by:      'system@executor'
+          });
+        }
+
+      } catch (jobErr) {
+        console.error(`[PR executor] Unexpected error for "${country}":`, jobErr.message);
+      }
+    }
+  } finally {
+    _executorRunning = false;
+  }
+}
+
+/**
+ * Lazy hybrid trigger: called at the start of schedule/status endpoints so
+ * that a Render instance waking from sleep still executes due jobs promptly.
+ */
+async function _maybeTriggerScheduledPRs() {
+  _runScheduledPRExecutor().catch(err =>
+    console.error('[PR executor] lazy trigger error:', err.message)
+  );
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────
@@ -1564,12 +1721,15 @@ app.listen(port, () => {
     ? `[OPS] GitHub automation enabled — target branch: ${GITHUB_TARGET_BRANCH} (${GITHUB_OWNER}/${GITHUB_REPO})`
     : `[OPS] WARNING: GITHUB_TOKEN not configured — PR automation disabled`);
 
-  // Start expiration scheduler — runs every 5 minutes
-  const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+  // ── Scheduled PR executor — runs every 60 seconds ────────────────────────
+  // Hybrid approach: setInterval catches active sessions; lazy execution in
+  // _maybeTriggerScheduledPRs() fires on any authenticated API call so that
+  // Render cold-start / sleep scenarios are also handled.
+  const PR_EXEC_INTERVAL_MS = 60 * 1000;
   setInterval(() => {
-    _runExpirationSweep().catch(err =>
-      console.error('[OPS scheduler] Unhandled sweep error:', err.message)
+    _runScheduledPRExecutor().catch(err =>
+      console.error('[PR executor] Unhandled error:', err.message)
     );
-  }, SWEEP_INTERVAL_MS);
-  console.log(`[OPS scheduler] Expiration sweep scheduled every ${SWEEP_INTERVAL_MS / 60000} minutes`);
+  }, PR_EXEC_INTERVAL_MS);
+  console.log('[PR executor] Scheduled PR executor running every 60 seconds');
 });
