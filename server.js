@@ -297,11 +297,29 @@ async function _createPRForCountry(country, validatedEntries, triggeredBy) {
       throw new Error(`Failed to create GitHub branch "${branchName}"`);
     }
 
+    // Read the current production process file from main branch
     const processesData = await readProcessData(country);
     if (!processesData) throw new Error(`No process data found for country "${country}"`);
 
+    // Apply each validated entry to an in-memory copy of the process array.
+    // This produces the desired post-merge state without touching main branch.
+    const arr = processesData.data.map(p => ({ ...p })); // shallow-copy each process
+    for (const h of validatedEntries) {
+      const targetIdx = arr.findIndex(
+        p => p.id === h.process?.id || p.issue === h.process?.issue
+      );
+      if (h.type === 'create') {
+        if (targetIdx === -1) arr.push({ ...h.process });
+      } else if (h.type === 'update') {
+        if (targetIdx !== -1) arr[targetIdx] = { ...h.process };
+        else arr.push({ ...h.process });
+      } else if (h.type === 'delete') {
+        if (targetIdx !== -1) arr.splice(targetIdx, 1);
+      }
+    }
+
     const processJson = JSON.stringify(
-      { ...processesData.meta, processes: processesData.data },
+      { ...processesData.meta, processes: arr, lastUpdated: new Date().toISOString() },
       null, 2
     );
 
@@ -674,10 +692,10 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
     if (!history[country]) history[country] = [];
     history[country].push(entry);
 
-    await Promise.all([
-      commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `ops: remove validated entry ${entry.id} from buffer`),
-      commitJsonToMainBranch('data/ops/history.json', history, `ops: add validated entry ${entry.id} for ${country}`)
-    ]);
+    // Sequential writes — parallel commits to the same branch cause SHA conflicts
+    // where one PUT wins and the other silently fails with 422 (stale sha).
+    await commitJsonToMainBranch('data/ops/history.json', history, `ops: add validated entry ${entry.id} for ${country}`);
+    await commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `ops: remove validated entry ${entry.id} from buffer`);
 
     appendAdminAudit({
       action:  'buffer-validated',
