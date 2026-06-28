@@ -354,11 +354,26 @@ app.post("/send-otp", async (req, res) => {
     const resend = new Resend(process.env.RESEND_API_KEY);
 
     await resend.emails.send({
-      from: "Process Finder <noreply@processfinder.xyz>",
-      to: email,
-      subject: "Your OTP Code",
-      html: `<h3>Your OTP Code</h3><p><b>${otp}</b></p>`
-    });
+  from: "Process Finder <noreply@processfinder.xyz>",
+  to: email,
+  subject: "[Process Finder] Your OTP Code ✅",
+  html: `
+    <p>Hello,</p>
+
+    <p>Your verification code is:</p>
+
+    <h2 style="letter-spacing:2px;">${otp}</h2>
+
+    <p>This code will expire in 5 minutes.</p>
+
+    <p>If you did not request this, please ignore this email.</p>
+
+    <br>
+
+    <p>Regards,<br>Process Finder Team</p>
+  `
+});
+
 
     console.log("[OTP SENT]", email, otp);
 
