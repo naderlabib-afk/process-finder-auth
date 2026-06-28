@@ -196,27 +196,46 @@ async function commitToGitHub(branchName, commits) {
  * Commits a single JSON value to the GITHUB_BRANCH (main data branch).
  * Uses PUT /contents — creates the file if it doesn't exist, updates with sha if it does.
  */
-async function commitJsonToMainBranch(filePath, data, message) {
-  try {
-    const fileInfo = await getGitHubFileContent(filePath);
-    const res = await fetch(
-      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
-      {
-        method: 'PUT',
-        headers: ghHeaders(),
-        body: JSON.stringify({
-          message,
-          content: Buffer.from(JSON.stringify(data, null, 2) + '\n').toString('base64'),
-          branch: GITHUB_BRANCH,
-          ...(fileInfo ? { sha: fileInfo.sha } : {})
-        })
+async function commitJsonToMainBranch(filePath, data, message, _retries = 3) {
+  for (let attempt = 1; attempt <= _retries; attempt++) {
+    try {
+      const fileInfo = await getGitHubFileContent(filePath);
+      const res = await fetch(
+        `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
+        {
+          method: 'PUT',
+          headers: ghHeaders(),
+          body: JSON.stringify({
+            message,
+            content: Buffer.from(JSON.stringify(data, null, 2) + '\n').toString('base64'),
+            branch: GITHUB_BRANCH,
+            ...(fileInfo ? { sha: fileInfo.sha } : {})
+          })
+        }
+      );
+      if (res.ok) return true;
+      // 409/422 = SHA conflict — re-fetch and retry
+      if (res.status === 409 || res.status === 422) {
+        const body = await res.text().catch(() => '');
+        console.warn(`[GitHub] commitJsonToMainBranch SHA conflict for "${filePath}" (attempt ${attempt}): ${res.status} ${body}`);
+        if (attempt < _retries) {
+          await new Promise(r => setTimeout(r, 300 * attempt)); // back-off
+          continue;
+        }
       }
-    );
-    return res.ok;
-  } catch (err) {
-    console.error(`[GitHub] commitJsonToMainBranch failed for "${filePath}":`, err.message);
-    return false;
+      const errBody = await res.text().catch(() => '');
+      console.error(`[GitHub] commitJsonToMainBranch failed for "${filePath}": ${res.status} ${errBody}`);
+      return false;
+    } catch (err) {
+      console.error(`[GitHub] commitJsonToMainBranch threw for "${filePath}" (attempt ${attempt}):`, err.message);
+      if (attempt < _retries) {
+        await new Promise(r => setTimeout(r, 300 * attempt));
+        continue;
+      }
+      return false;
+    }
   }
+  return false;
 }
 
 async function createGitHubPR(branchName, title, description) {
@@ -630,6 +649,26 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
     }
   }
 
+  // ── Scheduled-PR lock guard ──────────────────────────────────────────────────
+  const cancelSchedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+  const cancelSchedJob = cancelSchedule[country];
+  if (cancelSchedJob && Array.isArray(cancelSchedJob.entry_ids) && cancelSchedJob.entry_ids.includes(entry.id)) {
+    return res.status(409).json({
+      error: 'This entry is locked by a scheduled PR. Undo the scheduled PR before making changes.'
+    });
+  }
+
+  // ── Open-PR lock guard ───────────────────────────────────────────────────────
+  const cancelHistory = await fetchGitHubJson('data/ops/history.json', {});
+  const cancelIsInOpenPR = (cancelHistory[country] || []).some(
+    h => h.pr_status === 'pending_merge' && h.id === entry.id
+  );
+  if (cancelIsInOpenPR) {
+    return res.status(409).json({
+      error: 'This entry is locked by a scheduled or open PR. Undo the scheduled PR before making changes.'
+    });
+  }
+
   // Splice out — no history write, no log entry
   entries.splice(index, 1);
 
@@ -675,6 +714,29 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
   if (_processingEntries.has(entry.id)) {
     return res.status(409).json({ error: 'Entry is already being processed' });
   }
+
+  // ── Scheduled-PR lock guard ──────────────────────────────────────────────────
+  // Reject modifications to entries that are already frozen by a scheduled PR.
+  const schedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+  const schedJob = schedule[country];
+  if (schedJob && Array.isArray(schedJob.entry_ids) && schedJob.entry_ids.includes(entry.id)) {
+    return res.status(409).json({
+      error: 'This entry is locked by a scheduled PR. Undo the scheduled PR before making changes.'
+    });
+  }
+
+  // ── Open-PR lock guard ───────────────────────────────────────────────────────
+  // Reject modifications to entries already submitted into an open PR.
+  const history = await fetchGitHubJson('data/ops/history.json', {});
+  const isInOpenPR = (history[country] || []).some(
+    h => h.pr_status === 'pending_merge' && h.id === entry.id
+  );
+  if (isInOpenPR) {
+    return res.status(409).json({
+      error: 'This entry is locked by a scheduled or open PR. Undo the scheduled PR before making changes.'
+    });
+  }
+
   _processingEntries.add(entry.id);
 
   try {
@@ -693,10 +755,23 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
     }
 
     // Single write — entry stays in buffer, status toggled in-place
-    await commitJsonToMainBranch(
+    const committed = await commitJsonToMainBranch(
       'data/ops/buffer.json', buffer,
       `ops: ${entry.status === 'validated' ? 'validate' : 'unvalidate'} entry ${entry.id} for ${country}`
     );
+
+    if (!committed) {
+      console.error(`[OPS validate] GitHub write failed for entry "${entry.id}" — reverting in-memory change`);
+      // Revert the in-memory status change so state is consistent on retry
+      if (entry.status === 'validated') {
+        entry.status = 'pending';
+        delete entry.validatedAt;
+        delete entry.validatedBy;
+      } else {
+        entry.status = 'validated';
+      }
+      return res.status(503).json({ error: 'GitHub write failed — please retry in a moment.' });
+    }
 
     // Log validation events only (not unvalidations — only impactful events go to logs)
     if (entry.status === 'validated') {
@@ -1483,6 +1558,13 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     });
   }
 
+  // Snapshot the IDs of the validated entries included in this PR.
+  // Used by the frontend to freeze exactly those entries during countdown.
+  const validatedEntryIds = allEntries
+    .filter(e => e.status === 'validated')
+    .map(e => e.id)
+    .filter(Boolean);
+
   const now = new Date();
   const job = {
     country,
@@ -1490,7 +1572,8 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     execute_after: new Date(now.getTime() + PR_DELAY_MS).toISOString(),
     created_by:    req.user.email,
     delay_ms:      PR_DELAY_MS,
-    entry_count:   validatedCount
+    entry_count:   validatedCount,
+    entry_ids:     validatedEntryIds
   };
 
   schedule[country] = job;
