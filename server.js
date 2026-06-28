@@ -645,37 +645,21 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
   const entry = entries.splice(index, 1)[0];
 
   try {
-    const processesData = await readProcessData(country);
-    if (!processesData) {
-      entries.splice(index, 0, entry);
-      return res.status(404).json({ error: 'Process file not found for country' });
-    }
+    // Process data is NOT written here — it is updated only when the PR is merged
+    // into main by GitHub. before/after snapshots are derived from the entry itself.
+    let before = entry.before ?? null;
+    let after  = entry.after  ?? null;
 
-    const arr = processesData.data;
-    const targetIdx = arr.findIndex(p => p.id === entry.process.id || p.issue === entry.process.issue);
-
-    let before = null;
-    let after  = null;
-
-    if (entry.type === 'create') {
-      after = { ...entry.process };
-      if (targetIdx === -1) arr.push(entry.process);
-    } else if (entry.type === 'update') {
-      if (targetIdx !== -1) {
-        before = { ...arr[targetIdx] };
-        arr[targetIdx] = entry.process;
-      } else {
-        arr.push(entry.process);
+    // For entries that don't carry pre-computed snapshots, derive them from the
+    // process payload (mirrors the shape the UI expects in the diff block).
+    if (before === null && after === null) {
+      if (entry.type === 'create') {
+        after = { ...entry.process };
+      } else if (entry.type === 'update') {
+        after = { ...entry.process };
       }
-      after = { ...entry.process };
-    } else if (entry.type === 'delete') {
-      if (targetIdx !== -1) {
-        before = { ...arr[targetIdx] };
-        arr.splice(targetIdx, 1);
-      }
+      // delete: before unknown without reading the file — leave as null
     }
-
-    await writeProcessData(country, arr, processesData.meta);
 
     const now             = new Date().toISOString();
     entry.validatedAt     = now;
@@ -796,39 +780,9 @@ app.post('/api/ops/rollback', requireAuth, async (req, res) => {
   const itemId       = itemSnapshot.id;
   const itemProcess  = itemSnapshot.process;
 
-  const processesData = await readProcessData(country);
-  if (processesData) {
-    const arr = processesData.data;
-
-    if (itemType === 'create') {
-      const removeIdx = arr.findIndex(
-        p => p.id === afterSnap?.id || p.issue === afterSnap?.issue
-      );
-      if (removeIdx !== -1) arr.splice(removeIdx, 1);
-
-    } else if (itemType === 'update') {
-      if (beforeSnap) {
-        const restoreIdx = arr.findIndex(
-          p => p.id === afterSnap?.id || p.issue === afterSnap?.issue
-        );
-        if (restoreIdx !== -1) arr[restoreIdx] = beforeSnap;
-        else arr.push(beforeSnap);
-      }
-
-    } else if (itemType === 'delete') {
-      if (beforeSnap) {
-        const alreadyExists = arr.some(
-          p => p.id === beforeSnap.id || p.issue === beforeSnap.issue
-        );
-        if (!alreadyExists) arr.push(beforeSnap);
-      }
-    }
-
-    await writeProcessData(country, arr, processesData.meta);
-  }
-
-  // Re-fetch history immediately before write — captures any concurrent writes
-  // that occurred during the writeProcessData round-trip above.
+  // Process data is NOT reverted here — rollback takes effect only when the
+  // corresponding PR (restoring the previous state) is merged into main.
+  // Re-fetch history immediately before write to get the latest GitHub SHA.
   const history = await fetchGitHubJson('data/ops/history.json', {});
 
   // Stamp the original entry in-place in the freshly fetched copy
@@ -1466,17 +1420,11 @@ async function _runExpirationSweep() {
     const expired = expiredByCountry[country];
     console.log(`[OPS scheduler] Found ${expired.length} expired entries (${country.toUpperCase()})`);
 
-    const processesData = await readProcessData(country);
-    if (!processesData) {
-      console.error(`[OPS scheduler] Process file not found for "${country}" — skipping all entries`);
-      continue;
-    }
-    const arr = processesData.data;
-
-    // Collect validated entries in memory for this country
+    // Process data is NOT written here — it is updated only when the PR is merged.
+    // Collect validated entry stubs in memory; snapshots derived from entry payload.
     const newlyValidated = [];
 
-    for (const { userEmail, entry, idx } of expired) {
+    for (const { userEmail, entry } of expired) {
       _processingEntries.add(entry.id);
       try {
         const userEntries = buffer[country][userEmail] || [];
@@ -1488,21 +1436,13 @@ async function _runExpirationSweep() {
 
         const freshEntry = userEntries.splice(bufIdx, 1)[0];
 
-        const targetIdx = arr.findIndex(
-          p => p.id === freshEntry.process.id || p.issue === freshEntry.process.issue
-        );
-        let before = null;
-        let after  = null;
-
-        if (freshEntry.type === 'create') {
-          after = { ...freshEntry.process };
-          if (targetIdx === -1) arr.push(freshEntry.process);
-        } else if (freshEntry.type === 'update') {
-          if (targetIdx !== -1) { before = { ...arr[targetIdx] }; arr[targetIdx] = freshEntry.process; }
-          else arr.push(freshEntry.process);
-          after = { ...freshEntry.process };
-        } else if (freshEntry.type === 'delete') {
-          if (targetIdx !== -1) { before = { ...arr[targetIdx] }; arr.splice(targetIdx, 1); }
+        // Derive before/after snapshots from the entry payload (no file read)
+        let before = freshEntry.before ?? null;
+        let after  = freshEntry.after  ?? null;
+        if (before === null && after === null) {
+          if (freshEntry.type === 'create' || freshEntry.type === 'update') {
+            after = { ...freshEntry.process };
+          }
         }
 
         const validatedAt          = new Date().toISOString();
@@ -1537,15 +1477,13 @@ async function _runExpirationSweep() {
 
     if (!newlyValidated.length) continue;
 
-    // Re-fetch history immediately before write — avoids overwriting concurrent writes
-    // that occurred during the readProcessData / per-entry processing above.
+    // Re-fetch history immediately before write to get the latest GitHub SHA.
     const history = await fetchGitHubJson('data/ops/history.json', {});
     if (!history[country]) history[country] = [];
     newlyValidated.forEach(e => history[country].push(e));
 
-    // Commit process file, buffer, and history together
+    // Commit buffer and history — process file intentionally excluded
     await Promise.all([
-      writeProcessData(country, arr, processesData.meta),
       commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `ops: scheduler — remove expired entries for ${country}`),
       commitJsonToMainBranch('data/ops/history.json', history, `ops: scheduler — add validated entries for ${country}`)
     ]);
