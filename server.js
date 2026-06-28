@@ -1567,6 +1567,7 @@ async function _runExpirationSweep() {
 
 app.listen(port, () => {
   console.log(`Process Finder server listening on http://localhost:${port}`);
+  console.log('[STORAGE] GitHub-only mode — no local filesystem used');
   console.log(GITHUB_TOKEN
     ? `[OPS] GitHub automation enabled — target branch: ${GITHUB_TARGET_BRANCH} (${GITHUB_OWNER}/${GITHUB_REPO})`
     : `[OPS] WARNING: GITHUB_TOKEN not configured — PR automation disabled`);
