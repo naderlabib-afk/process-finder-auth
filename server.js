@@ -138,33 +138,146 @@ async function fetchGitHubJson(filePath, fallback = null) {
   }
 }
 
-async function createGitHubBranch(branchName) {
+// ─── OPS PR file allowlist ────────────────────────────────────────────────────
+/**
+ * The ONLY file paths an automated OPS PR is permitted to modify.
+ * Any other file appearing in the PR's changed-file list is a sign of a
+ * polluted branch and will cause the PR to be aborted / auto-closed.
+ *
+ * When GITHUB_TARGET_BRANCH === 'main':
+ *   data/processes/{country}.json
+ *
+ * When GITHUB_TARGET_BRANCH === 'feature/pre-live' (legacy pre-live phase):
+ *   data/processes/{country}.json  (still the same — we no longer use pre-live/ prefix)
+ */
+const OPS_PR_ALLOWED_PATH_PREFIX = 'data/processes/';
+
+function _isAllowedPRPath(filePath) {
+  return typeof filePath === 'string' && filePath.startsWith(OPS_PR_ALLOWED_PATH_PREFIX);
+}
+
+// ─── GitHub branch helpers ────────────────────────────────────────────────────
+
+/**
+ * Returns the latest commit SHA for a given branch, or null if not found.
+ * Always reads from the live GitHub ref — never from a cached local state.
+ */
+async function _getLatestBranchSha(branchName) {
   try {
-    const refRes = await fetch(
-      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${GITHUB_BRANCH}`,
+    const res = await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${encodeURIComponent(branchName)}`,
       { headers: ghHeaders() }
     );
-    if (!refRes.ok) throw new Error('Failed to get branch ref');
-    const { object: { sha } } = await refRes.json();
-
-    const createRes = await fetch(
-      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs`,
-      { method: 'POST', headers: ghHeaders(), body: JSON.stringify({ ref: `refs/heads/${branchName}`, sha }) }
-    );
-    return createRes.ok;
+    if (!res.ok) return null;
+    const data = await res.json();
+    // refs/heads/<branch> may return an array for prefix matches — find exact
+    if (Array.isArray(data)) {
+      const exact = data.find(r => r.ref === `refs/heads/${branchName}`);
+      return exact ? exact.object.sha : null;
+    }
+    return data.object ? data.object.sha : null;
   } catch (err) {
-    console.error('GitHub branch creation error:', err);
-    return false;
+    console.error(`[GitHub] _getLatestBranchSha("${branchName}") error:`, err.message);
+    return null;
   }
 }
 
+/**
+ * Returns true if a branch already exists on origin.
+ */
+async function _branchExists(branchName) {
+  const sha = await _getLatestBranchSha(branchName);
+  return sha !== null;
+}
+
+/**
+ * Creates a new branch from the exact latest SHA of baseBranch.
+ * Returns { ok: true, sha } or { ok: false, error }.
+ *
+ * CRITICAL: baseBranch must be GITHUB_TARGET_BRANCH so the new branch and the
+ * PR share the same ancestry — preventing the "221 commits / 77 files" problem
+ * that occurred when the branch was created from main but PR targeted feature/pre-live.
+ */
+async function createOPSBranch(branchName, baseBranch) {
+  console.log(`[OPS branch] Creating "${branchName}" from "${baseBranch}"`);
+  try {
+    const sha = await _getLatestBranchSha(baseBranch);
+    if (!sha) {
+      return { ok: false, error: `Base branch "${baseBranch}" not found or has no commits` };
+    }
+    console.log(`[OPS branch] Base SHA for "${baseBranch}": ${sha}`);
+
+    const createRes = await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs`,
+      {
+        method: 'POST',
+        headers: ghHeaders(),
+        body: JSON.stringify({ ref: `refs/heads/${branchName}`, sha })
+      }
+    );
+    if (!createRes.ok) {
+      const errBody = await createRes.text().catch(() => '');
+      return { ok: false, error: `Branch creation failed (HTTP ${createRes.status}): ${errBody}` };
+    }
+    return { ok: true, sha };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Commits a single file to an OPS PR branch via the GitHub Contents API.
+ * Only whitelisted paths are accepted — returns { ok: false } for blocked paths.
+ * Reads the current file SHA from the OPS branch itself (not from main) to
+ * produce a proper file-update diff rather than a creation.
+ */
+async function commitFileToOPSBranch(branchName, filePath, content, message) {
+  if (!_isAllowedPRPath(filePath)) {
+    console.error(`[OPS branch] BLOCKED: "${filePath}" is not in the allowed path list`);
+    return { ok: false, error: `Path "${filePath}" is not in the OPS PR allowed list` };
+  }
+
+  try {
+    // Read existing file SHA from the OPS branch (not from main or target branch)
+    // so GitHub produces a correct update diff, not a file-creation diff.
+    const fileInfoRes = await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}?ref=${branchName}`,
+      { headers: ghHeaders() }
+    );
+    const fileInfo = fileInfoRes.ok ? await fileInfoRes.json() : null;
+    const existingSha = fileInfo && !Array.isArray(fileInfo) ? fileInfo.sha : undefined;
+
+    const putRes = await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
+      {
+        method: 'PUT',
+        headers: ghHeaders(),
+        body: JSON.stringify({
+          message,
+          content: Buffer.from(content).toString('base64'),
+          branch: branchName,
+          ...(existingSha ? { sha: existingSha } : {})
+        })
+      }
+    );
+    if (!putRes.ok) {
+      const errBody = await putRes.text().catch(() => '');
+      return { ok: false, error: `Commit failed (HTTP ${putRes.status}): ${errBody}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Legacy helper kept for non-OPS-PR uses (commitToGitHub was used by older
+ * server.js routes). Marked internal — do not use for new OPS PR generation.
+ * @deprecated Use commitFileToOPSBranch for OPS PR commits.
+ */
 async function commitToGitHub(branchName, commits) {
   try {
     for (const { filePath, content, message } of commits) {
-      // Fetch the SHA from the TARGET branch, not from GITHUB_BRANCH (main).
-      // The file (e.g. pre-live/data/processes/fr.json) lives on feature/pre-live,
-      // not on main, so reading from main always returns null and causes a full
-      // file creation instead of an update — meaning the PR diff shows no deletions.
       const fileInfoRes = await fetch(
         `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}?ref=${branchName}`,
         { headers: ghHeaders() }
@@ -310,35 +423,179 @@ async function appendAdminAudit(entry) {
 // ─── Idempotency guard ────────────────────────────────────────────────────────
 const _processingEntries = new Set();
 
-// ─── Shared PR helper ─────────────────────────────────────────────────────────
+// ─── OPS PR creation ──────────────────────────────────────────────────────────
+
 /**
- * Creates a GitHub branch, commits the country process file, and opens a PR.
+ * Generates a unique OPS branch name for the given country.
+ * Pattern: ops/<country>/<YYYYMMDD>-<HHMM>
+ * If the generated name already exists, appends a seconds suffix to ensure
+ * uniqueness without reusing any old generated branch.
  */
-async function _createPRForCountry(country, validatedEntries, triggeredBy) {
+async function _generateOPSBranchName(country) {
   const now  = new Date();
   const pad  = n => String(n).padStart(2, '0');
-  const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}_${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}`;
-  const branchName = `${country}_${stamp}`;
+  const date = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}`;
+  const time = `${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}`;
+  let name   = `ops/${country}/${date}-${time}`;
 
-  console.log(`[OPS PR] Creating branch "${branchName}" for country "${country}" triggered by ${triggeredBy}`);
+  // Uniqueness guard — append seconds if name already taken
+  if (await _branchExists(name)) {
+    name = `${name}-${pad(now.getUTCSeconds())}`;
+    // Second collision is astronomically unlikely but guard anyway
+    if (await _branchExists(name)) {
+      name = `${name}-${Date.now()}`;
+    }
+  }
+  return name;
+}
+
+/**
+ * Verifies that the generated PR only modified allowed files.
+ * Fetches the PR's file list from the GitHub API and checks each path against
+ * the OPS allowlist.  Returns { clean: true } or { clean: false, blockedFiles }.
+ */
+async function _verifyPRFileScope(prNumber) {
+  try {
+    const res = await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/files`,
+      { headers: ghHeaders() }
+    );
+    if (!res.ok) {
+      console.warn(`[OPS PR] Could not fetch file list for PR #${prNumber}: HTTP ${res.status}`);
+      return { clean: false, blockedFiles: [], error: `GitHub API returned ${res.status}` };
+    }
+    const files = await res.json();
+    const blockedFiles = (Array.isArray(files) ? files : [])
+      .map(f => f.filename)
+      .filter(f => !_isAllowedPRPath(f));
+
+    if (blockedFiles.length > 0) {
+      console.error(`[OPS PR] PR #${prNumber} contains BLOCKED files: ${blockedFiles.join(', ')}`);
+      return { clean: false, blockedFiles };
+    }
+    return { clean: true, fileCount: files.length };
+  } catch (err) {
+    console.error(`[OPS PR] _verifyPRFileScope error for PR #${prNumber}:`, err.message);
+    return { clean: false, blockedFiles: [], error: err.message };
+  }
+}
+
+/**
+ * Attempts to close (auto-reject) a PR that was created but failed scope verification.
+ * Best-effort — never throws.
+ */
+async function _closePR(prNumber, reason) {
+  try {
+    await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`,
+      {
+        method: 'PATCH',
+        headers: ghHeaders(),
+        body: JSON.stringify({
+          state: 'closed',
+          body: `[AUTO-CLOSED] PR creation aborted by safety check.\nReason: ${reason}`
+        })
+      }
+    );
+    console.log(`[OPS PR] Auto-closed PR #${prNumber} — reason: ${reason}`);
+  } catch (err) {
+    console.error(`[OPS PR] Failed to auto-close PR #${prNumber}:`, err.message);
+  }
+}
+
+/**
+ * Pre-flight check before creating any OPS PR.
+ * Returns { ok: true } or { ok: false, error: string, httpStatus: number }.
+ *
+ * Validates:
+ *   1. GITHUB_TOKEN configured
+ *   2. Target base branch exists
+ *   3. Validated entries provided
+ *   4. No pending entries remain
+ *   5. No PR already open for this country
+ */
+async function _preflightPRCheck(country, validatedEntries, allEntries) {
+  if (!GITHUB_TOKEN) {
+    return { ok: false, httpStatus: 500, error: 'GITHUB_TOKEN not configured on server' };
+  }
+
+  const baseSha = await _getLatestBranchSha(GITHUB_TARGET_BRANCH);
+  if (!baseSha) {
+    return {
+      ok: false, httpStatus: 500,
+      error: `Target base branch "${GITHUB_TARGET_BRANCH}" could not be found`
+    };
+  }
+
+  if (!validatedEntries || validatedEntries.length === 0) {
+    return { ok: false, httpStatus: 400, error: 'No validated entries are ready for PR creation' };
+  }
+
+  const pendingCount = (allEntries || []).filter(e => e.status === 'pending').length;
+  if (pendingCount > 0) {
+    return {
+      ok: false, httpStatus: 400,
+      error: `${pendingCount} pending entr${pendingCount > 1 ? 'ies' : 'y'} must be validated or removed before creating a PR`
+    };
+  }
+
+  const hasOpen = await _hasOpenPRForCountry(country);
+  if (hasOpen) {
+    return {
+      ok: false, httpStatus: 409,
+      error: 'A PR package is already pending approval for this country'
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Creates a clean, data-only automated OPS PR for one country.
+ *
+ * Safety guarantees:
+ *   - Branch is created from the LATEST SHA of GITHUB_TARGET_BRANCH (same as PR base).
+ *     This is the root fix for the "221 commits / 77 files" problem: the old code
+ *     branched from GITHUB_BRANCH (main) but PR'd into GITHUB_TARGET_BRANCH
+ *     (feature/pre-live), forcing git to include every diverged commit.
+ *   - Only data/processes/{country}.json is ever committed (allowlist enforced twice:
+ *     once at commit time and once via post-creation GitHub API file-list check).
+ *   - Branch name follows ops/<country>/<timestamp> and is verified unique.
+ *   - Buffer entries are only moved to History AFTER the PR scope is verified clean.
+ *   - If scope verification fails, the PR is auto-closed and an error is returned.
+ *
+ * @returns {{ success, prUrl?, prNumber?, branchName?, error? }}
+ */
+async function _createPRForCountry(country, validatedEntries, triggeredBy) {
+  const branchName = await _generateOPSBranchName(country);
+  const allowedFilePath = `data/processes/${country}.json`;
+
+  console.log(`[OPS PR] ── Starting PR creation ──────────────────────────`);
+  console.log(`[OPS PR]   country      : ${country}`);
+  console.log(`[OPS PR]   base branch  : ${GITHUB_TARGET_BRANCH}`);
+  console.log(`[OPS PR]   new branch   : ${branchName}`);
+  console.log(`[OPS PR]   target file  : ${allowedFilePath}`);
+  console.log(`[OPS PR]   entries      : ${validatedEntries.length}`);
+  console.log(`[OPS PR]   triggered by : ${triggeredBy}`);
+
+  let createdPRNumber = null;
 
   try {
-    if (!GITHUB_TOKEN) {
-      console.warn('[OPS PR] GITHUB_TOKEN not configured — PR automation skipped');
-      return { success: false, error: 'GITHUB_TOKEN not configured' };
+    // ── Step 1: Create branch from target base branch SHA ──────────────────
+    const branchResult = await createOPSBranch(branchName, GITHUB_TARGET_BRANCH);
+    if (!branchResult.ok) {
+      throw new Error(`Branch creation failed: ${branchResult.error}`);
     }
+    console.log(`[OPS PR] Branch created at SHA: ${branchResult.sha}`);
 
-    if (!await createGitHubBranch(branchName)) {
-      throw new Error(`Failed to create GitHub branch "${branchName}"`);
-    }
-
-    // Read the current production process file from main branch
+    // ── Step 2: Build updated process JSON in memory ────────────────────────
+    // Read from GITHUB_BRANCH (main) — this is the live production data source.
+    // The branch was created from GITHUB_TARGET_BRANCH so the diff will be minimal
+    // (only the actual process changes), but we compute the target state from main.
     const processesData = await readProcessData(country);
     if (!processesData) throw new Error(`No process data found for country "${country}"`);
 
-    // Apply each validated entry to an in-memory copy of the process array.
-    // This produces the desired post-merge state without touching main branch.
-    const arr = processesData.data.map(p => ({ ...p })); // shallow-copy each process
+    const arr = processesData.data.map(p => ({ ...p }));
     for (const h of validatedEntries) {
       const targetIdx = arr.findIndex(
         p => p.id === h.process?.id || p.issue === h.process?.issue
@@ -356,32 +613,66 @@ async function _createPRForCountry(country, validatedEntries, triggeredBy) {
     const processJson = JSON.stringify(
       { ...processesData.meta, processes: arr, lastUpdated: new Date().toISOString() },
       null, 2
+    ) + '\n';
+
+    // ── Step 3: Commit ONLY the allowed process file ────────────────────────
+    const commitResult = await commitFileToOPSBranch(
+      branchName,
+      allowedFilePath,
+      processJson,
+      `ops: ${country} process updates — ${validatedEntries.length} change(s) by ${triggeredBy}`
     );
+    if (!commitResult.ok) {
+      throw new Error(`Commit failed: ${commitResult.error}`);
+    }
+    console.log(`[OPS PR] Committed ${allowedFilePath} to ${branchName}`);
 
-    const committed = await commitToGitHub(branchName, [{
-      filePath: `pre-live/data/processes/${country}.json`,
-      content:  processJson,
-      message:  `ops: ${country} process updates — ${validatedEntries.length} change(s) by ${triggeredBy}`
-    }]);
-    if (!committed) throw new Error('Failed to commit process file to GitHub');
-
+    // ── Step 4: Open PR ─────────────────────────────────────────────────────
+    const now = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}_${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}`;
     const title = `[OPS] ${country.toUpperCase()} Process Updates — ${stamp}`;
-    const trigger = triggeredBy === 'system@ops' ? 'expiry' : 'manual';
     const changeLines = validatedEntries
       .map(h => `- ${h.type.toUpperCase()}: ${h.process?.issue || h.process?.id || '?'}`)
       .join('\n');
     const description =
       `[OPS AUTO PR]\n\n` +
       `Country: ${country.toUpperCase()}\n` +
-      `Triggered by: ${trigger}\n` +
+      `Base branch: ${GITHUB_TARGET_BRANCH}\n` +
+      `Triggered by: ${triggeredBy}\n` +
       `Entries: ${validatedEntries.length}\n\n` +
-      `Changes:\n${changeLines}`;
+      `Changes:\n${changeLines}\n\n` +
+      `Files modified: ${allowedFilePath}`;
 
     const prResult = await createGitHubPR(branchName, title, description);
     if (!prResult.success) throw new Error(prResult.error);
+    createdPRNumber = prResult.prNumber;
+    console.log(`[OPS PR] PR #${prResult.prNumber} created → ${prResult.prUrl}`);
 
-    console.log(`[OPS PR] PR created successfully — #${prResult.prNumber} → ${prResult.prUrl}`);
-    return { success: true, prUrl: prResult.prUrl, prNumber: prResult.prNumber, branchName };
+    // ── Step 5: Post-creation file scope verification ───────────────────────
+    const scopeCheck = await _verifyPRFileScope(prResult.prNumber);
+    if (!scopeCheck.clean) {
+      const blockedList = scopeCheck.blockedFiles.join(', ') || scopeCheck.error || 'unknown';
+      console.error(`[OPS PR] SCOPE VIOLATION on PR #${prResult.prNumber}: ${blockedList}`);
+      await _closePR(prResult.prNumber,
+        `PR creation aborted because unexpected repository files would be modified: ${blockedList}`);
+      return {
+        success: false,
+        error: `PR creation aborted because unexpected repository files would be modified: ${blockedList}`,
+        branchName,
+        prNumber: prResult.prNumber,
+        scopeViolation: true,
+        blockedFiles: scopeCheck.blockedFiles
+      };
+    }
+    console.log(`[OPS PR] Scope verified clean — ${scopeCheck.fileCount} file(s), all allowed`);
+
+    return {
+      success:  true,
+      prUrl:    prResult.prUrl,
+      prNumber: prResult.prNumber,
+      branchName
+    };
 
   } catch (err) {
     console.error(`[OPS PR] _createPRForCountry failed for "${country}":`, err.message);
@@ -984,26 +1275,34 @@ app.post('/api/ops/approve-and-merge', requireAuth, async (req, res) => {
   if (req.user.role !== 'Admin') {
     return res.status(403).json({ error: 'Emergency override is Admin only' });
   }
-  if (!GITHUB_TOKEN) {
-    return res.status(500).json({ error: 'GitHub token not configured on server' });
-  }
-
   try {
-    // Read validated entries directly from the buffer (not history)
-    const buffer         = await fetchGitHubJson('data/ops/buffer.json', {});
-    const countryBuf     = buffer[country] || {};
-    const validatedEntries = Object.values(countryBuf).flat().filter(e => e.status === 'validated');
+    // Read all buffer entries for this country
+    const buffer       = await fetchGitHubJson('data/ops/buffer.json', {});
+    const countryBuf   = buffer[country] || {};
+    const allEntries   = Object.values(countryBuf).flat();
+    const validatedEntries = allEntries.filter(e => e.status === 'validated');
 
-    if (!validatedEntries.length) {
-      return res.status(400).json({ error: 'No validated entries in buffer for this country' });
+    // Run the same pre-flight check used by the scheduled executor
+    const preflight = await _preflightPRCheck(country, validatedEntries, allEntries);
+    if (!preflight.ok) {
+      return res.status(preflight.httpStatus || 400).json({ error: preflight.error });
     }
 
     console.log(`[OPS emergency-override] PR by ${approver} for "${country}" — ${validatedEntries.length} entries`);
 
     const prResult = await _createPRForCountry(country, validatedEntries, approver);
-    if (!prResult.success) throw new Error(prResult.error);
 
-    // Move validated entries from buffer to history as pending_merge
+    if (!prResult.success) {
+      // Scope violation: PR was auto-closed; return clear user-facing message
+      if (prResult.scopeViolation) {
+        return res.status(500).json({
+          error: `PR creation was stopped because unexpected files would be included. Please contact an Admin.\nDetails: ${prResult.error}`
+        });
+      }
+      throw new Error(prResult.error);
+    }
+
+    // Buffer entries only move to History after verified-clean PR creation
     await _moveBufToHistoryAfterPR(country, validatedEntries, prResult, approver);
 
     appendActivityLog({
@@ -1477,7 +1776,11 @@ const PR_SCHEDULE_PATH = 'data/ops/pr_schedule.json';
 /**
  * Returns true if there is currently an open (not merged, not closed) PR
  * for the given country by searching GitHub for PRs from branches matching
- * the country prefix.
+ * the OPS branch naming pattern.
+ *
+ * Matches both the new pattern  ops/<country>/<timestamp>
+ * and the legacy pattern        <country>_<timestamp>
+ * so that existing open PRs created before this fix are still detected.
  */
 async function _hasOpenPRForCountry(country) {
   try {
@@ -1487,9 +1790,14 @@ async function _hasOpenPRForCountry(country) {
     );
     if (!res.ok) return false;
     const prs = await res.json();
-    return prs.some(pr =>
-      pr.head && pr.head.ref && pr.head.ref.startsWith(`${country}_`)
-    );
+    return prs.some(pr => {
+      const ref = pr.head && pr.head.ref ? pr.head.ref : '';
+      // New naming: ops/<country>/...
+      if (ref.startsWith(`ops/${country}/`)) return true;
+      // Legacy naming: <country>_YYYYMMDD_HHMM
+      if (ref.startsWith(`${country}_`)) return true;
+      return false;
+    });
   } catch {
     return false;
   }
@@ -1724,35 +2032,30 @@ async function _runScheduledPRExecutor() {
         const countryBuf = buffer[country] || {};
         const allEntries = Object.values(countryBuf).flat();
         const validated  = allEntries.filter(e => e.status === 'validated');
-        const pending    = allEntries.filter(e => e.status === 'pending');
 
-        // Remove the job from the schedule regardless of outcome
+        // Remove the job from the schedule regardless of outcome — avoids retry loops
         const freshSchedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
         delete freshSchedule[country];
         await commitJsonToMainBranch(PR_SCHEDULE_PATH, freshSchedule, `ops: complete PR schedule job for ${country}`);
 
-        if (pending.length > 0 || !validated.length) {
-          console.warn(`[PR executor] "${country}" has ${pending.length} pending / ${validated.length} validated — cancelling PR silently`);
+        // Pre-flight check (token, base branch, entry state, open PR guard)
+        const preflight = await _preflightPRCheck(country, validated, allEntries);
+        if (!preflight.ok) {
+          console.warn(`[PR executor] Pre-flight failed for "${country}": ${preflight.error}`);
           appendActivityLog({
-            event:    'pr-cancelled-pending',
+            event:   'pr-preflight-failed',
             country,
-            pending:  pending.length,
-            validated: validated.length,
-            by:       'system@executor'
+            error:   preflight.error,
+            by:      'system@executor'
           });
-          continue;
-        }
-
-        // Check for existing open PR (safety lock)
-        const hasOpen = await _hasOpenPRForCountry(country);
-        if (hasOpen) {
-          console.warn(`[PR executor] Open PR already exists for "${country}" — skipping`);
           continue;
         }
 
         const prResult = await _createPRForCountry(country, validated, job.created_by);
 
         if (prResult.success) {
+          // Buffer entries only move to History after PR scope is verified clean.
+          // _createPRForCountry already ran _verifyPRFileScope internally.
           console.log(`[PR executor] PR #${prResult.prNumber} created for "${country}" → ${prResult.prUrl}`);
           await _moveBufToHistoryAfterPR(country, validated, prResult, job.created_by);
 
@@ -1767,12 +2070,17 @@ async function _runScheduledPRExecutor() {
             trigger:    'scheduled'
           });
         } else {
-          console.error(`[PR executor] PR creation failed for "${country}": ${prResult.error}`);
+          // Do NOT move buffer entries to history on failure or scope violation.
+          const isScopeViolation = !!prResult.scopeViolation;
+          console.error(`[PR executor] PR ${isScopeViolation ? 'scope violation' : 'creation failed'} for "${country}": ${prResult.error}`);
           appendActivityLog({
-            event:   'pr-create-failed',
+            event:         isScopeViolation ? 'pr-scope-violation' : 'pr-create-failed',
             country,
-            error:   prResult.error,
-            by:      'system@executor'
+            error:         prResult.error,
+            branchName:    prResult.branchName,
+            prNumber:      prResult.prNumber,
+            blockedFiles:  prResult.blockedFiles,
+            by:            'system@executor'
           });
         }
 
