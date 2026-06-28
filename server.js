@@ -2050,6 +2050,78 @@ app.get('/api/ops/pr/details/:prNumber', requireAuth, async (req, res) => {
   }
 });
 
+// ─── Admin PR close + branch delete (Admin only) ─────────────────────────────
+
+/**
+ * POST /api/admin/pr/close
+ * Closes a PR without merging. Admin only.
+ * Body: { prNumber: number, reason?: string }
+ */
+app.post('/api/admin/pr/close', requireAuth, async (req, res) => {
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  const { prNumber, reason } = req.body;
+  if (!prNumber || typeof prNumber !== 'number') {
+    return res.status(400).json({ error: 'prNumber (number) is required' });
+  }
+  try {
+    const r = await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`,
+      {
+        method: 'PATCH',
+        headers: ghHeaders(),
+        body: JSON.stringify({ state: 'closed', body: reason || '[Admin] Closed without merge' })
+      }
+    );
+    if (!r.ok) {
+      const errBody = await r.text().catch(() => '');
+      return res.status(r.status).json({ error: `GitHub returned ${r.status}: ${errBody}` });
+    }
+    const pr = await r.json();
+    console.log(`[Admin] PR #${prNumber} closed by ${req.user.email}`);
+    res.json({ success: true, prNumber: pr.number, state: pr.state, merged: !!pr.merged_at });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * DELETE /api/admin/branch
+ * Deletes a git branch on the repo. Admin only.
+ * Body: { branch: string }
+ */
+app.delete('/api/admin/branch', requireAuth, async (req, res) => {
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  const { branch } = req.body;
+  if (!branch || typeof branch !== 'string' || !branch.trim()) {
+    return res.status(400).json({ error: 'branch name is required' });
+  }
+  // Safety: only allow ops/ branches to be deleted via this route
+  if (!branch.startsWith('ops/')) {
+    return res.status(403).json({ error: 'This route may only delete ops/ branches' });
+  }
+  try {
+    const r = await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs/heads/${encodeURIComponent(branch)}`,
+      { method: 'DELETE', headers: ghHeaders() }
+    );
+    if (r.status === 422 || r.status === 404) {
+      return res.status(404).json({ error: `Branch "${branch}" not found` });
+    }
+    if (!r.ok) {
+      const errBody = await r.text().catch(() => '');
+      return res.status(r.status).json({ error: `GitHub returned ${r.status}: ${errBody}` });
+    }
+    console.log(`[Admin] Branch "${branch}" deleted by ${req.user.email}`);
+    res.json({ success: true, branch, deleted: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Logs read endpoint ───────────────────────────────────────────────────────
 
 /**
