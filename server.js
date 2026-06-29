@@ -6,7 +6,7 @@ const fetch = require('node-fetch');
 const app = express();
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
-  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
   if (req.method === "OPTIONS") {
@@ -511,10 +511,10 @@ async function _closePR(prNumber, reason) {
  *   1. GITHUB_TOKEN configured
  *   2. Target base branch exists
  *   3. Validated entries provided
- *   4. No pending entries remain
+ *   4. No pending entries remain (scoped to the triggering user's visible set)
  *   5. No PR already open for this country
  */
-async function _preflightPRCheck(country, validatedEntries, allEntries) {
+async function _preflightPRCheck(country, validatedEntries, scopedPendingEntries) {
   if (!GITHUB_TOKEN) {
     return { ok: false, httpStatus: 500, error: 'GITHUB_TOKEN not configured on server' };
   }
@@ -531,7 +531,9 @@ async function _preflightPRCheck(country, validatedEntries, allEntries) {
     return { ok: false, httpStatus: 400, error: 'No validated entries are ready for PR creation' };
   }
 
-  const pendingCount = (allEntries || []).filter(e => e.status === 'pending').length;
+  // Only count pending entries within the triggering user's scope — an OL with unvalidated
+  // entries must not block a Manager/Admin from creating a PR for their own scoped entries.
+  const pendingCount = (scopedPendingEntries || []).filter(e => e.status === 'pending').length;
   if (pendingCount > 0) {
     return {
       ok: false, httpStatus: 400,
@@ -548,6 +550,36 @@ async function _preflightPRCheck(country, validatedEntries, allEntries) {
   }
 
   return { ok: true };
+}
+
+/**
+ * Filters validated buffer entries based on the triggering user's role.
+ * - Admin   : all entries
+ * - Manager : own entries + entries owned by OL users (not other Managers/Admins)
+ * - OL      : own entries only
+ *
+ * @param {Array}  entries      - flat array of buffer entries for the country
+ * @param {Array}  allUsers     - users array from config/users.json
+ * @param {string} triggeredBy  - email of the user triggering the PR
+ * @returns {Array} filtered entries
+ */
+function _filterEntriesByPRScope(entries, allUsers, triggeredBy) {
+  const norm = e => (e || '').toLowerCase().trim();
+  const triggerUser = allUsers.find(u => norm(u.email) === norm(triggeredBy));
+  const triggerRole = triggerUser?.role || 'OL';
+
+  if (triggerRole === 'Admin') {
+    return entries; // unrestricted
+  }
+  if (triggerRole === 'Manager') {
+    return entries.filter(e => {
+      if (norm(e.user) === norm(triggeredBy)) return true; // own entries
+      const owner = allUsers.find(u => norm(u.email) === norm(e.user));
+      return owner?.role === 'OL'; // OL entries only — not other Managers
+    });
+  }
+  // OL: own entries only
+  return entries.filter(e => norm(e.user) === norm(triggeredBy));
 }
 
 /**
@@ -841,6 +873,10 @@ function validateProcessEntry(p) {
   return null;
 }
 
+// ── Process edit-lock constants (used by POST /api/ops/buffer and the lock endpoints) ──
+const PROCESS_EDIT_LOCKS_PATH = 'data/ops/process_edit_locks.json';
+const PROC_LOCK_TTL_MS        = 15 * 60 * 1000;
+
 /**
  * POST /api/ops/buffer
  * Adds a new pending entry for req.user.email (identity from JWT, not body).
@@ -871,6 +907,75 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
   if (!buffer[country]) buffer[country] = {};
   if (!buffer[country][user]) buffer[country][user] = [];
 
+  // ── Process edit-lock guard (update only) ────────────────────────────────────
+  // Reject update submissions if another user holds a live process edit lock.
+  // This prevents a race where two users save simultaneously; the second save
+  // (which won the lock check on the frontend) is blocked here as the canonical guard.
+  if (type === 'update' && process.id) {
+    const procLocks = await fetchGitHubJson(PROCESS_EDIT_LOCKS_PATH, {});
+    const lock = (procLocks[country] || {})[process.id];
+    if (lock && lock.editingBy) {
+      const norm = e => (e || '').toLowerCase().trim();
+      const lockAge = lock.editingLastActivityAt
+        ? Date.now() - new Date(lock.editingLastActivityAt).getTime()
+        : Infinity;
+      if (
+        norm(lock.editingBy) !== norm(user) &&
+        lockAge < PROC_LOCK_TTL_MS
+      ) {
+        return res.status(409).json({
+          error: `This process is currently being edited by ${lock.editingBy}`,
+          editingBy: lock.editingBy,
+          editingLastActivityAt: lock.editingLastActivityAt
+        });
+      }
+    }
+  }
+
+  // ── Ownership guard for update/delete ────────────────────────────────────────
+  // If the target process (by issue) already has a pending buffer entry owned by
+  // another user, check that the caller has the rights to act on that user's entry.
+  // This mirrors the frontend canActOnProcess() rule and prevents privilege bypass.
+  if (type === 'update' || type === 'delete') {
+    const targetIssue = process.issue || '';
+    if (targetIssue) {
+      const allUsers   = await fetchGitHubJson('config/users.json', []);
+      const norm       = e => (e || '').toLowerCase().trim();
+      const callerRole = req.user.role;
+
+      // Find any existing pending entry for this issue across all users
+      let existingOwner = null;
+      let existingOwnerRole = 'OL';
+      outer: for (const [entryUser, entries] of Object.entries(buffer[country] || {})) {
+        for (const e of (entries || [])) {
+          if (e.process?.issue === targetIssue) {
+            existingOwner = norm(entryUser);
+            const ownerRec  = allUsers.find(u => norm(u.email) === existingOwner);
+            existingOwnerRole = ownerRec?.role || 'OL';
+            break outer;
+          }
+        }
+      }
+
+      if (existingOwner && norm(existingOwner) !== norm(user)) {
+        // There is a pending entry for this process owned by someone else.
+        // Apply the same role-scoped permission model as /api/ops/cancel.
+        let allowed = false;
+        if (callerRole === 'Admin') {
+          allowed = true;
+        } else if (callerRole === 'Manager') {
+          allowed = existingOwnerRole === 'OL';
+        }
+        // OL: not allowed to act on another user's entry
+        if (!allowed) {
+          return res.status(403).json({
+            error: `Not allowed — process "${targetIssue}" already has a pending entry owned by another user.`
+          });
+        }
+      }
+    }
+  }
+
   const entry = {
     id: process.id || `${country}_${Date.now()}`,
     type,
@@ -888,14 +993,249 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
 /**
  * PUT /api/ops/buffer
  * Replaces the full buffer (legacy callers; prefer POST /api/ops/cancel).
+ * Rejects the write if the entry being modified is locked by another user's active edit session.
  */
 app.put('/api/ops/buffer', requireAuth, async (req, res) => {
-  const { buffer: newBuffer } = req.body;
+  const { buffer: newBuffer, editEntryId } = req.body;
   if (!newBuffer || typeof newBuffer !== 'object') {
     return res.status(400).json({ error: 'buffer object required' });
   }
+
+  // ── Edit-lock check ──────────────────────────────────────────────────────────
+  // If the caller passes the entry id they are saving, check whether another user
+  // holds a valid (non-expired) edit lock on that entry.
+  if (editEntryId) {
+    const liveBuffer = await fetchGitHubJson('data/ops/buffer.json', {});
+    const EDIT_LOCK_TTL_MS = 15 * 60 * 1000; // 15 minutes
+    const now = Date.now();
+    outer: for (const ck of Object.keys(liveBuffer)) {
+      for (const userEntries of Object.values(liveBuffer[ck] || {})) {
+        const locked = (userEntries || []).find(e => e.id === editEntryId);
+        if (!locked) continue;
+        const { editingBy, editingLastActivityAt } = locked;
+        if (
+          editingBy &&
+          editingBy.toLowerCase().trim() !== req.user.email.toLowerCase().trim() &&
+          editingLastActivityAt &&
+          (now - new Date(editingLastActivityAt).getTime()) < EDIT_LOCK_TTL_MS
+        ) {
+          return res.status(409).json({
+            error: `This entry is currently being edited by ${editingBy}`,
+            editingBy,
+            editingLastActivityAt
+          });
+        }
+        break outer;
+      }
+    }
+  }
+
   await commitJsonToMainBranch('data/ops/buffer.json', newBuffer, 'ops: replace buffer');
   res.json({ success: true, buffer: newBuffer });
+});
+
+// ─── Edit-lock heartbeat ──────────────────────────────────────────────────────
+
+/**
+ * PATCH /api/ops/buffer/edit-lock
+ * Acquires, refreshes, or releases an edit lock on a single buffer entry.
+ *
+ * Body:
+ *   { country, user, index, action: "acquire" | "heartbeat" | "release" }
+ *
+ * Lock fields written to the entry:
+ *   editingBy              — email of the user holding the lock
+ *   editingLastActivityAt  — ISO timestamp, updated on every heartbeat/acquire
+ *
+ * Lock expiry: 15 minutes of inactivity (enforced by PUT /api/ops/buffer on save).
+ *
+ * Anyone can call acquire; if another user holds a non-expired lock the call
+ * returns 409 so the frontend can show "Being edited by X".
+ */
+app.patch('/api/ops/buffer/edit-lock', requireAuth, async (req, res) => {
+  const { country, user: targetUser, index, action } = req.body;
+  const requester = req.user.email;
+
+  if (!country || !targetUser || typeof index !== 'number' || !action) {
+    return res.status(400).json({ error: 'country, user, index, and action are required' });
+  }
+  if (!validateCountry(country)) {
+    return res.status(400).json({ error: 'Invalid country' });
+  }
+  if (!['acquire', 'heartbeat', 'release'].includes(action)) {
+    return res.status(400).json({ error: 'action must be acquire, heartbeat, or release' });
+  }
+
+  const EDIT_LOCK_TTL_MS = 15 * 60 * 1000;
+  const now = new Date();
+
+  const buffer  = await fetchGitHubJson('data/ops/buffer.json', {});
+  const entries = (buffer[country] && buffer[country][targetUser]) || [];
+  const entry   = entries[index];
+
+  if (!entry) return res.status(404).json({ error: 'Buffer entry not found' });
+
+  const { editingBy, editingLastActivityAt } = entry;
+  const lockAge = editingLastActivityAt
+    ? now.getTime() - new Date(editingLastActivityAt).getTime()
+    : Infinity;
+  const lockHeldByOther = editingBy &&
+    editingBy.toLowerCase().trim() !== requester.toLowerCase().trim() &&
+    lockAge < EDIT_LOCK_TTL_MS;
+
+  if (action === 'release') {
+    // Only the lock holder or Admin may release
+    if (editingBy && editingBy.toLowerCase().trim() !== requester.toLowerCase().trim() &&
+        req.user.role !== 'Admin') {
+      return res.status(403).json({ error: 'Only the lock holder or Admin can release this lock' });
+    }
+    delete entry.editingBy;
+    delete entry.editingLastActivityAt;
+    await commitJsonToMainBranch('data/ops/buffer.json', buffer,
+      `ops: release edit lock on entry ${entry.id} by ${requester}`);
+    return res.json({ success: true, action: 'released', entryId: entry.id });
+  }
+
+  if (action === 'acquire' && lockHeldByOther) {
+    return res.status(409).json({
+      error: `This entry is currently being edited by ${editingBy}`,
+      editingBy,
+      editingLastActivityAt,
+      lockExpiresAt: new Date(new Date(editingLastActivityAt).getTime() + EDIT_LOCK_TTL_MS).toISOString()
+    });
+  }
+
+  // acquire or heartbeat — set/refresh the lock
+  entry.editingBy             = requester;
+  entry.editingLastActivityAt = now.toISOString();
+
+  await commitJsonToMainBranch('data/ops/buffer.json', buffer,
+    `ops: ${action} edit lock on entry ${entry.id} by ${requester}`);
+
+  res.json({
+    success:              true,
+    action,
+    entryId:              entry.id,
+    editingBy:            requester,
+    editingLastActivityAt: now.toISOString(),
+    lockExpiresAt:        new Date(now.getTime() + EDIT_LOCK_TTL_MS).toISOString()
+  });
+});
+
+// ─── Process edit-lock endpoints ─────────────────────────────────────────────
+
+/**
+ * GET /api/ops/process/edit-lock
+ * Returns the full process_edit_locks.json so the frontend can render
+ * "being edited by X" indicators on process cards.
+ */
+app.get('/api/ops/process/edit-lock', async (req, res) => {
+  const locks = await fetchGitHubJson(PROCESS_EDIT_LOCKS_PATH, {});
+  res.json(locks);
+});
+
+/**
+ * PATCH /api/ops/process/edit-lock
+ * Acquires, refreshes, or releases a pre-save edit lock on a process item.
+ * Stored in data/ops/process_edit_locks.json — completely separate from the
+ * buffer edit lock which is stored on the buffer entry itself.
+ *
+ * Body: { country, processId, action: "acquire" | "heartbeat" | "release" }
+ *
+ * Lock fields written:
+ *   editingBy              — email of the lock holder
+ *   editingLastActivityAt  — ISO timestamp, refreshed on heartbeat / acquire
+ *
+ * Expiry: 15 minutes of inactivity (same TTL as buffer edit lock).
+ */
+/**
+ * requireAuthBeacon — scoped variant of requireAuth that also accepts a JWT
+ * from req.body.token. Used only on this endpoint so that navigator.sendBeacon
+ * (which cannot set custom headers) can authenticate the release call on logout.
+ * All other endpoints continue to use requireAuth (header-only).
+ */
+function requireAuthBeacon(req, res, next) {
+  const authHeader = req.headers['authorization'] || '';
+  const token = authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : (req.body?.token || null);
+  if (!token) return res.status(401).json({ error: 'Authorization token required' });
+  const payload = verifyJwt(token);
+  if (!payload) return res.status(401).json({ error: 'Invalid or expired token' });
+  req.user = { email: payload.email, role: payload.role };
+  if (typeof _runScheduledPRExecutor === 'function') {
+    _runScheduledPRExecutor().catch(() => {});
+  }
+  next();
+}
+
+app.patch('/api/ops/process/edit-lock', requireAuthBeacon, async (req, res) => {
+  const { country, processId, action } = req.body;
+  const requester = req.user.email;
+
+  if (!country || !processId || !action) {
+    return res.status(400).json({ error: 'country, processId, and action are required' });
+  }
+  if (!validateCountry(country)) {
+    return res.status(400).json({ error: 'Invalid country' });
+  }
+  if (!['acquire', 'heartbeat', 'release'].includes(action)) {
+    return res.status(400).json({ error: 'action must be acquire, heartbeat, or release' });
+  }
+
+  const now   = new Date();
+  const locks = await fetchGitHubJson(PROCESS_EDIT_LOCKS_PATH, {});
+  if (!locks[country]) locks[country] = {};
+
+  const lock    = locks[country][processId] || {};
+  const { editingBy, editingLastActivityAt } = lock;
+  const lockAge = editingLastActivityAt
+    ? now.getTime() - new Date(editingLastActivityAt).getTime()
+    : Infinity;
+  const norm = e => (e || '').toLowerCase().trim();
+  const lockHeldByOther = editingBy &&
+    norm(editingBy) !== norm(requester) &&
+    lockAge < PROC_LOCK_TTL_MS;
+
+  if (action === 'release') {
+    // Only the lock holder or Admin may release
+    if (editingBy && norm(editingBy) !== norm(requester) && req.user.role !== 'Admin') {
+      return res.status(403).json({ error: 'Only the lock holder or Admin can release this lock' });
+    }
+    delete locks[country][processId];
+    // Clean up empty country key
+    if (!Object.keys(locks[country]).length) delete locks[country];
+    await commitJsonToMainBranch(PROCESS_EDIT_LOCKS_PATH, locks,
+      `ops: release process edit lock on ${processId} by ${requester}`);
+    return res.json({ success: true, action: 'released', processId });
+  }
+
+  if (action === 'acquire' && lockHeldByOther) {
+    return res.status(409).json({
+      error: `This process is currently being edited by ${editingBy}`,
+      editingBy,
+      editingLastActivityAt,
+      lockExpiresAt: new Date(new Date(editingLastActivityAt).getTime() + PROC_LOCK_TTL_MS).toISOString()
+    });
+  }
+
+  // acquire or heartbeat — set/refresh the lock
+  locks[country][processId] = {
+    editingBy:             requester,
+    editingLastActivityAt: now.toISOString()
+  };
+
+  await commitJsonToMainBranch(PROCESS_EDIT_LOCKS_PATH, locks,
+    `ops: ${action} process edit lock on ${processId} by ${requester}`);
+
+  res.json({
+    success:               true,
+    action,
+    processId,
+    editingBy:             requester,
+    editingLastActivityAt: now.toISOString(),
+    lockExpiresAt:         new Date(now.getTime() + PROC_LOCK_TTL_MS).toISOString()
+  });
 });
 
 /**
@@ -929,7 +1269,8 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
 
   const entry = entries[index];
 
-  // OL permission check: can only remove own pending entries
+  // ── Role-scoped permission check ─────────────────────────────────────────────
+  // OL: own pending entries only; Manager: own OR OL-owned; Admin: all
   if (cancellerRole === 'OL') {
     const ownerEmail = (entry.user || targetUser || '').toLowerCase().trim();
     if (ownerEmail !== canceller.toLowerCase().trim()) {
@@ -938,6 +1279,25 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
     if (entry.status === 'validated') {
       return res.status(403).json({ error: 'OL cannot remove a validated entry' });
     }
+  } else if (cancellerRole === 'Manager') {
+    const isOwnEntry = (entry.user || '').toLowerCase().trim() === canceller.toLowerCase().trim();
+    if (!isOwnEntry) {
+      const usersForCancel = await fetchGitHubJson('config/users.json', []);
+      const entryOwnerUser = usersForCancel.find(
+        u => u.email.toLowerCase().trim() === (entry.user || '').toLowerCase().trim()
+      );
+      const entryOwnerRole = entryOwnerUser?.role || 'OL';
+      if (entryOwnerRole !== 'OL') {
+        return res.status(403).json({ error: 'Manager can only remove own entries or OL entries' });
+      }
+    }
+  }
+  // Admin: no restriction
+
+  // ── Validated-entry guard (all roles) ────────────────────────────────────────
+  // Validated entries must not be cancelled regardless of caller role.
+  if (entry.status === 'validated') {
+    return res.status(403).json({ error: 'Validated entries cannot be cancelled. Unvalidate the entry first.' });
   }
 
   // ── Scheduled-PR lock guard ──────────────────────────────────────────────────
@@ -1000,6 +1360,41 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
 
   if (!entry) {
     return res.status(404).json({ error: 'Buffer entry not found' });
+  }
+
+  // ── Role-scoped permission check ─────────────────────────────────────────────
+  // OL: only own entries; Manager: own OR entries owned by an OL; Admin: all
+  if (req.user.role !== 'Admin') {
+    const usersForValidate = await fetchGitHubJson('config/users.json', []);
+    const entryOwnerUser   = usersForValidate.find(
+      u => u.email.toLowerCase().trim() === (entry.user || '').toLowerCase().trim()
+    );
+    const entryOwnerRole   = entryOwnerUser?.role || 'OL';
+
+    if (req.user.role === 'OL') {
+      if ((entry.user || '').toLowerCase().trim() !== validator.toLowerCase().trim()) {
+        return res.status(403).json({ error: 'OL can only validate their own entries' });
+      }
+    } else if (req.user.role === 'Manager') {
+      const isOwnEntry = (entry.user || '').toLowerCase().trim() === validator.toLowerCase().trim();
+      if (!isOwnEntry && entryOwnerRole !== 'OL') {
+        return res.status(403).json({ error: 'Manager can only validate own entries or OL entries' });
+      }
+    }
+  }
+
+  // ── Cross-validator override guard ───────────────────────────────────────────
+  // If the entry is already validated by a DIFFERENT user, only Admin may
+  // toggle it (unvalidate). This prevents Manager B from silently reversing
+  // Manager A's validation decision.
+  if (
+    entry.status === 'validated' &&
+    req.user.role !== 'Admin' &&
+    (entry.validatedBy || '').toLowerCase().trim() !== validator.toLowerCase().trim()
+  ) {
+    return res.status(403).json({
+      error: `This entry was validated by ${entry.validatedBy}. Only an Admin can reverse it.`
+    });
   }
 
   if (_processingEntries.has(entry.id)) {
@@ -1280,10 +1675,15 @@ app.post('/api/ops/approve-and-merge', requireAuth, async (req, res) => {
     const buffer       = await fetchGitHubJson('data/ops/buffer.json', {});
     const countryBuf   = buffer[country] || {};
     const allEntries   = Object.values(countryBuf).flat();
-    const validatedEntries = allEntries.filter(e => e.status === 'validated');
+    // Admin-only route: scope is always unrestricted, but run through filter
+    // for consistency so future role changes only need one place updated.
+    const mergeUsers       = await fetchGitHubJson('config/users.json', []);
+    const scopedForMerge   = _filterEntriesByPRScope(allEntries, mergeUsers, approver);
+    const validatedEntries = scopedForMerge.filter(e => e.status === 'validated');
+    const scopedPending    = scopedForMerge.filter(e => e.status === 'pending');
 
     // Run the same pre-flight check used by the scheduled executor
-    const preflight = await _preflightPRCheck(country, validatedEntries, allEntries);
+    const preflight = await _preflightPRCheck(country, validatedEntries, scopedPending);
     if (!preflight.ok) {
       return res.status(preflight.httpStatus || 400).json({ error: preflight.error });
     }
@@ -1853,11 +2253,13 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     return res.status(409).json({ error: 'A PR is already open on GitHub for this country' });
   }
 
-  // Collect all entries for this country from the buffer
+  // Collect entries for this country, scoped to the triggering user's role
   const countryBuf      = buffer[country] || {};
   const allEntries      = Object.values(countryBuf).flat();
-  const validatedCount  = allEntries.filter(e => e.status === 'validated').length;
-  const pendingCount    = allEntries.filter(e => e.status === 'pending').length;
+  const scheduleUsers   = await fetchGitHubJson('config/users.json', []);
+  const scopedEntries   = _filterEntriesByPRScope(allEntries, scheduleUsers, req.user.email);
+  const validatedCount  = scopedEntries.filter(e => e.status === 'validated').length;
+  const pendingCount    = scopedEntries.filter(e => e.status === 'pending').length;
 
   if (!validatedCount) {
     return res.status(400).json({ error: 'No validated entries to create a PR for' });
@@ -1868,9 +2270,9 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     });
   }
 
-  // Snapshot the IDs of the validated entries included in this PR.
+  // Snapshot the IDs of the validated entries included in this PR (scoped).
   // Used by the frontend to freeze exactly those entries during countdown.
-  const validatedEntryIds = allEntries
+  const validatedEntryIds = scopedEntries
     .filter(e => e.status === 'validated')
     .map(e => e.id)
     .filter(Boolean);
@@ -1883,7 +2285,8 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     created_by:    req.user.email,
     delay_ms:      PR_DELAY_MS,
     entry_count:   validatedCount,
-    entry_ids:     validatedEntryIds
+    entry_ids:     validatedEntryIds,
+    trigger_role:  req.user.role
   };
 
   schedule[country] = job;
@@ -2282,15 +2685,19 @@ async function _runScheduledPRExecutor() {
         const buffer     = await fetchGitHubJson('data/ops/buffer.json', {});
         const countryBuf = buffer[country] || {};
         const allEntries = Object.values(countryBuf).flat();
-        const validated  = allEntries.filter(e => e.status === 'validated');
+        // Apply role-based scope: executor fires on behalf of the job creator
+        const execUsers    = await fetchGitHubJson('config/users.json', []);
+        const scopedAll    = _filterEntriesByPRScope(allEntries, execUsers, job.created_by);
+        const validated    = scopedAll.filter(e => e.status === 'validated');
+        const scopedPending = scopedAll.filter(e => e.status === 'pending');
 
         // Remove the job from the schedule regardless of outcome — avoids retry loops
         const freshSchedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
         delete freshSchedule[country];
         await commitJsonToMainBranch(PR_SCHEDULE_PATH, freshSchedule, `ops: complete PR schedule job for ${country}`);
 
-        // Pre-flight check (token, base branch, entry state, open PR guard)
-        const preflight = await _preflightPRCheck(country, validated, allEntries);
+        // Pre-flight check (token, base branch, scoped entry state, open PR guard)
+        const preflight = await _preflightPRCheck(country, validated, scopedPending);
         if (!preflight.ok) {
           console.warn(`[PR executor] Pre-flight failed for "${country}": ${preflight.error}`);
           appendActivityLog({
