@@ -23,9 +23,14 @@ const GITHUB_TOKEN  = process.env.GITHUB_TOKEN  || '';
 const GITHUB_OWNER  = process.env.GITHUB_OWNER  || 'nlabib';
 const GITHUB_REPO   = process.env.GITHUB_REPO   || 'process-finder';
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
-// PR target branch — defaults to feature/pre-live during pre-live phase.
-// Override via GITHUB_TARGET_BRANCH env var when promoting to production.
+// PR target branch — must be "main" in production.
+// Set GITHUB_TARGET_BRANCH=main in Render. Server warns on startup if not "main".
 const GITHUB_TARGET_BRANCH = process.env.GITHUB_TARGET_BRANCH || 'feature/pre-live';
+
+// Kill switch: set DISABLE_PR_CREATION=true in Render to block all PR creation,
+// branch creation, commits, and buffer-to-history movements. Buffer reads/writes,
+// validate/cancel, history reads, and PR schedule undo are unaffected.
+const DISABLE_PR_CREATION = process.env.DISABLE_PR_CREATION === 'true';
 
 // JWT secret — set via environment variable in production
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
@@ -541,8 +546,16 @@ async function _preflightPRCheck(country, validatedEntries, scopedPendingEntries
     };
   }
 
-  const hasOpen = await _hasOpenPRForCountry(country);
-  if (hasOpen) {
+  // _hasOpenPRForCountry now returns { ok, hasOpen?, error? }.
+  // If ok===false (GitHub unreachable / non-2xx), block the operation — fail safe.
+  const prCheck = await _hasOpenPRForCountry(country);
+  if (!prCheck.ok) {
+    return {
+      ok: false, httpStatus: 502,
+      error: `Cannot verify open PRs on GitHub: ${prCheck.error}`
+    };
+  }
+  if (prCheck.hasOpen) {
     return {
       ok: false, httpStatus: 409,
       error: 'A PR package is already pending approval for this country'
@@ -599,6 +612,12 @@ function _filterEntriesByPRScope(entries, allUsers, triggeredBy) {
  * @returns {{ success, prUrl?, prNumber?, branchName?, error? }}
  */
 async function _createPRForCountry(country, validatedEntries, triggeredBy) {
+  // Phase 1 kill switch — no GitHub API calls of any kind when disabled.
+  if (DISABLE_PR_CREATION) {
+    console.warn(`[OPS PR] DISABLE_PR_CREATION=true — PR creation blocked for "${country}" (triggered by ${triggeredBy})`);
+    return { success: false, error: 'PR creation is disabled on this server (DISABLE_PR_CREATION=true)' };
+  }
+
   const branchName = await _generateOPSBranchName(country);
   const allowedFilePath = `data/processes/${country}.json`;
 
@@ -1670,6 +1689,12 @@ app.post('/api/ops/approve-and-merge', requireAuth, async (req, res) => {
   if (req.user.role !== 'Admin') {
     return res.status(403).json({ error: 'Emergency override is Admin only' });
   }
+
+  // Phase 1 kill switch — block emergency PR creation when disabled.
+  if (DISABLE_PR_CREATION) {
+    return res.status(503).json({ error: 'PR creation is currently disabled on this server.' });
+  }
+
   try {
     // Read all buffer entries for this country
     const buffer       = await fetchGitHubJson('data/ops/buffer.json', {});
@@ -2176,13 +2201,21 @@ const PR_DELAY_MS  = 10 * 60 * 1000; // 10 minutes
 const PR_SCHEDULE_PATH = 'data/ops/pr_schedule.json';
 
 /**
- * Returns true if there is currently an open (not merged, not closed) PR
- * for the given country by searching GitHub for PRs from branches matching
- * the OPS branch naming pattern.
+ * Checks whether an open (not merged, not closed) PR exists for the given
+ * country by searching GitHub for PRs from branches matching the OPS branch
+ * naming patterns.
  *
- * Matches both the new pattern  ops/<country>/<timestamp>
- * and the legacy pattern        <country>_<timestamp>
- * so that existing open PRs created before this fix are still detected.
+ * Returns a structured result — NEVER returns a permissive result on error:
+ *   { ok: true,  hasOpen: boolean }   — GitHub reachable, result is authoritative
+ *   { ok: false, error: string }      — GitHub unreachable or non-2xx; callers MUST block
+ *
+ * Matches both the current pattern  ops/<country>/<timestamp>
+ * and the legacy pattern            <country>_<timestamp>
+ * so that open PRs created before the naming change are still detected.
+ *
+ * Safety rule: any caller that receives ok===false must block the operation.
+ * Failing open (allowing PR creation when GitHub is unreachable) risks creating
+ * duplicate PRs. Failing safe (blocking when uncertain) is always correct.
  */
 async function _hasOpenPRForCountry(country) {
   try {
@@ -2190,18 +2223,21 @@ async function _hasOpenPRForCountry(country) {
       `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls?state=open&per_page=50`,
       { headers: ghHeaders() }
     );
-    if (!res.ok) return false;
+    if (!res.ok) {
+      return { ok: false, error: `GitHub PR list returned HTTP ${res.status}` };
+    }
     const prs = await res.json();
-    return prs.some(pr => {
+    const hasOpen = prs.some(pr => {
       const ref = pr.head && pr.head.ref ? pr.head.ref : '';
-      // New naming: ops/<country>/...
+      // Current naming: ops/<country>/...
       if (ref.startsWith(`ops/${country}/`)) return true;
       // Legacy naming: <country>_YYYYMMDD_HHMM
       if (ref.startsWith(`${country}_`)) return true;
       return false;
     });
-  } catch {
-    return false;
+    return { ok: true, hasOpen };
+  } catch (err) {
+    return { ok: false, error: err.message || 'Network error contacting GitHub PR API' };
   }
 }
 
@@ -2237,6 +2273,11 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     return res.status(403).json({ error: 'Only OL, Manager or Admin can schedule a PR' });
   }
 
+  // Phase 1 kill switch — block scheduling when PR creation is disabled.
+  if (DISABLE_PR_CREATION) {
+    return res.status(503).json({ error: 'PR creation is currently disabled on this server.' });
+  }
+
   const [buffer, schedule] = await Promise.all([
     fetchGitHubJson('data/ops/buffer.json', {}),
     fetchGitHubJson(PR_SCHEDULE_PATH, {})
@@ -2247,9 +2288,13 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     return res.status(409).json({ error: 'A PR is already scheduled for this country', job: schedule[country] });
   }
 
-  // Block if open PR exists on GitHub
-  const hasOpen = await _hasOpenPRForCountry(country);
-  if (hasOpen) {
+  // Block if open PR exists on GitHub.
+  // _hasOpenPRForCountry returns { ok, hasOpen?, error? } — block on any error (fail safe).
+  const prCheck = await _hasOpenPRForCountry(country);
+  if (!prCheck.ok) {
+    return res.status(502).json({ error: `Cannot verify open PRs on GitHub: ${prCheck.error}` });
+  }
+  if (prCheck.hasOpen) {
     return res.status(409).json({ error: 'A PR is already open on GitHub for this country' });
   }
 
@@ -2667,6 +2712,11 @@ let _executorRunning = false;
  */
 async function _runScheduledPRExecutor() {
   if (_executorRunning) return;
+  // Phase 1 kill switch — executor is a complete no-op when disabled.
+  if (DISABLE_PR_CREATION) {
+    console.warn('[PR executor] DISABLE_PR_CREATION=true — executor is disabled, skipping run');
+    return;
+  }
   _executorRunning = true;
   try {
     const schedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
@@ -2769,6 +2819,12 @@ app.listen(port, () => {
   console.log(GITHUB_TOKEN
     ? `[OPS] GitHub automation enabled — target branch: ${GITHUB_TARGET_BRANCH} (${GITHUB_OWNER}/${GITHUB_REPO})`
     : `[OPS] WARNING: GITHUB_TOKEN not configured — PR automation disabled`);
+  if (GITHUB_TARGET_BRANCH !== 'main') {
+    console.warn(`[OPS] WARNING: GITHUB_TARGET_BRANCH="${GITHUB_TARGET_BRANCH}", not "main". Set GITHUB_TARGET_BRANCH=main in Render for production — PRs are currently targeting the wrong branch.`);
+  }
+  if (DISABLE_PR_CREATION) {
+    console.warn('[OPS] WARNING: DISABLE_PR_CREATION=true — all PR creation, branch creation, and buffer-to-history movements are disabled.');
+  }
 
   // ── Scheduled PR executor — runs every 60 seconds ────────────────────────
   // Hybrid approach: setInterval catches active sessions; lazy execution in
