@@ -2262,13 +2262,13 @@ async function _moveBufToHistoryAfterPR(country, validatedEntries, prResult, tri
 }
 
 // ─── PR Schedule helpers ──────────────────────────────────────────────────────
-// In production this is always 10 minutes.
+// In production this is always 5 minutes.
 // Set PR_DELAY_MS_OVERRIDE (milliseconds) in the environment only for test/staging
 // environments where you need the countdown to fire immediately.
 // Example: PR_DELAY_MS_OVERRIDE=5000  → 5-second countdown.
 const PR_DELAY_MS = process.env.PR_DELAY_MS_OVERRIDE
   ? Math.max(0, parseInt(process.env.PR_DELAY_MS_OVERRIDE, 10))
-  : 10 * 60 * 1000; // 10 minutes
+  : 5 * 60 * 1000; // 5 minutes
 const PR_SCHEDULE_PATH = 'data/ops/pr_schedule.json';
 
 /**
