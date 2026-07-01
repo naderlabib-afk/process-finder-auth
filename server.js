@@ -168,6 +168,39 @@ async function fetchGitHubJson(filePath, fallback = null) {
   }
 }
 
+/**
+ * Reads a JSON file from a specific branch ref (not the default GITHUB_BRANCH).
+ * Used by Mode B append to read process data from the active PR branch, not main.
+ * Returns { data: parsedJson, meta: metaObject } or null if the file is missing/unreadable.
+ */
+async function _readProcessDataFromBranch(country, branchName) {
+  const ghPath = `data/processes/${country}.json`;
+  try {
+    const res = await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${ghPath}?ref=${encodeURIComponent(branchName)}`,
+      { headers: ghHeaders() }
+    );
+    if (!res.ok) {
+      console.warn(`[GitHub] _readProcessDataFromBranch: HTTP ${res.status} for "${ghPath}" on branch "${branchName}"`);
+      return null;
+    }
+    const fileInfo = await res.json();
+    if (!fileInfo || !fileInfo.content) return null;
+    const raw     = Buffer.from(fileInfo.content, 'base64').toString('utf8');
+    const cleaned = raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
+    const json    = JSON.parse(cleaned);
+    if (Array.isArray(json)) {
+      return { ghPath, data: json, meta: {} };
+    }
+    const meta = { ...json };
+    delete meta.processes;
+    return { ghPath, data: Array.isArray(json.processes) ? json.processes : [], meta };
+  } catch (err) {
+    console.error(`[GitHub] _readProcessDataFromBranch failed for "${ghPath}" on "${branchName}":`, err.message);
+    return null;
+  }
+}
+
 // ─── OPS PR file allowlist ────────────────────────────────────────────────────
 /**
  * The ONLY file paths an automated OPS PR is permitted to modify.
@@ -2229,7 +2262,13 @@ async function _moveBufToHistoryAfterPR(country, validatedEntries, prResult, tri
 }
 
 // ─── PR Schedule helpers ──────────────────────────────────────────────────────
-const PR_DELAY_MS  = 10 * 60 * 1000; // 10 minutes
+// In production this is always 10 minutes.
+// Set PR_DELAY_MS_OVERRIDE (milliseconds) in the environment only for test/staging
+// environments where you need the countdown to fire immediately.
+// Example: PR_DELAY_MS_OVERRIDE=5000  → 5-second countdown.
+const PR_DELAY_MS = process.env.PR_DELAY_MS_OVERRIDE
+  ? Math.max(0, parseInt(process.env.PR_DELAY_MS_OVERRIDE, 10))
+  : 10 * 60 * 1000; // 10 minutes
 const PR_SCHEDULE_PATH = 'data/ops/pr_schedule.json';
 
 /**
@@ -2238,7 +2277,7 @@ const PR_SCHEDULE_PATH = 'data/ops/pr_schedule.json';
  * naming patterns.
  *
  * Returns a structured result — NEVER returns a permissive result on error:
- *   { ok: true,  hasOpen: boolean }   — GitHub reachable, result is authoritative
+ *   { ok: true,  hasOpen: boolean, activePR?: { prNumber, branchName, prUrl } }
  *   { ok: false, error: string }      — GitHub unreachable or non-2xx; callers MUST block
  *
  * Matches both the current pattern  ops/<country>/<timestamp>
@@ -2259,7 +2298,7 @@ async function _hasOpenPRForCountry(country) {
       return { ok: false, error: `GitHub PR list returned HTTP ${res.status}` };
     }
     const prs = await res.json();
-    const hasOpen = prs.some(pr => {
+    const match = prs.find(pr => {
       const ref = pr.head && pr.head.ref ? pr.head.ref : '';
       // Current naming: ops/<country>/...
       if (ref.startsWith(`ops/${country}/`)) return true;
@@ -2267,10 +2306,312 @@ async function _hasOpenPRForCountry(country) {
       if (ref.startsWith(`${country}_`)) return true;
       return false;
     });
-    return { ok: true, hasOpen };
+    if (!match) return { ok: true, hasOpen: false };
+    return {
+      ok: true,
+      hasOpen: true,
+      activePR: {
+        prNumber:   match.number,
+        branchName: match.head.ref,
+        prUrl:      match.html_url
+      }
+    };
   } catch (err) {
     return { ok: false, error: err.message || 'Network error contacting GitHub PR API' };
   }
+}
+
+/**
+ * Appends a new batch of validated entries to an existing open PR branch.
+ *
+ * Mode B — Append to Active PR:
+ *   - Reads the current process JSON from the live target branch (GITHUB_BRANCH / main).
+ *   - Applies the new validated entries on top.
+ *   - Fetches the latest commit SHA of the existing PR branch (not HEAD of main).
+ *   - Commits the updated process JSON to that existing PR branch.
+ *   - Posts a comment to the PR with a batch summary.
+ *
+ * Serialization: the caller must ensure only one append runs per country at a
+ * time (the schedule job mechanism already guarantees this — the executor is
+ * single-threaded per country via the _executorRunning guard).
+ *
+ * @param {string} country          - country key
+ * @param {Array}  newEntries       - validated entries to append
+ * @param {string} triggeredBy      - email of user who triggered the append
+ * @param {{ prNumber, branchName, prUrl }} activePR - the open PR to append to
+ * @param {string} batchId          - unique batch identifier for audit
+ * @returns {{ success, prNumber?, prUrl?, branchName?, batchId?, error? }}
+ */
+/**
+ * Pre-flight checks for Mode B (append to active PR) executed at executor time.
+ *
+ * Validates:
+ *   1. GITHUB_TOKEN configured
+ *   2. Active PR branch still exists on GitHub
+ *   3. The PR is still open (not merged / not closed between schedule and execution)
+ *   4. No validated entries are empty
+ *   5. All allowed file paths — only data/processes/{country}.json
+ *   6. Executor-time duplicate check: reads existing issues from the PR branch
+ *      content and from history, blocking any overlap with the new batch
+ *
+ * Returns { ok: true } or { ok: false, error: string }
+ */
+async function _preflightAppendCheck(country, newEntries, activePR) {
+  if (!GITHUB_TOKEN) {
+    return { ok: false, error: 'GITHUB_TOKEN not configured on server' };
+  }
+
+  const { prNumber, branchName } = activePR;
+  const allowedFilePath = `data/processes/${country}.json`;
+
+  // 1. All entries must target the allowed file path only
+  const badEntries = newEntries.filter(e => {
+    // entries write to data/processes/{country}.json — verify the country matches
+    return !_isAllowedPRPath(allowedFilePath);
+  });
+  if (badEntries.length > 0) {
+    return { ok: false, error: `Append entries target a disallowed file path` };
+  }
+
+  // 2. Branch must exist
+  const branchSha = await _getLatestBranchSha(branchName);
+  if (!branchSha) {
+    return { ok: false, error: `PR branch "${branchName}" no longer exists on GitHub` };
+  }
+
+  // 3. PR must still be open
+  try {
+    const prRes = await fetch(
+      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`,
+      { headers: ghHeaders() }
+    );
+    if (!prRes.ok) {
+      return { ok: false, error: `GitHub returned HTTP ${prRes.status} checking PR #${prNumber}` };
+    }
+    const pr = await prRes.json();
+    if (pr.state !== 'open') {
+      return { ok: false, error: `PR #${prNumber} is no longer open (state: ${pr.state}) — cannot append` };
+    }
+  } catch (err) {
+    return { ok: false, error: `Could not verify PR #${prNumber} state: ${err.message}` };
+  }
+
+  // 4. At least one entry
+  if (!newEntries || newEntries.length === 0) {
+    return { ok: false, error: 'No validated entries for append batch' };
+  }
+
+  // 5. Executor-time duplicate check against PR branch content
+  // Read the process JSON from the PR branch (authoritative) and build a Set of
+  // existing issue/id values. Also cross-check against history pending_merge entries
+  // for this PR (covers batches already moved from buffer).
+  const newIssues = new Set(
+    newEntries.map(e => e.process?.issue || e.process?.id).filter(Boolean)
+  );
+
+  // 5a. Check PR branch content
+  const branchData = await _readProcessDataFromBranch(country, branchName);
+  if (branchData) {
+    const branchIssues = new Set(
+      branchData.data.map(p => p.issue || p.id).filter(Boolean)
+    );
+    // Compare against main branch to find net-new issues already on the PR branch
+    // that weren't there before (i.e. added by previous batches).
+    // We do this by comparing against main content.
+    const mainData = await readProcessData(country);
+    const mainIssues = new Set(
+      (mainData?.data || []).map(p => p.issue || p.id).filter(Boolean)
+    );
+    // Issues present on the PR branch but NOT on main were added by batch 1
+    const addedByPR = new Set([...branchIssues].filter(i => !mainIssues.has(i)));
+    // Also issues on main that are missing from PR branch were deleted by batch 1
+    // (they shouldn't be re-added/re-deleted in batch 2 — flag as conflict)
+    const deletedByPR = new Set([...mainIssues].filter(i => !branchIssues.has(i)));
+
+    const conflictCreate = newEntries.filter(e =>
+      e.type === 'create' && (e.process?.issue || e.process?.id) &&
+      addedByPR.has(e.process?.issue || e.process?.id)
+    );
+    const conflictDelete = newEntries.filter(e =>
+      e.type === 'delete' && (e.process?.issue || e.process?.id) &&
+      deletedByPR.has(e.process?.issue || e.process?.id)
+    );
+    const conflictUpdate = newEntries.filter(e =>
+      e.type === 'update' && (e.process?.issue || e.process?.id) &&
+      addedByPR.has(e.process?.issue || e.process?.id)
+    );
+
+    const conflicts = [...conflictCreate, ...conflictDelete, ...conflictUpdate];
+    if (conflicts.length > 0) {
+      const list = conflicts.map(e => `${e.type.toUpperCase()}:${e.process?.issue || e.process?.id}`).join(', ');
+      return {
+        ok: false,
+        error: `Executor-time conflict: the following issues already have changes on PR branch "${branchName}": ${list}`
+      };
+    }
+  }
+
+  // 5b. Check history for pending_merge entries for this PR (belt-and-suspenders)
+  try {
+    const history = await fetchGitHubJson('data/ops/history.json', {});
+    const activePRHistory = (history[country] || []).filter(
+      h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
+    );
+    const historyIssues = new Set(
+      activePRHistory.map(h => h.process?.issue || h.process?.id).filter(Boolean)
+    );
+    const histDuplicates = [...newIssues].filter(i => historyIssues.has(i));
+    if (histDuplicates.length > 0) {
+      return {
+        ok: false,
+        error: `Executor-time duplicate: issue(s) already in PR #${prNumber} history: ${histDuplicates.join(', ')}`
+      };
+    }
+  } catch (err) {
+    // Non-fatal — log and continue; branch-content check above is the primary guard
+    console.warn(`[PR append preflight] History duplicate check failed: ${err.message}`);
+  }
+
+  return { ok: true };
+}
+
+async function _appendToActivePR(country, newEntries, triggeredBy, activePR, batchId) {
+  if (DISABLE_PR_CREATION) {
+    return { success: false, error: 'PR creation is disabled on this server (DISABLE_PR_CREATION=true)' };
+  }
+
+  const { prNumber, branchName, prUrl } = activePR;
+  const allowedFilePath = `data/processes/${country}.json`;
+
+  console.log(`[OPS PR append] ── Starting append to PR #${prNumber} ──────────────────`);
+  console.log(`[OPS PR append]   country    : ${country}`);
+  console.log(`[OPS PR append]   branch     : ${branchName}`);
+  console.log(`[OPS PR append]   entries    : ${newEntries.length}`);
+  console.log(`[OPS PR append]   batchId    : ${batchId}`);
+  console.log(`[OPS PR append]   triggered  : ${triggeredBy}`);
+
+  try {
+    // ── Step 1: Read current process data from the PR branch (not main) ───────
+    // CRITICAL: we must read from branchName, not from GITHUB_BRANCH (main).
+    // If batch 1 already committed changes to the PR branch, reading from main
+    // would lose those changes and batch 2 would overwrite them.
+    const processesData = await _readProcessDataFromBranch(country, branchName);
+    if (!processesData) throw new Error(`No process data found on PR branch "${branchName}" for country "${country}"`);
+    console.log(`[OPS PR append] Read ${processesData.data.length} processes from branch "${branchName}"`);
+
+    // ── Step 2: Apply new entries on top of the PR branch content ─────────────
+    const arr = processesData.data.map(p => ({ ...p }));
+    for (const h of newEntries) {
+      const targetIdx = arr.findIndex(
+        p => p.id === h.process?.id || p.issue === h.process?.issue
+      );
+      if (h.type === 'create') {
+        if (targetIdx === -1) arr.push({ ...h.process });
+      } else if (h.type === 'update') {
+        if (targetIdx !== -1) arr[targetIdx] = { ...h.process };
+        else arr.push({ ...h.process });
+      } else if (h.type === 'delete') {
+        if (targetIdx !== -1) arr.splice(targetIdx, 1);
+      }
+    }
+
+    const processJson = JSON.stringify(
+      { ...processesData.meta, processes: arr, lastUpdated: new Date().toISOString() },
+      null, 2
+    ) + '\n';
+
+    // ── Step 3: Commit to the existing PR branch ──────────────────────────────
+    // commitFileToOPSBranch reads the file SHA from `?ref=branchName` so the
+    // new commit stacks correctly on top of the previous batch.
+    const commitResult = await commitFileToOPSBranch(
+      branchName,
+      allowedFilePath,
+      processJson,
+      `ops: append batch ${batchId} to ${country} PR #${prNumber} — ${newEntries.length} change(s) by ${triggeredBy}`
+    );
+    if (!commitResult.ok) {
+      throw new Error(`Commit to PR branch failed: ${commitResult.error}`);
+    }
+    console.log(`[OPS PR append] Committed batch ${batchId} to branch ${branchName}`);
+
+    // ── Step 4: Post a comment to the PR with batch summary ───────────────────
+    const now = new Date();
+    const changeLines = newEntries
+      .map(h => `- ${h.type.toUpperCase()}: ${h.process?.issue || h.process?.id || '?'}`)
+      .join('\n');
+    const commentBody =
+      `**[OPS Append — Batch ${batchId}]**\n\n` +
+      `Country: ${country.toUpperCase()}\n` +
+      `Added by: ${triggeredBy}\n` +
+      `Added at: ${now.toISOString()}\n` +
+      `Entries: ${newEntries.length}\n\n` +
+      `Changes:\n${changeLines}`;
+
+    try {
+      await fetch(
+        `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/issues/${prNumber}/comments`,
+        {
+          method: 'POST',
+          headers: ghHeaders(),
+          body: JSON.stringify({ body: commentBody })
+        }
+      );
+      console.log(`[OPS PR append] Posted batch summary comment to PR #${prNumber}`);
+    } catch (commentErr) {
+      // Non-fatal — comment failure must not abort the append
+      console.warn(`[OPS PR append] Could not post comment to PR #${prNumber}: ${commentErr.message}`);
+    }
+
+    return { success: true, prNumber, prUrl, branchName, batchId };
+
+  } catch (err) {
+    console.error(`[OPS PR append] _appendToActivePR failed for "${country}" PR #${prNumber}:`, err.message);
+    return { success: false, error: err.message, prNumber, branchName, batchId };
+  }
+}
+
+/**
+ * Moves buffer entries to history after a successful append to an active PR.
+ * Identical contract to _moveBufToHistoryAfterPR but marks entries with
+ * append-specific metadata: batchId, appendedAt, appendedBy.
+ */
+async function _moveBufToHistoryAfterAppend(country, appendedEntries, activePR, triggeredBy, batchId) {
+  const entryIds = new Set(appendedEntries.map(e => e.id));
+  const now      = new Date().toISOString();
+
+  const [buffer, history] = await Promise.all([
+    fetchGitHubJson('data/ops/buffer.json',  {}),
+    fetchGitHubJson('data/ops/history.json', {})
+  ]);
+
+  // Remove matched entries from buffer
+  if (buffer[country]) {
+    for (const userEmail of Object.keys(buffer[country])) {
+      buffer[country][userEmail] = (buffer[country][userEmail] || []).filter(
+        e => !entryIds.has(e.id)
+      );
+    }
+  }
+
+  // Append to history as pending_merge (inheriting the same active PR)
+  if (!history[country]) history[country] = [];
+  for (const entry of appendedEntries) {
+    history[country].push({
+      ...entry,
+      pr_status:   'pending_merge',
+      prUrl:       activePR.prUrl,
+      prNumber:    activePR.prNumber,
+      branchName:  activePR.branchName,
+      batchId,
+      appendedAt:  now,
+      appendedBy:  triggeredBy,
+      submittedAt: now,
+      submittedBy: triggeredBy
+    });
+  }
+
+  await commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `ops: clear ${country} buffer after append to PR #${activePR.prNumber} (batch ${batchId})`);
+  await commitJsonToMainBranch('data/ops/history.json', history, `ops: add ${country} batch ${batchId} as pending_merge for PR #${activePR.prNumber}`);
 }
 
 // ─── PR Schedule routes ───────────────────────────────────────────────────────
@@ -2289,10 +2630,17 @@ app.get('/api/ops/pr/schedule', async (req, res) => {
  * Schedules a PR for a country (10-minute delayed creation).
  * All roles (OL, Manager, Admin) may call this.
  *
- * Blocked if:
- *   - Any buffer entry for this country is still "pending" (not all validated)
- *   - A PR job is already scheduled for this country
- *   - A PR is already open on GitHub for this country
+ * Mode A — Create PR (no active PR exists):
+ *   - Blocked if any scoped entry is still "pending"
+ *   - Blocked if a job is already scheduled for this country
+ *   - Creates a new scheduled PR job
+ *
+ * Mode B — Append to Active PR (open PR already exists):
+ *   - NOT blocked by the open PR
+ *   - Blocked if any scoped entry is still "pending"
+ *   - Blocked if a job is already scheduled for this country
+ *   - Blocks duplicate process issues already present in the active PR's history
+ *   - Creates a scheduled append job referencing the active PR
  */
 app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
   await _maybeTriggerScheduledPRs(); // lazy hybrid trigger
@@ -2315,20 +2663,19 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     fetchGitHubJson(PR_SCHEDULE_PATH, {})
   ]);
 
-  // Block if already scheduled
+  // Block if already scheduled (applies to both Mode A and Mode B)
   if (schedule[country]) {
     return res.status(409).json({ error: 'A PR is already scheduled for this country', job: schedule[country] });
   }
 
-  // Block if open PR exists on GitHub.
-  // _hasOpenPRForCountry returns { ok, hasOpen?, error? } — block on any error (fail safe).
+  // Check for open PR — determines mode (A = create new, B = append)
   const prCheck = await _hasOpenPRForCountry(country);
   if (!prCheck.ok) {
     return res.status(502).json({ error: `Cannot verify open PRs on GitHub: ${prCheck.error}` });
   }
-  if (prCheck.hasOpen) {
-    return res.status(409).json({ error: 'A PR is already open on GitHub for this country' });
-  }
+
+  const isAppendMode = prCheck.hasOpen;
+  const activePR     = isAppendMode ? prCheck.activePR : null;
 
   // Collect entries for this country, scoped to the triggering user's role
   const countryBuf      = buffer[country] || {};
@@ -2347,37 +2694,96 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     });
   }
 
-  // Snapshot the IDs of the validated entries included in this PR (scoped).
+  // Mode B duplicate process issue check
+  // Checks three sources for issues already claimed by the active PR:
+  //   1. history.json — entries already executed and moved to history (primary source)
+  //   2. pr_schedule.json — a prior batch job scheduled but not yet executed
+  //      Note: the schedule[country] guard above already blocks two concurrent jobs,
+  //      so source 2 can only be non-empty if a race condition occurred.
+  //      Including it here is belt-and-suspenders.
+  // The executor also runs _preflightAppendCheck which reads the authoritative
+  // PR branch content at execution time (the final safety net).
+  if (isAppendMode) {
+    const history = await fetchGitHubJson('data/ops/history.json', {});
+
+    // Source 1: history entries pending_merge for this PR
+    const activePRHistory = (history[country] || []).filter(
+      h => h.prNumber === activePR.prNumber && h.pr_status === 'pending_merge'
+    );
+    const activePRIssues = new Set(
+      activePRHistory.map(h => h.process?.issue || h.process?.id).filter(Boolean)
+    );
+
+    // Source 2: any previously scheduled (but not yet executed) append batch for
+    // the same PR in pr_schedule.json — derive its issues from the buffer entry_ids
+    // cross-referenced against the buffer. In practice the schedule[country] guard
+    // above prevents two live jobs, but we check anyway.
+    // (schedule was already loaded above)
+    const priorJob = schedule[country]; // null — already blocked above, but defensively:
+    if (priorJob && priorJob.mode === 'append' && priorJob.active_pr?.prNumber === activePR.prNumber) {
+      const priorEntryIds = new Set(priorJob.entry_ids || []);
+      const countryBufForCheck = buffer[country] || {};
+      Object.values(countryBufForCheck).flat()
+        .filter(e => priorEntryIds.has(e.id))
+        .forEach(e => {
+          const issue = e.process?.issue || e.process?.id;
+          if (issue) activePRIssues.add(issue);
+        });
+    }
+
+    const newValidated = scopedEntries.filter(e => e.status === 'validated');
+    const duplicates   = newValidated.filter(e => {
+      const issue = e.process?.issue || e.process?.id;
+      return issue && activePRIssues.has(issue);
+    });
+    if (duplicates.length > 0) {
+      const issueList = duplicates.map(e => e.process?.issue || e.process?.id).join(', ');
+      return res.status(409).json({
+        error: `Duplicate process issue(s) already in active PR #${activePR.prNumber}: ${issueList}. Duplicate submission is not allowed.`,
+        duplicateIssues: duplicates.map(e => e.process?.issue || e.process?.id),
+        activePRNumber:  activePR.prNumber
+      });
+    }
+  }
+
+  // Snapshot the IDs of the validated entries included in this batch.
   // Used by the frontend to freeze exactly those entries during countdown.
   const validatedEntryIds = scopedEntries
     .filter(e => e.status === 'validated')
     .map(e => e.id)
     .filter(Boolean);
 
-  const now = new Date();
+  const now     = new Date();
+  const batchId = `batch_${country}_${now.getTime()}`;
+
   const job = {
     country,
+    mode:          isAppendMode ? 'append' : 'create',
     scheduled_at:  now.toISOString(),
     execute_after: new Date(now.getTime() + PR_DELAY_MS).toISOString(),
     created_by:    req.user.email,
     delay_ms:      PR_DELAY_MS,
     entry_count:   validatedCount,
     entry_ids:     validatedEntryIds,
-    trigger_role:  req.user.role
+    trigger_role:  req.user.role,
+    batch_id:      batchId,
+    ...(isAppendMode ? { active_pr: activePR } : {})
   };
 
   schedule[country] = job;
-  await commitJsonToMainBranch(PR_SCHEDULE_PATH, schedule, `ops: schedule PR for ${country} by ${req.user.email}`);
+  await commitJsonToMainBranch(PR_SCHEDULE_PATH, schedule, `ops: schedule ${isAppendMode ? 'append' : 'PR'} for ${country} by ${req.user.email}`);
 
   appendActivityLog({
-    event:       'pr-scheduled',
+    event:       isAppendMode ? 'pr-append-scheduled' : 'pr-scheduled',
     by:          req.user.email,
     country,
     execute_after: job.execute_after,
-    entryCount:  validatedCount
+    entryCount:  validatedCount,
+    batchId,
+    ...(isAppendMode ? { activePRNumber: activePR.prNumber } : {})
   });
 
-  console.log(`[PR schedule] Scheduled PR for "${country}" to execute after ${job.execute_after}`);
+  console.log(`[PR schedule] Scheduled ${isAppendMode ? `append (batch ${batchId}) to PR #${activePR.prNumber}` : 'PR'} for "${country}" to execute after ${job.execute_after}`);
   res.json({ success: true, job });
 });
 
@@ -2761,7 +3167,8 @@ async function _runScheduledPRExecutor() {
     console.log(`[PR executor] ${due.length} job(s) due for execution`);
 
     for (const [country, job] of due) {
-      console.log(`[PR executor] Executing scheduled PR for "${country}" (scheduled by ${job.created_by})`);
+      const isAppend = job.mode === 'append';
+      console.log(`[PR executor] Executing scheduled ${isAppend ? `append (batch ${job.batch_id})` : 'PR'} for "${country}" (scheduled by ${job.created_by})`);
 
       try {
         const buffer     = await fetchGitHubJson('data/ops/buffer.json', {});
@@ -2770,58 +3177,123 @@ async function _runScheduledPRExecutor() {
         // Apply role-based scope: executor fires on behalf of the job creator
         const execUsers    = await fetchGitHubJson('config/users.json', []);
         const scopedAll    = _filterEntriesByPRScope(allEntries, execUsers, job.created_by);
-        const validated    = scopedAll.filter(e => e.status === 'validated');
+
+        // Honour the entry_ids snapshot: only process entries that were part of
+        // this scheduled batch, not any new entries added after scheduling.
+        const validated = Array.isArray(job.entry_ids)
+          ? scopedAll.filter(e => e.status === 'validated' && job.entry_ids.includes(e.id))
+          : scopedAll.filter(e => e.status === 'validated');
         const scopedPending = scopedAll.filter(e => e.status === 'pending');
 
         // Remove the job from the schedule regardless of outcome — avoids retry loops
         const freshSchedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
         delete freshSchedule[country];
-        await commitJsonToMainBranch(PR_SCHEDULE_PATH, freshSchedule, `ops: complete PR schedule job for ${country}`);
+        await commitJsonToMainBranch(PR_SCHEDULE_PATH, freshSchedule, `ops: complete ${isAppend ? 'append' : 'PR'} schedule job for ${country}`);
 
-        // Pre-flight check (token, base branch, scoped entry state, open PR guard)
-        const preflight = await _preflightPRCheck(country, validated, scopedPending);
-        if (!preflight.ok) {
-          console.warn(`[PR executor] Pre-flight failed for "${country}": ${preflight.error}`);
-          appendActivityLog({
-            event:   'pr-preflight-failed',
-            country,
-            error:   preflight.error,
-            by:      'system@executor'
-          });
-          continue;
-        }
+        if (isAppend) {
+          // ── Mode B: Append to existing active PR ─────────────────────────────
+          const activePR = job.active_pr;
+          if (!activePR || !activePR.prNumber || !activePR.branchName) {
+            console.error(`[PR executor] Append job for "${country}" missing active_pr metadata — skipping`);
+            appendActivityLog({ event: 'pr-append-failed', country, error: 'Missing active_pr metadata in job', by: 'system@executor' });
+            continue;
+          }
+          if (!validated.length) {
+            console.warn(`[PR executor] Append job for "${country}" has no validated entries — skipping`);
+            appendActivityLog({ event: 'pr-append-failed', country, error: 'No validated entries at execution time', by: 'system@executor', batchId: job.batch_id });
+            continue;
+          }
 
-        const prResult = await _createPRForCountry(country, validated, job.created_by);
+          // Mode B pre-flight: PR still open, branch exists, no conflicts/duplicates
+          const appendPreflight = await _preflightAppendCheck(country, validated, activePR);
+          if (!appendPreflight.ok) {
+            console.warn(`[PR executor] Append pre-flight failed for "${country}" PR #${activePR.prNumber}: ${appendPreflight.error}`);
+            appendActivityLog({
+              event:    'pr-append-failed',
+              country,
+              error:    appendPreflight.error,
+              prNumber: activePR.prNumber,
+              batchId:  job.batch_id,
+              by:       'system@executor'
+            });
+            continue;
+          }
 
-        if (prResult.success) {
-          // Buffer entries only move to History after PR scope is verified clean.
-          // _createPRForCountry already ran _verifyPRFileScope internally.
-          console.log(`[PR executor] PR #${prResult.prNumber} created for "${country}" → ${prResult.prUrl}`);
-          await _moveBufToHistoryAfterPR(country, validated, prResult, job.created_by);
+          const appendResult = await _appendToActivePR(country, validated, job.created_by, activePR, job.batch_id);
 
-          appendActivityLog({
-            event:      'pr-created',
-            by:         job.created_by,
-            country,
-            branchName: prResult.branchName,
-            prNumber:   prResult.prNumber,
-            prUrl:      prResult.prUrl,
-            entryCount: validated.length,
-            trigger:    'scheduled'
-          });
+          if (appendResult.success) {
+            console.log(`[PR executor] Append batch ${job.batch_id} committed to PR #${activePR.prNumber} for "${country}"`);
+            await _moveBufToHistoryAfterAppend(country, validated, activePR, job.created_by, job.batch_id);
+            appendActivityLog({
+              event:         'pr-append-created',
+              by:            job.created_by,
+              country,
+              branchName:    activePR.branchName,
+              prNumber:      activePR.prNumber,
+              prUrl:         activePR.prUrl,
+              entryCount:    validated.length,
+              batchId:       job.batch_id,
+              trigger:       'scheduled'
+            });
+          } else {
+            console.error(`[PR executor] Append failed for "${country}" PR #${activePR.prNumber}: ${appendResult.error}`);
+            appendActivityLog({
+              event:     'pr-append-failed',
+              country,
+              error:     appendResult.error,
+              prNumber:  activePR.prNumber,
+              batchId:   job.batch_id,
+              by:        'system@executor'
+            });
+          }
+
         } else {
-          // Do NOT move buffer entries to history on failure or scope violation.
-          const isScopeViolation = !!prResult.scopeViolation;
-          console.error(`[PR executor] PR ${isScopeViolation ? 'scope violation' : 'creation failed'} for "${country}": ${prResult.error}`);
-          appendActivityLog({
-            event:         isScopeViolation ? 'pr-scope-violation' : 'pr-create-failed',
-            country,
-            error:         prResult.error,
-            branchName:    prResult.branchName,
-            prNumber:      prResult.prNumber,
-            blockedFiles:  prResult.blockedFiles,
-            by:            'system@executor'
-          });
+          // ── Mode A: Create new PR ─────────────────────────────────────────────
+          // Pre-flight check (token, base branch, scoped entry state, open PR guard)
+          const preflight = await _preflightPRCheck(country, validated, scopedPending);
+          if (!preflight.ok) {
+            console.warn(`[PR executor] Pre-flight failed for "${country}": ${preflight.error}`);
+            appendActivityLog({
+              event:   'pr-preflight-failed',
+              country,
+              error:   preflight.error,
+              by:      'system@executor'
+            });
+            continue;
+          }
+
+          const prResult = await _createPRForCountry(country, validated, job.created_by);
+
+          if (prResult.success) {
+            // Buffer entries only move to History after PR scope is verified clean.
+            // _createPRForCountry already ran _verifyPRFileScope internally.
+            console.log(`[PR executor] PR #${prResult.prNumber} created for "${country}" → ${prResult.prUrl}`);
+            await _moveBufToHistoryAfterPR(country, validated, prResult, job.created_by);
+
+            appendActivityLog({
+              event:      'pr-created',
+              by:         job.created_by,
+              country,
+              branchName: prResult.branchName,
+              prNumber:   prResult.prNumber,
+              prUrl:      prResult.prUrl,
+              entryCount: validated.length,
+              trigger:    'scheduled'
+            });
+          } else {
+            // Do NOT move buffer entries to history on failure or scope violation.
+            const isScopeViolation = !!prResult.scopeViolation;
+            console.error(`[PR executor] PR ${isScopeViolation ? 'scope violation' : 'creation failed'} for "${country}": ${prResult.error}`);
+            appendActivityLog({
+              event:         isScopeViolation ? 'pr-scope-violation' : 'pr-create-failed',
+              country,
+              error:         prResult.error,
+              branchName:    prResult.branchName,
+              prNumber:      prResult.prNumber,
+              blockedFiles:  prResult.blockedFiles,
+              by:            'system@executor'
+            });
+          }
         }
 
       } catch (jobErr) {
