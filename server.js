@@ -54,21 +54,43 @@ function signJwt(payload) {
   return `${header}.${body}.${sig}`;
 }
 
+/**
+ * Verifies a JWT token.
+ * Returns { ok: true, payload } on success.
+ * Returns { ok: false, expired: true }  when the token is valid but has expired.
+ * Returns { ok: false, expired: false } when the token is malformed or the signature is wrong.
+ */
 function verifyJwt(token) {
   try {
     const parts = token.split('.');
-    if (parts.length !== 3) return null;
+    if (parts.length !== 3) return { ok: false, expired: false };
     const [header, body, sig] = parts;
     const expected = b64url(
       crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest()
     );
-    if (sig !== expected) return null;
+    if (sig !== expected) return { ok: false, expired: false };
     const payload = JSON.parse(Buffer.from(body, 'base64').toString());
-    if (payload.exp && Date.now() / 1000 > payload.exp) return null;
-    return payload;
+    if (payload.exp && Date.now() / 1000 > payload.exp) {
+      return { ok: false, expired: true };
+    }
+    return { ok: true, payload };
   } catch {
-    return null;
+    return { ok: false, expired: false };
   }
+}
+
+/** Sends a machine-readable 401 response based on the verifyJwt result. */
+function _rejectAuth(res, verifyResult) {
+  if (verifyResult.expired) {
+    return res.status(401).json({
+      error: 'SESSION_EXPIRED',
+      message: 'Your OPS session has expired. Please sign in again.'
+    });
+  }
+  return res.status(401).json({
+    error: 'INVALID_TOKEN',
+    message: 'Authorization token is missing or invalid.'
+  });
 }
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
@@ -76,13 +98,16 @@ function requireAuth(req, res, next) {
   const authHeader = req.headers['authorization'] || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
   if (!token) {
-    return res.status(401).json({ error: 'Authorization token required' });
+    return res.status(401).json({
+      error: 'AUTH_REQUIRED',
+      message: 'Authorization is required.'
+    });
   }
-  const payload = verifyJwt(token);
-  if (!payload) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
+  const result = verifyJwt(token);
+  if (!result.ok) {
+    return _rejectAuth(res, result);
   }
-  req.user = { email: payload.email, role: payload.role };
+  req.user = { email: result.payload.email, role: result.payload.role };
   // Hybrid lazy trigger: any authenticated request wakes the PR executor.
   // Defined later in the file; safe to call here because Node hoists function
   // declarations — but _runScheduledPRExecutor is an async function expression,
@@ -1178,10 +1203,17 @@ function requireAuthBeacon(req, res, next) {
   const token = authHeader.startsWith('Bearer ')
     ? authHeader.slice(7)
     : (req.body?.token || null);
-  if (!token) return res.status(401).json({ error: 'Authorization token required' });
-  const payload = verifyJwt(token);
-  if (!payload) return res.status(401).json({ error: 'Invalid or expired token' });
-  req.user = { email: payload.email, role: payload.role };
+  if (!token) {
+    return res.status(401).json({
+      error: 'AUTH_REQUIRED',
+      message: 'Authorization is required.'
+    });
+  }
+  const result = verifyJwt(token);
+  if (!result.ok) {
+    return _rejectAuth(res, result);
+  }
+  req.user = { email: result.payload.email, role: result.payload.role };
   if (typeof _runScheduledPRExecutor === 'function') {
     _runScheduledPRExecutor().catch(() => {});
   }
