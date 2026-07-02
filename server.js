@@ -801,87 +801,173 @@ async function _createPRForCountry(country, validatedEntries, triggeredBy) {
 
 const { Resend } = require("resend");
 
+// ─── Email send mode ──────────────────────────────────────────────────────────
+// EMAIL_SEND_MODE=real  → calls Resend API (production on Render)
+// EMAIL_SEND_MODE=mock  → logs only, never calls Resend (local dev / tests)
+// Unset defaults to mock so local runs never consume quota accidentally.
+const EMAIL_SEND_MODE = (process.env.EMAIL_SEND_MODE || 'mock').toLowerCase();
+console.log(`[OTP] Email send mode: ${EMAIL_SEND_MODE}`);
+
+// ─── OTP send safety constants ────────────────────────────────────────────────
+// Fixed sender — never overrideable by frontend input.
+const OTP_FROM_ADDRESS = "Process Finder <noreply@processfinder.xyz>";
+// Fixed subject — never overrideable by frontend input.
+const OTP_SUBJECT      = "[Process Finder] Your OTP Code";
+
 // ─── OTP challenge store ──────────────────────────────────────────────────────
 // Keyed by normalized email. Entry shape: { code, expiry, attempts }
-// This is intentionally in-memory: challenges expire in 5 minutes and must
-// not survive server restarts (a restart invalidates all in-flight OTPs).
+// Intentionally in-memory: challenges expire in 5 minutes and must not survive
+// server restarts (a restart invalidates all in-flight OTPs by design).
 const _otpChallenges = new Map();
-const OTP_TTL_MS     = 5 * 60 * 1000;  // 5 minutes
+const OTP_TTL_MS       = 5 * 60 * 1000;  // 5 minutes
 const OTP_MAX_ATTEMPTS = 5;
+
+// ─── OTP send rate-limit store ────────────────────────────────────────────────
+// Keyed by normalized email.
+// Entry shape: { lastSentAt: number, hourlySends: number[], globalHourlySends: number[] }
+const _otpSendLog = new Map();
+// Throttle: minimum seconds between consecutive sends to the same email.
+const OTP_COOLDOWN_S     = 60;        // 60 s between sends per email
+// Per-email hourly cap: max sends per email per rolling 60-minute window.
+const OTP_HOURLY_CAP     = 5;
+// Global hourly cap: max total OTP sends across all emails per rolling 60-minute window.
+const OTP_GLOBAL_HOURLY_CAP = 20;
+// Global send log (timestamps only, shared across all emails).
+const _otpGlobalSendLog  = [];
 
 // ─── Consumed otpToken jti set ────────────────────────────────────────────────
 // One-time-use tokens: once a jti has been used to create a session it is
 // placed here and rejected on any subsequent attempt.
-const _usedOtpJtis = new Set();
+const _usedOtpJtis  = new Set();
 const OTP_TOKEN_TTL = 5 * 60; // 5 minutes in seconds
 
 app.post("/send-otp", async (req, res) => {
   try {
     const { email } = req.body;
 
-    if (!email) {
+    if (!email || typeof email !== 'string') {
       return res.status(400).json({ error: "Email is required" });
     }
 
     const normalized = email.trim().toLowerCase();
-    const FROM_ADDRESS = "Process Finder <noreply@processfinder.xyz>";
-    const code = String(Math.floor(100000 + Math.random() * 900000));
 
-    // Generate the challenge but do NOT store it until Resend confirms acceptance.
-    // This prevents a valid challenge existing server-side for an email the user
-    // never received.
+    // ── 1. Allowlist: recipient must be a registered user in config/users.json ──
+    // This is the primary abuse-prevention guard. Only registered process-finder
+    // users may receive OTP emails. Arbitrary email addresses are rejected.
+    const allUsers = await fetchGitHubJson('config/users.json', []);
+    const registeredUser = allUsers.find(
+      u => (u.email || '').trim().toLowerCase() === normalized
+    );
+    if (!registeredUser) {
+      // Return a generic 400 — do not reveal whether the email is registered.
+      console.warn("[OTP BLOCKED] unregistered email:", normalized);
+      return res.status(400).json({ error: "Email not authorized" });
+    }
+
+    // ── 2. Per-email cooldown ─────────────────────────────────────────────────
+    const now = Date.now();
+    const sendLog = _otpSendLog.get(normalized) || { lastSentAt: 0, hourlySends: [] };
+
+    const cooldownRemainS = Math.ceil((sendLog.lastSentAt + OTP_COOLDOWN_S * 1000 - now) / 1000);
+    if (cooldownRemainS > 0) {
+      console.warn("[OTP THROTTLED] cooldown:", normalized, `${cooldownRemainS}s remaining`);
+      return res.status(429).json({
+        error: "Please wait before requesting another code.",
+        retryAfterSeconds: cooldownRemainS
+      });
+    }
+
+    // ── 3. Per-email hourly cap ───────────────────────────────────────────────
+    const oneHourAgo = now - 60 * 60 * 1000;
+    const recentSends = sendLog.hourlySends.filter(t => t > oneHourAgo);
+    if (recentSends.length >= OTP_HOURLY_CAP) {
+      console.warn("[OTP THROTTLED] hourly cap:", normalized, `${recentSends.length}/${OTP_HOURLY_CAP}`);
+      return res.status(429).json({
+        error: "Too many OTP requests. Please try again later.",
+        retryAfterSeconds: 3600
+      });
+    }
+
+    // ── 4. Global hourly cap ──────────────────────────────────────────────────
+    // Prune old timestamps in place
+    while (_otpGlobalSendLog.length && _otpGlobalSendLog[0] <= oneHourAgo) {
+      _otpGlobalSendLog.shift();
+    }
+    if (_otpGlobalSendLog.length >= OTP_GLOBAL_HOURLY_CAP) {
+      console.warn("[OTP THROTTLED] global hourly cap:", _otpGlobalSendLog.length, "sends in last hour");
+      return res.status(429).json({
+        error: "OTP service temporarily at capacity. Please try again later.",
+        retryAfterSeconds: 3600
+      });
+    }
+
+    // ── 5. Generate challenge (not stored until send confirmed) ───────────────
+    const code = String(Math.floor(100000 + Math.random() * 900000));
     const challenge = {
       code,
-      expiry: Date.now() + OTP_TTL_MS,
+      expiry: now + OTP_TTL_MS,
       attempts: 0
     };
 
-    const resend = new Resend(process.env.RESEND_API_KEY);
+    // ── 6. Send email (or mock) ───────────────────────────────────────────────
+    if (EMAIL_SEND_MODE === 'mock') {
+      // Mock mode: log only — never calls Resend. Safe for local dev and tests.
+      // OTP code is intentionally NOT logged even in mock mode.
+      console.log(
+        "[OTP MOCK SENT]", normalized,
+        "from:", OTP_FROM_ADDRESS,
+        "subject:", OTP_SUBJECT,
+        "(mock — Resend not called)"
+      );
+    } else {
+      // Real mode: call Resend API. from/subject are fixed constants — never
+      // derived from request body or any user-supplied input.
+      const resend = new Resend(process.env.RESEND_API_KEY);
 
-    const result = await resend.emails.send({
-      from: FROM_ADDRESS,
-      to: normalized,
-      subject: "[Process Finder] Your OTP Code",
-      html: `
+      const result = await resend.emails.send({
+        from:    OTP_FROM_ADDRESS,
+        to:      normalized,       // allowlisted registered user only
+        subject: OTP_SUBJECT,      // fixed — never user-supplied
+        html: `
     <p>Hello,</p>
-
     <p>Your verification code is:</p>
-
     <h2 style="letter-spacing:2px;">${code}</h2>
-
     <p>This code will expire in 5 minutes.</p>
-
     <p>If you did not request this, please ignore this email.</p>
-
     <br>
-
     <p>Regards,<br>Process Finder Team</p>
   `
-    });
+      });
 
-    // Resend SDK v2+ returns { data: { id }, error } — check error before trusting success.
-    if (result.error) {
-      console.error(
-        "[OTP SEND FAILED]", normalized,
-        "from:", FROM_ADDRESS,
-        "resendError:", result.error.name,
-        "message:", result.error.message,
-        "statusCode:", result.error.statusCode
+      // Resend SDK v2+ returns { data: { id }, error }.
+      // Challenge is NOT stored if Resend rejects — avoids a valid challenge
+      // existing server-side for an email the user never received.
+      if (result.error) {
+        console.error(
+          "[OTP SEND FAILED]", normalized,
+          "from:", OTP_FROM_ADDRESS,
+          "resendError:", result.error.name,
+          "message:", result.error.message,
+          "statusCode:", result.error.statusCode
+        );
+        return res.status(502).json({ error: "Failed to deliver OTP email. Please try again." });
+      }
+
+      console.log(
+        "[OTP SENT]", normalized,
+        "from:", OTP_FROM_ADDRESS,
+        "messageId:", result.data?.id || "unknown"
       );
-      // Challenge is NOT stored — user never received a code, so no challenge should exist.
-      return res.status(502).json({ error: "Failed to deliver OTP email. Please try again." });
     }
 
-    // Resend accepted the send — store the challenge now.
+    // ── 7. Commit challenge and update rate-limit state ───────────────────────
     _otpChallenges.set(normalized, challenge);
+    sendLog.lastSentAt   = now;
+    sendLog.hourlySends  = [...recentSends, now]; // pruned window + new timestamp
+    _otpSendLog.set(normalized, sendLog);
+    _otpGlobalSendLog.push(now);
 
-    console.log(
-      "[OTP SENT]", normalized,
-      "from:", FROM_ADDRESS,
-      "messageId:", result.data?.id || "unknown"
-    );
-
-    res.json({ success: true, messageId: result.data?.id });
+    res.json({ success: true });
 
   } catch (err) {
     console.error("[OTP ERROR]", err.message || err);
