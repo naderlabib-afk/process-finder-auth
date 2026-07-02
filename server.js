@@ -824,21 +824,24 @@ app.post("/send-otp", async (req, res) => {
     }
 
     const normalized = email.trim().toLowerCase();
+    const FROM_ADDRESS = "Process Finder <noreply@processfinder.xyz>";
     const code = String(Math.floor(100000 + Math.random() * 900000));
 
-    // Store challenge — overwrites any prior pending challenge for this email.
-    _otpChallenges.set(normalized, {
+    // Generate the challenge but do NOT store it until Resend confirms acceptance.
+    // This prevents a valid challenge existing server-side for an email the user
+    // never received.
+    const challenge = {
       code,
       expiry: Date.now() + OTP_TTL_MS,
       attempts: 0
-    });
+    };
 
     const resend = new Resend(process.env.RESEND_API_KEY);
 
-    await resend.emails.send({
-      from: "Process Finder <noreply@processfinder.xyz>",
+    const result = await resend.emails.send({
+      from: FROM_ADDRESS,
       to: normalized,
-      subject: "[Process Finder] Your OTP Code ✅",
+      subject: "[Process Finder] Your OTP Code",
       html: `
     <p>Hello,</p>
 
@@ -856,12 +859,32 @@ app.post("/send-otp", async (req, res) => {
   `
     });
 
-    console.log("[OTP SENT]", normalized);
+    // Resend SDK v2+ returns { data: { id }, error } — check error before trusting success.
+    if (result.error) {
+      console.error(
+        "[OTP SEND FAILED]", normalized,
+        "from:", FROM_ADDRESS,
+        "resendError:", result.error.name,
+        "message:", result.error.message,
+        "statusCode:", result.error.statusCode
+      );
+      // Challenge is NOT stored — user never received a code, so no challenge should exist.
+      return res.status(502).json({ error: "Failed to deliver OTP email. Please try again." });
+    }
 
-    res.json({ success: true });
+    // Resend accepted the send — store the challenge now.
+    _otpChallenges.set(normalized, challenge);
+
+    console.log(
+      "[OTP SENT]", normalized,
+      "from:", FROM_ADDRESS,
+      "messageId:", result.data?.id || "unknown"
+    );
+
+    res.json({ success: true, messageId: result.data?.id });
 
   } catch (err) {
-    console.error("OTP ERROR:", err);
+    console.error("[OTP ERROR]", err.message || err);
     res.status(500).json({ error: "Failed to send OTP" });
   }
 });
