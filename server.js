@@ -797,6 +797,20 @@ async function _createPRForCountry(country, validatedEntries, triggeredBy) {
 
 const { Resend } = require("resend");
 
+// ─── OTP challenge store ──────────────────────────────────────────────────────
+// Keyed by normalized email. Entry shape: { code, expiry, attempts }
+// This is intentionally in-memory: challenges expire in 5 minutes and must
+// not survive server restarts (a restart invalidates all in-flight OTPs).
+const _otpChallenges = new Map();
+const OTP_TTL_MS     = 5 * 60 * 1000;  // 5 minutes
+const OTP_MAX_ATTEMPTS = 5;
+
+// ─── Consumed otpToken jti set ────────────────────────────────────────────────
+// One-time-use tokens: once a jti has been used to create a session it is
+// placed here and rejected on any subsequent attempt.
+const _usedOtpJtis = new Set();
+const OTP_TOKEN_TTL = 5 * 60; // 5 minutes in seconds
+
 app.post("/send-otp", async (req, res) => {
   try {
     const { email } = req.body;
@@ -805,20 +819,28 @@ app.post("/send-otp", async (req, res) => {
       return res.status(400).json({ error: "Email is required" });
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000);
+    const normalized = email.trim().toLowerCase();
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+
+    // Store challenge — overwrites any prior pending challenge for this email.
+    _otpChallenges.set(normalized, {
+      code,
+      expiry: Date.now() + OTP_TTL_MS,
+      attempts: 0
+    });
 
     const resend = new Resend(process.env.RESEND_API_KEY);
 
     await resend.emails.send({
       from: "Process Finder <noreply@processfinder.xyz>",
-      to: email,
+      to: normalized,
       subject: "[Process Finder] Your OTP Code ✅",
       html: `
     <p>Hello,</p>
 
     <p>Your verification code is:</p>
 
-    <h2 style="letter-spacing:2px;">${otp}</h2>
+    <h2 style="letter-spacing:2px;">${code}</h2>
 
     <p>This code will expire in 5 minutes.</p>
 
@@ -830,7 +852,7 @@ app.post("/send-otp", async (req, res) => {
   `
     });
 
-    console.log("[OTP SENT]", email, otp);
+    console.log("[OTP SENT]", normalized);
 
     res.json({ success: true });
 
@@ -841,29 +863,131 @@ app.post("/send-otp", async (req, res) => {
 });
 
 // ─── OTP Verify Route ────────────────────────────────────────────────────────
+//
+// Validates the submitted OTP code against the server-stored challenge.
+// On success: deletes the challenge (one-time use) and returns a short-lived
+// signed otpToken that /api/auth/session requires as proof of OTP verification.
+// On failure: increments the attempt counter; after OTP_MAX_ATTEMPTS the
+// challenge is locked (all further attempts rejected regardless of code).
 
 app.post("/verify-otp", (req, res) => {
-  res.json({ success: true });
+  const { email, otp } = req.body;
+
+  if (!email || !otp) {
+    return res.status(400).json({ error: 'EMAIL_AND_OTP_REQUIRED', message: 'Email and OTP code are required.' });
+  }
+
+  const normalized = email.trim().toLowerCase();
+  const challenge  = _otpChallenges.get(normalized);
+
+  if (!challenge) {
+    return res.status(400).json({ error: 'OTP_NOT_FOUND', message: 'No OTP challenge found. Please request a new code.' });
+  }
+
+  if (Date.now() > challenge.expiry) {
+    _otpChallenges.delete(normalized);
+    return res.status(400).json({ error: 'OTP_EXPIRED', message: 'The OTP code has expired. Please request a new code.' });
+  }
+
+  if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
+    _otpChallenges.delete(normalized);
+    return res.status(429).json({ error: 'TOO_MANY_ATTEMPTS', message: 'Too many incorrect attempts. Please request a new code.' });
+  }
+
+  const submitted = String(otp).trim();
+  if (submitted !== challenge.code) {
+    challenge.attempts += 1;
+    const remaining = OTP_MAX_ATTEMPTS - challenge.attempts;
+    return res.status(400).json({
+      error: 'INVALID_OTP',
+      message: remaining > 0
+        ? `Incorrect code. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`
+        : 'Incorrect code. No attempts remaining. Please request a new code.'
+    });
+  }
+
+  // ── Success: consume the challenge ──────────────────────────────────────────
+  _otpChallenges.delete(normalized);
+
+  // Issue a short-lived, single-use otpToken as proof of OTP verification.
+  // /api/auth/session will require this token before issuing a session JWT.
+  const now = Math.floor(Date.now() / 1000);
+  const jti = crypto.randomBytes(16).toString('hex');
+  const otpToken = signJwt({
+    type: 'otp-verified',
+    email: normalized,
+    jti,
+    iat: now,
+    exp: now + OTP_TOKEN_TTL
+  });
+
+  console.log("[OTP VERIFIED]", normalized);
+  res.json({ success: true, otpToken });
 });
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
 /**
  * POST /api/auth/session
- * Validates the email against config/users.json (fetched from GitHub), then issues a signed JWT.
+ * Requires a valid otpToken (issued by /verify-otp) as proof that the OTP
+ * challenge was successfully completed. Only then validates the email against
+ * config/users.json and issues a signed session JWT.
+ *
+ * Security guarantees:
+ *  - otpToken must be a valid JWT signed with JWT_SECRET
+ *  - otpToken type must be 'otp-verified'
+ *  - otpToken email must match the session email
+ *  - otpToken must not be expired
+ *  - otpToken jti must not have been used before (single-use)
+ *  - Role is always derived from the trusted server-side users config
  */
 app.post('/api/auth/session', async (req, res) => {
-  const { email } = req.body;
+  const { email, otpToken } = req.body;
   if (!email || typeof email !== 'string') {
     return res.status(400).json({ error: 'email required' });
   }
+  if (!otpToken || typeof otpToken !== 'string') {
+    return res.status(401).json({ error: 'OTP_TOKEN_REQUIRED', message: 'OTP verification token is required.' });
+  }
+
+  // Validate the otpToken
+  const otpResult = verifyJwt(otpToken);
+  if (!otpResult.ok) {
+    const msg = otpResult.expired
+      ? 'OTP verification has expired. Please request a new code.'
+      : 'Invalid OTP verification token.';
+    return res.status(401).json({ error: 'INVALID_OTP_TOKEN', message: msg });
+  }
+
+  const otpPayload = otpResult.payload;
+
+  if (otpPayload.type !== 'otp-verified') {
+    return res.status(401).json({ error: 'INVALID_OTP_TOKEN', message: 'Invalid OTP verification token.' });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  if (otpPayload.email !== normalizedEmail) {
+    return res.status(401).json({ error: 'OTP_EMAIL_MISMATCH', message: 'OTP token does not match the requested email.' });
+  }
+
+  // Enforce single-use: reject if this jti has already been consumed
+  if (_usedOtpJtis.has(otpPayload.jti)) {
+    return res.status(401).json({ error: 'OTP_TOKEN_REUSED', message: 'OTP verification token has already been used.' });
+  }
+
+  // Mark this jti as consumed before issuing the session
+  _usedOtpJtis.add(otpPayload.jti);
+
+  // Role is always derived from the trusted server-side users config
   const users = await fetchGitHubJson('config/users.json', []);
-  const user = users.find(u => u.email.trim().toLowerCase() === email.trim().toLowerCase());
+  const user = users.find(u => u.email.trim().toLowerCase() === normalizedEmail);
   if (!user || !['OL', 'Manager', 'Admin'].includes(user.role)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
+
   const now = Math.floor(Date.now() / 1000);
   const token = signJwt({ email: user.email, role: user.role, iat: now, exp: now + TOKEN_TTL });
+  console.log("[SESSION ISSUED]", user.email, user.role);
   res.json({ success: true, token, email: user.email, role: user.role });
 });
 
