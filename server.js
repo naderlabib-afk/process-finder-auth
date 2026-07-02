@@ -1115,6 +1115,19 @@ app.get('/api/config/countries', async (req, res) => {
 });
 
 app.get('/api/config/users', async (req, res) => {
+  // Phase 2: strip the `countries` array — public route must not expose country
+  // assignment details. Returns email + role only for each user.
+  const users = await fetchGitHubJson('config/users.json', []);
+  res.json(users.map(u => ({ email: u.email, role: u.role })));
+});
+
+/**
+ * GET /api/ops/users
+ * Returns full user objects (email, role, countries) for authenticated OPS UI use.
+ * Phase 2: new authenticated endpoint. Replaces the unguarded /api/config/users
+ * for internal OPS calls that need the full user record.
+ */
+app.get('/api/ops/users', requireAuth, async (req, res) => {
   res.json(await fetchGitHubJson('config/users.json', []));
 });
 
@@ -1132,13 +1145,13 @@ app.get('/api/processes/:country', async (req, res) => {
   res.json(json);
 });
 
-// ─── OPS reads (public) ───────────────────────────────────────────────────────
+// ─── OPS reads (authenticated — Phase 2) ────────────────────────────────────
 
-app.get('/api/ops/buffer', async (req, res) => {
+app.get('/api/ops/buffer', requireAuth, async (req, res) => {
   res.json(await fetchGitHubJson('data/ops/buffer.json', {}));
 });
 
-app.get('/api/ops/history', async (req, res) => {
+app.get('/api/ops/history', requireAuth, async (req, res) => {
   res.json(await fetchGitHubJson('data/ops/history.json', {}));
 });
 
@@ -1161,7 +1174,7 @@ app.post('/api/ops/history/append', requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/api/ops/settings', async (req, res) => {
+app.get('/api/ops/settings', requireAuth, async (req, res) => {
   res.json(await fetchGitHubJson('data/ops/settings.json', {}));
 });
 
@@ -1446,8 +1459,9 @@ app.patch('/api/ops/buffer/edit-lock', requireAuth, async (req, res) => {
  * GET /api/ops/process/edit-lock
  * Returns the full process_edit_locks.json so the frontend can render
  * "being edited by X" indicators on process cards.
+ * Phase 2: requireAuth added.
  */
-app.get('/api/ops/process/edit-lock', async (req, res) => {
+app.get('/api/ops/process/edit-lock', requireAuth, async (req, res) => {
   const locks = await fetchGitHubJson(PROCESS_EDIT_LOCKS_PATH, {});
   res.json(locks);
 });
@@ -2873,8 +2887,9 @@ async function _moveBufToHistoryAfterAppend(country, appendedEntries, activePR, 
 /**
  * GET /api/ops/pr/schedule
  * Returns the full pr_schedule.json so the frontend can render countdown timers.
+ * Phase 2: requireAuth added.
  */
-app.get('/api/ops/pr/schedule', async (req, res) => {
+app.get('/api/ops/pr/schedule', requireAuth, async (req, res) => {
   await _maybeTriggerScheduledPRs(); // lazy hybrid trigger
   res.json(await fetchGitHubJson(PR_SCHEDULE_PATH, {}));
 });
