@@ -1013,6 +1013,10 @@ app.post("/verify-otp", (req, res) => {
     const remaining = OTP_MAX_ATTEMPTS - challenge.attempts;
     return res.status(400).json({
       error: 'INVALID_OTP',
+      // remainingAttempts is a typed numeric field for frontend rendering.
+      // message is a human-readable fallback — frontend should use remainingAttempts
+      // rather than parsing this string.
+      remainingAttempts: remaining,
       message: remaining > 0
         ? `Incorrect code. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`
         : 'Incorrect code. No attempts remaining. Please request a new code.'
