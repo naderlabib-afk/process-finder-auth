@@ -3129,9 +3129,13 @@ app.delete('/api/admin/branch', requireAuth, async (req, res) => {
 
 /**
  * GET /api/ops/logs
- * Returns activity_logs.json — the new structured log (validation, PR events, rollback).
+ * Returns activity_logs.json — Admin only.
+ * Phase 8.5: requireAuth added. Previously unauthenticated (TODO-2 from §8).
  */
-app.get('/api/ops/logs', async (req, res) => {
+app.get('/api/ops/logs', requireAuth, async (req, res) => {
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Forbidden — Logs are Admin only.' });
+  }
   res.json(await fetchGitHubJson('data/logs/activity_logs.json', []));
 });
 
