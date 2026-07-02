@@ -573,11 +573,10 @@ async function _closePR(prNumber, reason) {
  * Validates:
  *   1. GITHUB_TOKEN configured
  *   2. Target base branch exists
- *   3. Validated entries provided
- *   4. No pending entries remain (scoped to the triggering user's visible set)
- *   5. No PR already open for this country
+ *   3. At least one validated entry provided
+ *   4. No PR already open for this country (pending entries do NOT block — see governance §11)
  */
-async function _preflightPRCheck(country, validatedEntries, scopedPendingEntries) {
+async function _preflightPRCheck(country, validatedEntries) {
   if (!GITHUB_TOKEN) {
     return { ok: false, httpStatus: 500, error: 'GITHUB_TOKEN not configured on server' };
   }
@@ -594,15 +593,9 @@ async function _preflightPRCheck(country, validatedEntries, scopedPendingEntries
     return { ok: false, httpStatus: 400, error: 'No validated entries are ready for PR creation' };
   }
 
-  // Only count pending entries within the triggering user's scope — an OL with unvalidated
-  // entries must not block a Manager/Admin from creating a PR for their own scoped entries.
-  const pendingCount = (scopedPendingEntries || []).filter(e => e.status === 'pending').length;
-  if (pendingCount > 0) {
-    return {
-      ok: false, httpStatus: 400,
-      error: `${pendingCount} pending entr${pendingCount > 1 ? 'ies' : 'y'} must be validated or removed before creating a PR`
-    };
-  }
+  // Governance: pending entries do NOT block PR creation.
+  // Only validated entries are included; pending entries remain in Buffer untouched.
+  // No pendingCount check here — see governance rule §11.3-5.
 
   // _hasOpenPRForCountry now returns { ok, hasOpen?, error? }.
   // If ok===false (GitHub unreachable / non-2xx), block the operation — fail safe.
@@ -624,10 +617,21 @@ async function _preflightPRCheck(country, validatedEntries, scopedPendingEntries
 }
 
 /**
- * Filters validated buffer entries based on the triggering user's role.
- * - Admin   : all entries
- * - Manager : own entries + entries owned by OL users (not other Managers/Admins)
- * - OL      : own entries only
+ * Filters buffer entries to those the triggering user is authorised to include
+ * in a Publish Request, based on role and ownership.
+ *
+ * Scope rules:
+ *   Admin   : all entries, unrestricted.
+ *   Manager : own entries (any status) + entries owned by OL users only.
+ *             Peer Manager entries are NEVER included.
+ *             Country scope is caller-enforced — this function receives only the
+ *             flat entry list for the requested country, which is already bounded
+ *             by the Manager's assigned countries at the route level.
+ *   OL      : own entries only. No other user's entries regardless of role.
+ *
+ * This is the AUTHORITATIVE scope filter for Publish Request eligibility.
+ * The frontend canValidateEntry() mirrors this logic for button-visibility purposes only.
+ * The backend always re-applies this filter server-side — frontend entry selection is never trusted.
  *
  * @param {Array}  entries      - flat array of buffer entries for the country
  * @param {Array}  allUsers     - users array from config/users.json
@@ -1449,7 +1453,13 @@ app.patch('/api/ops/process/edit-lock', requireAuthBeacon, async (req, res) => {
 /**
  * POST /api/ops/cancel
  * Hard-deletes a single buffer entry. No history write, no audit log.
- * New workflow: cancel = remove without trace.
+ *
+ * Governance (Phase 8.6 correction): this endpoint can only ever succeed for
+ * pre-PR draft entries — entries locked by a scheduled job or an open GitHub PR
+ * are rejected (409) before reaching the splice. Pre-PR Buffer cleanup is NOT a
+ * production lifecycle event and must not be logged as audit/rollback trail.
+ * History/Logs audit begins when a real GitHub PR is created (see Reject Request
+ * workflow — future phase).
  *
  * Permission rules:
  *   OL      → can only remove their OWN entries with status="pending"
@@ -1528,7 +1538,8 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
     });
   }
 
-  // Splice out — no history write, no log entry
+  // Splice out — no history write, no audit log.
+  // Pre-PR Buffer cleanup is not a production lifecycle event (see JSDoc above).
   entries.splice(index, 1);
 
   await commitJsonToMainBranch('data/ops/buffer.json', buffer, `ops: remove buffer entry ${entry.id} for ${country}`);
@@ -1541,6 +1552,12 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
  * Toggles a buffer entry between status="pending" and status="validated".
  * The entry STAYS IN THE BUFFER — no history write, no PR trigger.
  * Entries only move to history after the 10-minute scheduled PR executor fires.
+ *
+ * "validated" is a Buffer READINESS state, not an approval state.
+ * It means the entry has passed operational/readiness checks and is eligible
+ * to be included in a Publish Request. It does not mean Admin-approved or
+ * production-approved. The approval lifecycle starts only after a real GitHub
+ * PR / Publish Request is created.
  *
  * Available to: OL, Manager, Admin (all three roles).
  * OL can validate any entry within their allowed countries.
@@ -1736,9 +1753,9 @@ app.post('/api/ops/rollback', requireAuth, async (req, res) => {
   const rollbackLogEntry = {
     id:          `rollback_${itemId || historyIndex}_${Date.now()}`,
     type:        'rollback',
-    status:      'approved',
+    status:      'approved',   // internal: 'approved' here means the rollback was actioned (not Buffer-validated)
     user:        req.user.email,
-    validatedAt: now,
+    validatedAt: now,          // internal: reuses validatedAt/By fields to record when/by whom rollback was confirmed
     validatedBy: req.user.email,
     country,
     referenceId: itemId || null,
@@ -1894,10 +1911,10 @@ app.post('/api/ops/approve-and-merge', requireAuth, async (req, res) => {
     const mergeUsers       = await fetchGitHubJson('config/users.json', []);
     const scopedForMerge   = _filterEntriesByPRScope(allEntries, mergeUsers, approver);
     const validatedEntries = scopedForMerge.filter(e => e.status === 'validated');
-    const scopedPending    = scopedForMerge.filter(e => e.status === 'pending');
+    // Pending entries are not passed — governance: pending does not block.
 
     // Run the same pre-flight check used by the scheduled executor
-    const preflight = await _preflightPRCheck(country, validatedEntries, scopedPending);
+    const preflight = await _preflightPRCheck(country, validatedEntries);
     if (!preflight.ok) {
       return res.status(preflight.httpStatus || 400).json({ error: preflight.error });
     }
@@ -2801,22 +2818,24 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
   const isAppendMode = prCheck.hasOpen;
   const activePR     = isAppendMode ? prCheck.activePR : null;
 
-  // Collect entries for this country, scoped to the triggering user's role
-  const countryBuf      = buffer[country] || {};
-  const allEntries      = Object.values(countryBuf).flat();
-  const scheduleUsers   = await fetchGitHubJson('config/users.json', []);
-  const scopedEntries   = _filterEntriesByPRScope(allEntries, scheduleUsers, req.user.email);
-  const validatedCount  = scopedEntries.filter(e => e.status === 'validated').length;
-  const pendingCount    = scopedEntries.filter(e => e.status === 'pending').length;
+  // Collect entries for this country, scoped to the triggering user's role.
+  // Governance: only validated entries are included in the Publish Request.
+  // Pending/unvalidated entries in scope remain in Buffer and do not block creation.
+  const countryBuf     = buffer[country] || {};
+  const allEntries     = Object.values(countryBuf).flat();
+  const scheduleUsers  = await fetchGitHubJson('config/users.json', []);
+  const scopedEntries  = _filterEntriesByPRScope(allEntries, scheduleUsers, req.user.email);
+  const validatedCount = scopedEntries.filter(e => e.status === 'validated').length;
 
   if (!validatedCount) {
     return res.status(400).json({ error: 'No validated entries to create a PR for' });
   }
-  if (pendingCount > 0) {
-    return res.status(400).json({
-      error: `${pendingCount} pending entr${pendingCount > 1 ? 'ies' : 'y'} must be validated or removed before scheduling a PR`
-    });
-  }
+  // Pending entries are intentionally NOT checked here — they remain in Buffer
+  // and are excluded from the Publish Request. See governance rule §11.3-5.
+  //
+  // Phase 3 gap (tracked): country-scope check (_assertCountryAllowed) not yet enforced here.
+  // The backend verifies role + ownership via _filterEntriesByPRScope but does not yet
+  // assert that req.user is assigned to the requested country. Tracked as a future phase.
 
   // Mode B duplicate process issue check
   // Checks three sources for issues already claimed by the active PR:
@@ -2915,6 +2934,11 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
  * DELETE /api/ops/pr/schedule/:country
  * Cancels (undoes) a scheduled PR job. Available during the 10-minute window.
  * All roles may undo a PR they can see.
+ *
+ * Governance (Phase 8.6 correction): countdown cancellation is pre-PR; no GitHub
+ * PR exists yet (Mode A) or the entries being appended have not yet been committed
+ * to the PR branch (Mode B). Neither case is a production lifecycle event.
+ * No audit log is written. History/Logs audit begins at PR creation, not schedule.
  */
 app.delete('/api/ops/pr/schedule/:country', requireAuth, async (req, res) => {
   const country = (req.params.country || '').toLowerCase();
@@ -3377,8 +3401,8 @@ async function _runScheduledPRExecutor() {
 
         } else {
           // ── Mode A: Create new PR ─────────────────────────────────────────────
-          // Pre-flight check (token, base branch, scoped entry state, open PR guard)
-          const preflight = await _preflightPRCheck(country, validated, scopedPending);
+          // Pre-flight check (token, base branch, validated entries, open PR guard)
+          const preflight = await _preflightPRCheck(country, validated);
           if (!preflight.ok) {
             console.warn(`[PR executor] Pre-flight failed for "${country}": ${preflight.error}`);
             appendActivityLog({
