@@ -2583,13 +2583,13 @@ async function _moveBufToHistoryAfterPR(country, validatedEntries, prResult, tri
 }
 
 // ─── PR Schedule helpers ──────────────────────────────────────────────────────
-// In production this is always 5 minutes.
+// In production this is always 2 minutes.
 // Set PR_DELAY_MS_OVERRIDE (milliseconds) in the environment only for test/staging
 // environments where you need the countdown to fire immediately.
 // Example: PR_DELAY_MS_OVERRIDE=5000  → 5-second countdown.
 const PR_DELAY_MS = process.env.PR_DELAY_MS_OVERRIDE
   ? Math.max(0, parseInt(process.env.PR_DELAY_MS_OVERRIDE, 10))
-  : 5 * 60 * 1000; // 5 minutes
+  : 2 * 60 * 1000; // 2 minutes
 const PR_SCHEDULE_PATH = 'data/ops/pr_schedule.json';
 
 /**
@@ -2949,7 +2949,7 @@ app.get('/api/ops/pr/schedule', requireAuth, async (req, res) => {
 
 /**
  * POST /api/ops/pr/schedule
- * Schedules a PR for a country (10-minute delayed creation).
+ * Schedules a PR for a country (2-minute delayed creation).
  * All roles (OL, Manager, Admin) may call this.
  *
  * Mode A — Create PR (no active PR exists):
@@ -3112,7 +3112,7 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
 
 /**
  * DELETE /api/ops/pr/schedule/:country
- * Cancels (undoes) a scheduled PR job. Available during the 10-minute window.
+ * Cancels (undoes) a scheduled PR job. Available during the 2-minute window.
  * All roles may undo a PR they can see.
  *
  * Audit trail (Phase 8.6): a matching 'pr-schedule-cancelled' (Mode A) or
@@ -3432,6 +3432,17 @@ app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
   const now      = new Date().toISOString();
 
   try {
+    // ── Governance: block Approve while a countdown is active for this country ─
+    // A countdown means a PR creation or append is in-flight for the country.
+    // Approving while a new batch is mid-schedule could corrupt state.
+    const scheduleNow = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+    if (scheduleNow[country]) {
+      return res.status(409).json({
+        error: `A PR countdown is currently running for "${country}". Wait for it to complete or be cancelled before approving.`,
+        countdown: true
+      });
+    }
+
     // ── Pre-flight: verify History has pending_merge entries for this PR ──────
     // Must happen before any GitHub call so we never merge a PR whose History
     // record is missing or already transitioned.
@@ -3548,6 +3559,17 @@ app.post('/api/admin/pr/close', requireAuth, async (req, res) => {
   const now      = new Date().toISOString();
 
   try {
+    // ── Governance: block Reject while a countdown is active for this country ─
+    // A countdown means a PR creation or append is in-flight for the country.
+    // Rejecting while a new batch is mid-schedule could corrupt state.
+    const scheduleNow = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+    if (scheduleNow[country]) {
+      return res.status(409).json({
+        error: `A PR countdown is currently running for "${country}". Wait for it to complete or be cancelled before rejecting.`,
+        countdown: true
+      });
+    }
+
     // ── Pre-flight: verify History has pending_merge entries for this PR ──────
     // Must happen before any GitHub call so we never close a PR whose History
     // record is missing or already transitioned.
