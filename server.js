@@ -26,6 +26,9 @@ const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
 // PR target branch — must be "main" in production.
 // Set GITHUB_TARGET_BRANCH=main in Render. Server warns on startup if not "main".
 const GITHUB_TARGET_BRANCH = process.env.GITHUB_TARGET_BRANCH || 'feature/pre-live';
+// Overridable GitHub API base — set GITHUB_API_BASE in env to redirect calls (e.g. for tests).
+// Production default: https://api.github.ibm.com
+const GITHUB_API_BASE = process.env.GITHUB_API_BASE || 'https://api.github.ibm.com';
 
 // Kill switch: set DISABLE_PR_CREATION=true in Render to block all PR creation,
 // branch creation, commits, and buffer-to-history movements. Buffer reads/writes,
@@ -168,7 +171,7 @@ function ghHeaders() {
 async function getGitHubFileContent(filePath) {
   try {
     const res = await fetch(
-      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}?ref=${GITHUB_BRANCH}`,
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}?ref=${GITHUB_BRANCH}`,
       { headers: ghHeaders() }
     );
     if (!res.ok) return null;
@@ -405,7 +408,7 @@ async function commitJsonToMainBranch(filePath, data, message, _retries = 3) {
     try {
       const fileInfo = await getGitHubFileContent(filePath);
       const res = await fetch(
-        `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
+        `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
         {
           method: 'PUT',
           headers: ghHeaders(),
@@ -2518,8 +2521,8 @@ app.get('/api/readme', async (req, res) => {
 // ─── Activity Log helper ──────────────────────────────────────────────────────
 /**
  * Appends an entry to data/logs/activity_logs.json on GitHub.
- * Only called for impactful events: validation, PR scheduled, PR created,
- * PR merged, PR refused, rollback.
+ * Called for impactful events: validation, PR scheduled, PR schedule cancelled,
+ * PR created, PR merged, PR refused, rollback.
  * Never throws — log failure must never block the successful response.
  */
 async function appendActivityLog(entry) {
@@ -3112,10 +3115,11 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
  * Cancels (undoes) a scheduled PR job. Available during the 10-minute window.
  * All roles may undo a PR they can see.
  *
- * Governance (Phase 8.6 correction): countdown cancellation is pre-PR; no GitHub
- * PR exists yet (Mode A) or the entries being appended have not yet been committed
- * to the PR branch (Mode B). Neither case is a production lifecycle event.
- * No audit log is written. History/Logs audit begins at PR creation, not schedule.
+ * Audit trail (Phase 8.6): a matching 'pr-schedule-cancelled' (Mode A) or
+ * 'pr-append-schedule-cancelled' (Mode B) event is written to activity_logs.json.
+ * The corresponding 'pr-scheduled' / 'pr-append-scheduled' event was already written
+ * when the schedule was created — the cancellation log completes the audit pair.
+ * Mode B: the underlying GitHub PR still exists even though the append was undone.
  */
 app.delete('/api/ops/pr/schedule/:country', requireAuth, async (req, res) => {
   const country = (req.params.country || '').toLowerCase();
@@ -3134,6 +3138,25 @@ app.delete('/api/ops/pr/schedule/:country', requireAuth, async (req, res) => {
   const job = schedule[country];
   delete schedule[country];
   await commitJsonToMainBranch(PR_SCHEDULE_PATH, schedule, `ops: undo PR schedule for ${country} by ${req.user.email}`);
+
+  // Write audit log — fire-and-forget; failure must not block the success response.
+  const isAppend = job.mode === 'append';
+  appendActivityLog({
+    event:         isAppend ? 'pr-append-schedule-cancelled' : 'pr-schedule-cancelled',
+    by:            req.user.email,
+    role:          req.user.role,
+    country,
+    batchId:       job.batch_id    || null,
+    entryCount:    job.entry_count || 0,
+    entryIds:      job.entry_ids   || [],
+    scheduledAt:   job.scheduled_at   || null,
+    executeAfter:  job.execute_after  || null,
+    originalCreatedBy: job.created_by || null,
+    ...(isAppend ? {
+      activePRNumber: job.active_pr?.prNumber || null,
+      activePRUrl:    job.active_pr?.prUrl    || null
+    } : {})
+  });
 
   console.log(`[PR schedule] PR for "${country}" cancelled by ${req.user.email}`);
   res.json({ success: true, job });
@@ -3381,38 +3404,217 @@ app.delete('/api/ops/history/entry', requireAuth, async (req, res) => {
   }
 });
 
-// ─── Admin PR close + branch delete (Admin only) ─────────────────────────────
+// ─── Admin OPS-based Approve & Publish / Reject Request (Admin only) ─────────
+
+/**
+ * POST /api/admin/pr/approve
+ * OPS-based Admin Approve & Publish.
+ * Admin acts from the OPS panel — backend merges the GitHub PR, updates
+ * History to merged/published, and writes a Logs audit record.
+ *
+ * Body: { country: string, prNumber: number }
+ * Returns: { success, country, prNumber, mergedCount, sha }
+ */
+app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+
+  const { country, prNumber } = req.body;
+  if (!country || !validateCountry(country)) {
+    return res.status(400).json({ error: 'Valid country is required' });
+  }
+  if (!prNumber || typeof prNumber !== 'number') {
+    return res.status(400).json({ error: 'prNumber (number) is required' });
+  }
+
+  const approver = req.user.email;
+  const now      = new Date().toISOString();
+
+  try {
+    // ── Pre-flight: verify History has pending_merge entries for this PR ──────
+    // Must happen before any GitHub call so we never merge a PR whose History
+    // record is missing or already transitioned.
+    const historyPre = await fetchGitHubJson('data/ops/history.json', {});
+    const matchingEntries = (historyPre[country] || []).filter(
+      h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
+    );
+    if (matchingEntries.length === 0) {
+      return res.status(409).json({
+        error: `No pending_merge History entries found for country "${country}" PR #${prNumber}. Approve aborted.`
+      });
+    }
+
+    // ── Verify PR is open before attempting merge ─────────────────────────────
+    const prCheckRes = await fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`,
+      { headers: ghHeaders() }
+    );
+    if (!prCheckRes.ok) {
+      const errBody = await prCheckRes.text().catch(() => '');
+      return res.status(prCheckRes.status).json({ error: `GitHub returned ${prCheckRes.status} fetching PR #${prNumber}: ${errBody}` });
+    }
+    const prData = await prCheckRes.json();
+    if (prData.state !== 'open') {
+      return res.status(409).json({ error: `PR #${prNumber} is not open (state: ${prData.state}). Cannot approve.` });
+    }
+
+    // ── Squash-merge the PR via GitHub API ────────────────────────────────────
+    const mergeRes = await fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/merge`,
+      {
+        method: 'PUT',
+        headers: ghHeaders(),
+        body: JSON.stringify({
+          merge_method:    'squash',
+          commit_title:    `OPS: Publish Request #${prNumber} approved by ${approver}`,
+          commit_message:  `Approved via OPS panel. Country: ${country}. Approved by: ${approver}. Timestamp: ${now}.`
+        })
+      }
+    );
+    if (!mergeRes.ok) {
+      const errBody = await mergeRes.text().catch(() => '');
+      // 405 = not mergeable (conflicts or already merged)
+      if (mergeRes.status === 405) {
+        return res.status(409).json({ error: `PR #${prNumber} is not mergeable — may have conflicts or was already merged. GitHub: ${errBody}` });
+      }
+      return res.status(mergeRes.status).json({ error: `GitHub merge failed for PR #${prNumber}: ${mergeRes.status} ${errBody}` });
+    }
+    const mergeData = await mergeRes.json();
+    const mergeSha  = mergeData.sha || null;
+
+    // ── Update History: pending_merge → merged ────────────────────────────────
+    // Re-use the pre-fetched history object — mutate the matched entries in place.
+    let mergedCount = 0;
+    matchingEntries.forEach(h => {
+      h.pr_status  = 'merged';
+      h.mergedAt   = now;
+      h.approvedBy = approver;
+      h.approvedAt = now;
+      if (mergeSha) h.mergeCommitSha = mergeSha;
+      mergedCount++;
+    });
+
+    await commitJsonToMainBranch(
+      'data/ops/history.json', historyPre,
+      `ops: mark ${country} PR #${prNumber} as merged — approved by ${approver}`
+    );
+
+    // ── Write Logs audit record ───────────────────────────────────────────────
+    appendActivityLog({
+      event:       'request-approved',
+      by:          approver,
+      role:        req.user.role,
+      country,
+      prNumber,
+      prUrl:       prData.html_url,
+      branchName:  prData.head?.ref || null,
+      mergedCount,
+      mergeCommitSha: mergeSha,
+      approvedAt:  now
+    });
+
+    console.log(`[Admin approve] PR #${prNumber} merged for "${country}" by ${approver} — ${mergedCount} history entries updated`);
+    res.json({ success: true, country, prNumber, mergedCount, sha: mergeSha });
+
+  } catch (err) {
+    console.error('[Admin approve] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /**
  * POST /api/admin/pr/close
- * Closes a PR without merging. Admin only.
- * Body: { prNumber: number, reason?: string }
+ * OPS-based Admin Reject Request.
+ * Admin acts from the OPS panel — backend closes the GitHub PR, updates
+ * History to refused, and writes a request-rejected Logs audit record.
+ *
+ * Body: { country: string, prNumber: number, reason?: string }
+ * Returns: { success, country, prNumber, refusedCount }
  */
 app.post('/api/admin/pr/close', requireAuth, async (req, res) => {
   if (req.user.role !== 'Admin') {
     return res.status(403).json({ error: 'Admin only' });
   }
-  const { prNumber, reason } = req.body;
+  const { country, prNumber, reason } = req.body;
   if (!prNumber || typeof prNumber !== 'number') {
     return res.status(400).json({ error: 'prNumber (number) is required' });
   }
+  if (!country || !validateCountry(country)) {
+    return res.status(400).json({ error: 'Valid country is required' });
+  }
+
+  const rejecter = req.user.email;
+  const now      = new Date().toISOString();
+
   try {
-    const r = await fetch(
-      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`,
+    // ── Pre-flight: verify History has pending_merge entries for this PR ──────
+    // Must happen before any GitHub call so we never close a PR whose History
+    // record is missing or already transitioned.
+    const historyPre = await fetchGitHubJson('data/ops/history.json', {});
+    const matchingEntries = (historyPre[country] || []).filter(
+      h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
+    );
+    if (matchingEntries.length === 0) {
+      return res.status(409).json({
+        error: `No pending_merge History entries found for country "${country}" PR #${prNumber}. Reject aborted.`
+      });
+    }
+
+    // ── Close the PR via GitHub API ───────────────────────────────────────────
+    const closeRes = await fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`,
       {
         method: 'PATCH',
         headers: ghHeaders(),
-        body: JSON.stringify({ state: 'closed', body: reason || '[Admin] Closed without merge' })
+        body: JSON.stringify({
+          state: 'closed',
+          body:  reason ? `[Admin Reject] ${reason}` : '[Admin] Rejected via OPS panel'
+        })
       }
     );
-    if (!r.ok) {
-      const errBody = await r.text().catch(() => '');
-      return res.status(r.status).json({ error: `GitHub returned ${r.status}: ${errBody}` });
+    if (!closeRes.ok) {
+      const errBody = await closeRes.text().catch(() => '');
+      return res.status(closeRes.status).json({ error: `GitHub returned ${closeRes.status}: ${errBody}` });
     }
-    const pr = await r.json();
-    console.log(`[Admin] PR #${prNumber} closed by ${req.user.email}`);
-    res.json({ success: true, prNumber: pr.number, state: pr.state, merged: !!pr.merged_at });
+    const pr = await closeRes.json();
+
+    // ── Update History: pending_merge → refused ───────────────────────────────
+    // Re-use the pre-fetched history object — mutate the matched entries in place.
+    let refusedCount = 0;
+    matchingEntries.forEach(h => {
+      h.pr_status        = 'refused';
+      h.closedAt         = now;
+      h.rejectedBy       = rejecter;
+      h.rejectedAt       = now;
+      if (reason) h.rejectionReason = reason.trim();
+      refusedCount++;
+    });
+
+    await commitJsonToMainBranch(
+      'data/ops/history.json', historyPre,
+      `ops: mark ${country} PR #${prNumber} as refused — rejected by ${rejecter}`
+    );
+
+    // ── Write Logs audit record ───────────────────────────────────────────────
+    appendActivityLog({
+      event:            'request-rejected',
+      by:               rejecter,
+      role:             req.user.role,
+      country,
+      prNumber,
+      prUrl:            pr.html_url,
+      branchName:       pr.head?.ref || null,
+      refusedCount,
+      rejectionReason:  reason ? reason.trim() : null,
+      rejectedAt:       now
+    });
+
+    console.log(`[Admin reject] PR #${prNumber} closed for "${country}" by ${rejecter} — ${refusedCount} history entries updated`);
+    res.json({ success: true, country, prNumber, state: pr.state, refusedCount });
+
   } catch (err) {
+    console.error('[Admin reject] error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
