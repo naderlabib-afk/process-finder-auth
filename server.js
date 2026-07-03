@@ -123,6 +123,34 @@ function validateCountry(country) {
   return typeof country === 'string' && /^[a-z0-9_-]+$/i.test(country.trim());
 }
 
+/**
+ * Phase 3: Country-scope enforcement helper.
+ *
+ * Asserts that the authenticated user is permitted to act on `country`.
+ * - Admin:   always allowed (unrestricted scope).
+ * - Manager: allowed only if `country` is in their `countries` array in config/users.json.
+ * - OL:      allowed only if `country` is in their `countries` array in config/users.json.
+ *
+ * Returns { ok: true } on success.
+ * Returns { ok: false, status: 403, error: string } when the user is not assigned to the country.
+ * The caller is responsible for sending the HTTP response on failure.
+ *
+ * `allUsers` is optional — pass a pre-fetched copy to avoid a redundant GitHub read.
+ */
+async function _assertCountryAllowed(user, country, allUsers = null) {
+  if (user.role === 'Admin') return { ok: true };
+  const users = allUsers || await fetchGitHubJson('config/users.json', []);
+  const norm  = e => (e || '').toLowerCase().trim();
+  const rec   = users.find(u => norm(u.email) === norm(user.email));
+  const assigned = Array.isArray(rec?.countries) ? rec.countries.map(c => norm(c)) : [];
+  if (assigned.includes(norm(country))) return { ok: true };
+  return {
+    ok:     false,
+    status: 403,
+    error:  `Not allowed — you are not assigned to country "${country}".`
+  };
+}
+
 // ─── GitHub API helpers ───────────────────────────────────────────────────────
 
 function ghHeaders() {
@@ -1222,6 +1250,9 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
   if (!validateCountry(country)) {
     return res.status(400).json({ error: 'Invalid country' });
   }
+  // Phase 3: country-scope enforcement
+  const _bufScope = await _assertCountryAllowed(req.user, country);
+  if (!_bufScope.ok) return res.status(_bufScope.status).json({ error: _bufScope.error });
   if (!['create', 'update', 'delete'].includes(type)) {
     return res.status(400).json({ error: 'type must be create, update, or delete' });
   }
@@ -1332,6 +1363,13 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'buffer object required' });
   }
 
+  // Phase 3: country-scope enforcement — check every country key in the incoming buffer
+  for (const ck of Object.keys(newBuffer)) {
+    if (!validateCountry(ck)) continue; // malformed keys rejected downstream
+    const _putScope = await _assertCountryAllowed(req.user, ck);
+    if (!_putScope.ok) return res.status(_putScope.status).json({ error: _putScope.error });
+  }
+
   // ── Edit-lock check ──────────────────────────────────────────────────────────
   // If the caller passes the entry id they are saving, check whether another user
   // holds a valid (non-expired) edit lock on that entry.
@@ -1396,6 +1434,9 @@ app.patch('/api/ops/buffer/edit-lock', requireAuth, async (req, res) => {
   if (!['acquire', 'heartbeat', 'release'].includes(action)) {
     return res.status(400).json({ error: 'action must be acquire, heartbeat, or release' });
   }
+  // Phase 3: country-scope enforcement
+  const _elScope = await _assertCountryAllowed(req.user, country);
+  if (!_elScope.ok) return res.status(_elScope.status).json({ error: _elScope.error });
 
   const EDIT_LOCK_TTL_MS = 15 * 60 * 1000;
   const now = new Date();
@@ -1521,6 +1562,9 @@ app.patch('/api/ops/process/edit-lock', requireAuthBeacon, async (req, res) => {
   if (!['acquire', 'heartbeat', 'release'].includes(action)) {
     return res.status(400).json({ error: 'action must be acquire, heartbeat, or release' });
   }
+  // Phase 3: country-scope enforcement
+  const _pelScope = await _assertCountryAllowed(req.user, country);
+  if (!_pelScope.ok) return res.status(_pelScope.status).json({ error: _pelScope.error });
 
   const now   = new Date();
   const locks = await fetchGitHubJson(PROCESS_EDIT_LOCKS_PATH, {});
@@ -1604,6 +1648,9 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
   if (!validateCountry(country)) {
     return res.status(400).json({ error: 'Invalid country' });
   }
+  // Phase 3: country-scope enforcement
+  const _cancelScope = await _assertCountryAllowed(req.user, country);
+  if (!_cancelScope.ok) return res.status(_cancelScope.status).json({ error: _cancelScope.error });
 
   const buffer  = await fetchGitHubJson('data/ops/buffer.json', {});
   const entries = (buffer[country] && buffer[country][targetUser]) || [];
@@ -1702,6 +1749,9 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
   if (!['OL', 'Manager', 'Admin'].includes(req.user.role)) {
     return res.status(403).json({ error: 'Only OL, Manager or Admin can validate entries' });
   }
+  // Phase 3: country-scope enforcement
+  const _valScope = await _assertCountryAllowed(req.user, country);
+  if (!_valScope.ok) return res.status(_valScope.status).json({ error: _valScope.error });
 
   const targetUser = req.body.user;
   if (!targetUser) return res.status(400).json({ error: 'user field required to identify buffer queue' });
@@ -1927,8 +1977,8 @@ app.post('/api/ops/settings', requireAuth, async (req, res) => {
   if (!settings || typeof settings !== 'object') {
     return res.status(400).json({ error: 'settings object required' });
   }
-  if (!['Manager', 'Admin'].includes(req.user.role)) {
-    return res.status(403).json({ error: 'Only Manager or Admin can modify settings' });
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin only — settings require Admin role' });
   }
 
   // ── Category rename propagation ──────────────────────────────────────────
@@ -2921,6 +2971,9 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
   if (!['OL', 'Manager', 'Admin'].includes(req.user.role)) {
     return res.status(403).json({ error: 'Only OL, Manager or Admin can schedule a PR' });
   }
+  // Phase 3: country-scope enforcement
+  const _schedScope = await _assertCountryAllowed(req.user, country);
+  if (!_schedScope.ok) return res.status(_schedScope.status).json({ error: _schedScope.error });
 
   // Phase 1 kill switch — block scheduling when PR creation is disabled.
   if (DISABLE_PR_CREATION) {
@@ -2960,10 +3013,6 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
   }
   // Pending entries are intentionally NOT checked here — they remain in Buffer
   // and are excluded from the Publish Request. See governance rule §11.3-5.
-  //
-  // Phase 3 gap (tracked): country-scope check (_assertCountryAllowed) not yet enforced here.
-  // The backend verifies role + ownership via _filterEntriesByPRScope but does not yet
-  // assert that req.user is assigned to the requested country. Tracked as a future phase.
 
   // Mode B duplicate process issue check
   // Checks three sources for issues already claimed by the active PR:
@@ -3073,6 +3122,9 @@ app.delete('/api/ops/pr/schedule/:country', requireAuth, async (req, res) => {
   if (!validateCountry(country)) {
     return res.status(400).json({ error: 'Invalid country' });
   }
+  // Phase 3: country-scope enforcement
+  const _undoScope = await _assertCountryAllowed(req.user, country);
+  if (!_undoScope.ok) return res.status(_undoScope.status).json({ error: _undoScope.error });
 
   const schedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
   if (!schedule[country]) {
