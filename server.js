@@ -1380,6 +1380,121 @@ function validateProcessEntry(p) {
 // ── Process edit-lock constants (used by POST /api/ops/buffer and the lock endpoints) ──
 const PROCESS_EDIT_LOCKS_PATH = 'data/ops/process_edit_locks.json';
 const PROC_LOCK_TTL_MS        = 15 * 60 * 1000;
+const MIN_ADMIN_ERROR_MESSAGE = 'This change cannot be saved because Process Finder must always have at least one Admin. Assign another Admin first, then you may change this role.';
+
+function _normalizeIssue(issue) {
+  return String(issue || '').trim();
+}
+
+function _getProcessLockKey(entryOrProcess) {
+  return entryOrProcess?.originalProcessId || entryOrProcess?.process?.originalProcessId || entryOrProcess?.process?.id || entryOrProcess?.id || null;
+}
+
+function _getDuplicateProcessIdentity(entryOrProcess) {
+  return entryOrProcess?.originalProcessId || entryOrProcess?.process?.originalProcessId || entryOrProcess?.process?.id || entryOrProcess?.id || null;
+}
+
+function _buildDuplicateError(country, issue) {
+  return {
+    error: `This Issue/Subject already exists in ${country.toUpperCase()}. Please change the Issue/Subject or modify the existing process instead.`,
+    code: 'DUPLICATE_ISSUE_SUBJECT',
+    opsMessage: `This Issue/Subject already exists in ${country.toUpperCase()}. Please change the Issue/Subject or modify the existing process instead.`,
+    country,
+    issue
+  };
+}
+
+async function _findDuplicateIssueInCountry(country, issue, excludedIdentity = null) {
+  const normalizedIssue = _normalizeIssue(issue);
+  if (!normalizedIssue) return null;
+
+  const [production, buffer, history, schedule] = await Promise.all([
+    readProcessData(country),
+    fetchGitHubJson('data/ops/buffer.json', {}),
+    fetchGitHubJson('data/ops/history.json', {}),
+    fetchGitHubJson(PR_SCHEDULE_PATH, {})
+  ]);
+
+  const excluded = excludedIdentity || null;
+  const matchesIdentity = candidate => excluded && candidate && candidate === excluded;
+
+  for (const proc of (production?.data || [])) {
+    if (_normalizeIssue(proc.issue) !== normalizedIssue) continue;
+    if (matchesIdentity(proc.id)) continue;
+    return { source: 'production', issue: proc.issue, identity: proc.id || null };
+  }
+
+  const countryBuffer = buffer[country] || {};
+  const scheduleEntryIds = new Set(Array.isArray(schedule[country]?.entry_ids) ? schedule[country].entry_ids : []);
+  for (const entries of Object.values(countryBuffer)) {
+    for (const entry of (entries || [])) {
+      if (_normalizeIssue(entry.process?.issue) !== normalizedIssue) continue;
+      const identity = _getDuplicateProcessIdentity(entry);
+      if (matchesIdentity(identity)) continue;
+      return {
+        source: scheduleEntryIds.has(entry.id) ? 'scheduled' : `buffer_${entry.status || 'pending'}`,
+        issue: entry.process?.issue,
+        identity: identity || null,
+        entryId: entry.id
+      };
+    }
+  }
+
+  for (const histEntry of (history[country] || [])) {
+    if (_normalizeIssue(histEntry.process?.issue) !== normalizedIssue) continue;
+    if (!['pending_merge'].includes(histEntry.pr_status)) continue;
+    const identity = _getDuplicateProcessIdentity(histEntry);
+    if (matchesIdentity(identity)) continue;
+    return {
+      source: 'active_publish_request',
+      issue: histEntry.process?.issue,
+      identity: identity || null,
+      entryId: histEntry.id,
+      prNumber: histEntry.prNumber || null
+    };
+  }
+
+  return null;
+}
+
+async function _findActiveWorkflowLock(country, originalProcessId, excludedEntryId = null) {
+  if (!originalProcessId) return null;
+
+  const [buffer, history, schedule] = await Promise.all([
+    fetchGitHubJson('data/ops/buffer.json', {}),
+    fetchGitHubJson('data/ops/history.json', {}),
+    fetchGitHubJson(PR_SCHEDULE_PATH, {})
+  ]);
+
+  const countryBuffer = buffer[country] || {};
+  const scheduleEntryIds = new Set(Array.isArray(schedule[country]?.entry_ids) ? schedule[country].entry_ids : []);
+
+  for (const entries of Object.values(countryBuffer)) {
+    for (const entry of (entries || [])) {
+      if (excludedEntryId && entry.id === excludedEntryId) continue;
+      if (_getProcessLockKey(entry) !== originalProcessId) continue;
+      return {
+        source: scheduleEntryIds.has(entry.id) ? 'scheduled' : `buffer_${entry.status || 'pending'}`,
+        entryId: entry.id,
+        originalProcessId
+      };
+    }
+  }
+
+  for (const histEntry of (history[country] || [])) {
+    if (excludedEntryId && histEntry.id === excludedEntryId) continue;
+    if (histEntry.pr_status !== 'pending_merge') continue;
+    if (_getProcessLockKey(histEntry) !== originalProcessId) continue;
+    return {
+      source: 'active_publish_request',
+      entryId: histEntry.id,
+      originalProcessId,
+      prNumber: histEntry.prNumber || null
+    };
+  }
+
+  return null;
+}
 
 /**
  * POST /api/ops/buffer
@@ -1414,13 +1529,15 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
   if (!buffer[country]) buffer[country] = {};
   if (!buffer[country][user]) buffer[country][user] = [];
 
+  const processIdentity = process.originalProcessId || process.id || null;
+
   // ── Process edit-lock guard (update only) ────────────────────────────────────
   // Reject update submissions if another user holds a live process edit lock.
   // This prevents a race where two users save simultaneously; the second save
   // (which won the lock check on the frontend) is blocked here as the canonical guard.
-  if (type === 'update' && process.id) {
+  if (type === 'update' && processIdentity) {
     const procLocks = await fetchGitHubJson(PROCESS_EDIT_LOCKS_PATH, {});
-    const lock = (procLocks[country] || {})[process.id];
+    const lock = (procLocks[country] || {})[processIdentity];
     if (lock && lock.editingBy) {
       const norm = e => (e || '').toLowerCase().trim();
       const lockAge = lock.editingLastActivityAt
@@ -1436,6 +1553,35 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
           editingLastActivityAt: lock.editingLastActivityAt
         });
       }
+    }
+  }
+
+  if (type === 'update' || type === 'delete') {
+    if (!processIdentity) {
+      return res.status(400).json({ error: 'originalProcessId or process.id is required for update/delete' });
+    }
+    const activeLock = await _findActiveWorkflowLock(country, processIdentity);
+    if (activeLock) {
+      return res.status(409).json({
+        error: 'This process already has an active workflow and remains locked until that request is resolved.',
+        code: 'PROCESS_WORKFLOW_LOCKED',
+        originalProcessId: processIdentity,
+        ...activeLock
+      });
+    }
+  }
+
+  if (type !== 'delete') {
+    const duplicate = await _findDuplicateIssueInCountry(
+      country,
+      process.issue,
+      type === 'update' ? processIdentity : null
+    );
+    if (duplicate) {
+      return res.status(409).json({
+        ..._buildDuplicateError(country, process.issue),
+        duplicate
+      });
     }
   }
 
@@ -1486,7 +1632,15 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
   const entry = {
     id: process.id || `${country}_${Date.now()}`,
     type,
-    process,
+    process: {
+      ...process,
+      ...(type === 'update' || type === 'delete'
+        ? { originalProcessId: processIdentity }
+        : {})
+    },
+    ...(type === 'update' || type === 'delete'
+      ? { originalProcessId: processIdentity }
+      : {}),
     user,
     createdAt: new Date().toISOString(),
     status: 'pending'
@@ -1540,6 +1694,38 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
           });
         }
         break outer;
+      }
+    }
+  }
+
+  const liveBuffer = await fetchGitHubJson('data/ops/buffer.json', {});
+  for (const ck of Object.keys(newBuffer)) {
+    const countryEntries = newBuffer[ck] || {};
+    const liveEntries = liveBuffer[ck] || {};
+    for (const [owner, entries] of Object.entries(countryEntries)) {
+      const liveUserEntries = liveEntries[owner] || [];
+      for (let index = 0; index < (entries || []).length; index++) {
+        const entry = entries[index];
+        if (!entry?.process || entry.type === 'delete') continue;
+
+        const liveEntry = liveUserEntries.find(e => e.id === entry.id) || null;
+        const originalProcessId = entry.originalProcessId || entry.process.originalProcessId || liveEntry?.originalProcessId || liveEntry?.process?.originalProcessId || null;
+        if ((entry.type === 'update' || liveEntry?.type === 'update' || entry.type === 'delete' || liveEntry?.type === 'delete') && !originalProcessId) {
+          return res.status(400).json({ error: 'originalProcessId must be preserved for existing process workflows.' });
+        }
+        if (liveEntry?.originalProcessId && originalProcessId !== liveEntry.originalProcessId) {
+          return res.status(400).json({ error: 'originalProcessId cannot be changed for an existing process workflow.' });
+        }
+        if (entry.type === 'update') {
+          const duplicate = await _findDuplicateIssueInCountry(ck, entry.process.issue, originalProcessId);
+          if (duplicate) {
+            return res.status(409).json({ ..._buildDuplicateError(ck, entry.process.issue), duplicate });
+          }
+        }
+        if (originalProcessId) {
+          entry.originalProcessId = originalProcessId;
+          entry.process.originalProcessId = originalProcessId;
+        }
       }
     }
   }
@@ -2565,6 +2751,14 @@ app.post('/api/admin/users', requireAuth, async (req, res) => {
         }
       }
     }
+  }
+
+  const activeAdminCount = working.filter(u => u.role === 'Admin').length;
+  if (activeAdminCount === 0) {
+    return res.status(400).json({
+      error: MIN_ADMIN_ERROR_MESSAGE,
+      opsMessage: MIN_ADMIN_ERROR_MESSAGE
+    });
   }
 
   await commitJsonToMainBranch('config/users.json', working, `admin: update users (${users.length} op(s)) by ${req.user.email}`);

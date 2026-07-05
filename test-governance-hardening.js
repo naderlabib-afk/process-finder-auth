@@ -126,6 +126,17 @@ function resetMockState(overrides = {}) {
       ]
     },
     'data/ops/pr_schedule.json': {},
+    'data/processes/fr.json': {
+      processes: [
+        { id: 'prod_fr_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'production fr item 1' },
+        { id: 'prod_fr_002', issue: 'PROD-FR-KEEP', category: 'Contract', machineType: '', process: 'production fr item 2' }
+      ]
+    },
+    'data/processes/mea.json': {
+      processes: [
+        { id: 'prod_mea_001', issue: 'MEA-UNIQUE', category: 'Contract', machineType: '', process: 'same issue allowed in another country baseline' }
+      ]
+    },
     'data/ops/assignment_history.json': [],
     'data/logs/activity_logs.json': [],
     'data/logs/admin-audit.json': [],
@@ -714,6 +725,329 @@ function waitForPort(port, retries = 20, delay = 300) {
     assert('ASSIGN-1c eventId is set', typeof addEv?.eventId === 'string' && addEv.eventId.startsWith('asgn_'), `eventId=${addEv?.eventId}`);
     assert('ASSIGN-1d effectiveAt is set', typeof addEv?.effectiveAt === 'string', '');
     assert('ASSIGN-1e changedBy is Admin email', addEv?.changedBy === 'admin-a@ibm.com', `changedBy=${addEv?.changedBy}`);
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // GOV-1..4: Minimum Admin protection
+    // ══════════════════════════════════════════════════════════════════════════
+    section('GOV-1: Last Admin cannot be downgraded');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com', name: 'Admin A', role: 'Admin', countries: ['all'] },
+        { email: 'ol-a@ibm.com', name: 'OL A', role: 'OL', countries: ['fr'] }
+      ]
+    });
+    const adminCommitCountBeforeDowngrade = mockState._commits.filter(c => c.path === 'config/users.json').length;
+    const rLastAdminDowngrade = await apiCall('POST', '/api/admin/users', {
+      users: [{ op: 'update', user: { email: 'admin-a@ibm.com', name: 'Admin A', role: 'Manager', countries: ['fr'] } }]
+    }, ADMIN_A_TOKEN);
+    assert('GOV-1  Last Admin downgrade blocked', rLastAdminDowngrade.status === 400,
+      `status=${rLastAdminDowngrade.status} body=${JSON.stringify(rLastAdminDowngrade.json)}`);
+    assert('GOV-1b minimum admin message returned', rLastAdminDowngrade.json?.opsMessage?.includes('must always have at least one Admin') === true, '');
+    assert('GOV-1c no users.json commit on blocked downgrade',
+      mockState._commits.filter(c => c.path === 'config/users.json').length === adminCommitCountBeforeDowngrade, '');
+
+    section('GOV-2: Last Admin cannot be removed');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com', name: 'Admin A', role: 'Admin', countries: ['all'] },
+        { email: 'ol-a@ibm.com', name: 'OL A', role: 'OL', countries: ['fr'] }
+      ]
+    });
+    const adminCommitCountBeforeRemove = mockState._commits.filter(c => c.path === 'config/users.json').length;
+    const rLastAdminRemove = await apiCall('POST', '/api/admin/users', {
+      users: [{ op: 'remove', user: { email: 'admin-a@ibm.com' } }]
+    }, ADMIN_A_TOKEN);
+    assert('GOV-2  Last Admin removal blocked', rLastAdminRemove.status === 400,
+      `status=${rLastAdminRemove.status} body=${JSON.stringify(rLastAdminRemove.json)}`);
+    assert('GOV-2b no users.json commit on blocked remove',
+      mockState._commits.filter(c => c.path === 'config/users.json').length === adminCommitCountBeforeRemove, '');
+
+    section('GOV-3: Admin downgrade allowed when another Admin remains');
+    resetMockState();
+    const rAdminDowngradeAllowed = await apiCall('POST', '/api/admin/users', {
+      users: [{ op: 'update', user: { email: 'admin-a@ibm.com', name: 'Admin A', role: 'Manager', countries: ['fr'] } }]
+    }, ADMIN_B_TOKEN);
+    assert('GOV-3  Downgrade succeeds when another Admin remains', rAdminDowngradeAllowed.ok,
+      `status=${rAdminDowngradeAllowed.status} body=${JSON.stringify(rAdminDowngradeAllowed.json)}`);
+
+    section('GOV-4: Same batch replacement Admin permits downgrade');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com', name: 'Admin A', role: 'Admin', countries: ['all'] },
+        { email: 'ol-a@ibm.com', name: 'OL A', role: 'OL', countries: ['fr'] }
+      ]
+    });
+    const rBatchReplaceAdmin = await apiCall('POST', '/api/admin/users', {
+      users: [
+        { op: 'add', user: { email: 'admin-b@ibm.com', name: 'Admin B', role: 'Admin', countries: ['all'] } },
+        { op: 'update', user: { email: 'admin-a@ibm.com', name: 'Admin A', role: 'Manager', countries: ['fr'] } }
+      ]
+    }, ADMIN_A_TOKEN);
+    assert('GOV-4  Replacement Admin in same batch allows downgrade', rBatchReplaceAdmin.ok,
+      `status=${rBatchReplaceAdmin.status} body=${JSON.stringify(rBatchReplaceAdmin.json)}`);
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // DUP-1..9: Duplicate Issue/Subject blocking
+    // ══════════════════════════════════════════════════════════════════════════
+    section('DUP-1: Create duplicate against production same country blocked');
+    resetMockState();
+    const rDupProd = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'create',
+      process: { id: 'new_dup_prod', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'dup prod' }
+    }, OL_A_TOKEN);
+    assert('DUP-1  Production duplicate blocked', rDupProd.status === 409,
+      `status=${rDupProd.status} body=${JSON.stringify(rDupProd.json)}`);
+    assert('DUP-1b duplicate payload is typed', rDupProd.json?.code === 'DUPLICATE_ISSUE_SUBJECT', '');
+
+    section('DUP-2: Create duplicate against Buffer pending same country blocked');
+    resetMockState();
+    const rDupPending = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'create',
+      process: { id: 'new_dup_pending', issue: 'OL-B-ISSUE', category: 'Contract', machineType: '', process: 'dup pending' }
+    }, OL_A_TOKEN);
+    assert('DUP-2  Buffer pending duplicate blocked', rDupPending.status === 409,
+      `status=${rDupPending.status} body=${JSON.stringify(rDupPending.json)}`);
+
+    section('DUP-3: Create duplicate against Buffer validated same country blocked');
+    resetMockState();
+    const rDupValidated = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'create',
+      process: { id: 'new_dup_validated', issue: 'OL-A-ISSUE', category: 'Contract', machineType: '', process: 'dup validated' }
+    }, MANAGER_A_TOKEN);
+    assert('DUP-3  Buffer validated duplicate blocked', rDupValidated.status === 409,
+      `status=${rDupValidated.status} body=${JSON.stringify(rDupValidated.json)}`);
+
+    section('DUP-4: Create duplicate against countdown scheduled entry blocked');
+    resetMockState({
+      'data/ops/pr_schedule.json': {
+        fr: { country: 'fr', entry_ids: ['fr_ol_a_001'], created_by: 'ol-a@ibm.com', execute_after: new Date(Date.now() + 60000).toISOString() }
+      }
+    });
+    const rDupScheduled = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'create',
+      process: { id: 'new_dup_sched', issue: 'OL-A-ISSUE', category: 'Contract', machineType: '', process: 'dup scheduled' }
+    }, MANAGER_A_TOKEN);
+    assert('DUP-4  Scheduled duplicate blocked', rDupScheduled.status === 409,
+      `status=${rDupScheduled.status} body=${JSON.stringify(rDupScheduled.json)}`);
+    assert('DUP-4b duplicate source identifies scheduled snapshot', rDupScheduled.json?.duplicate?.source === 'scheduled', '');
+
+    section('DUP-5: Create duplicate against active Publish Request blocked');
+    resetMockState();
+    const rDupPR = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'create',
+      process: { id: 'new_dup_pr', issue: 'PR-TEST', category: 'Contract', machineType: '', process: 'dup pr' }
+    }, MANAGER_A_TOKEN);
+    assert('DUP-5  Active Publish Request duplicate blocked', rDupPR.status === 409,
+      `status=${rDupPR.status} body=${JSON.stringify(rDupPR.json)}`);
+
+    section('DUP-6: Same Issue/Subject in another country allowed');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com',  name: 'Admin A',   role: 'Admin',   countries: ['all'] },
+        { email: 'ol-a@ibm.com',     name: 'OL A',      role: 'OL',      countries: ['fr'] },
+        { email: 'ol-mea@ibm.com',   name: 'OL MEA',    role: 'OL',      countries: ['mea'] }
+      ]
+    });
+    const OL_MEA_TOKEN = mintJwt({ email: 'ol-mea@ibm.com', role: 'OL', iat: now, exp: now + 28800 });
+    const rDupOtherCountry = await apiCall('POST', '/api/ops/buffer', {
+      country: 'mea',
+      type: 'create',
+      process: { id: 'mea_allowed_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'allowed in mea' }
+    }, OL_MEA_TOKEN);
+    assert('DUP-6  Same issue in different country allowed', rDupOtherCountry.ok,
+      `status=${rDupOtherCountry.status} body=${JSON.stringify(rDupOtherCountry.json)}`);
+
+    section('DUP-7: Update same process keeping same Issue/Subject allowed');
+    resetMockState();
+    const rUpdateKeepOwn = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'update',
+      process: { id: 'prod_fr_001', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'updated text' }
+    }, MANAGER_A_TOKEN);
+    assert('DUP-7  Update keeping own issue allowed', rUpdateKeepOwn.ok,
+      `status=${rUpdateKeepOwn.status} body=${JSON.stringify(rUpdateKeepOwn.json)}`);
+
+    section('DUP-8: Update changing Issue/Subject to another same-country active subject blocked');
+    resetMockState();
+    const rUpdateToDuplicate = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'update',
+      process: { id: 'prod_fr_002', originalProcessId: 'prod_fr_002', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'dup change' }
+    }, MANAGER_A_TOKEN);
+    assert('DUP-8  Update to another active issue blocked', rUpdateToDuplicate.status === 409,
+      `status=${rUpdateToDuplicate.status} body=${JSON.stringify(rUpdateToDuplicate.json)}`);
+
+    section('DUP-9: Buffer edit changing Issue/Subject to duplicate blocked');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_update_001',
+              type: 'update',
+              originalProcessId: 'prod_fr_002',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_update_001', originalProcessId: 'prod_fr_002', issue: 'PROD-FR-KEEP', category: 'Contract', machineType: '', process: 'draft' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const editedBufferDup = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    editedBufferDup.fr['ol-a@ibm.com'][0].process.issue = 'PROD-FR-UNIQUE';
+    const rBufferEditDup = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: editedBufferDup,
+      editEntryId: 'buf_update_001'
+    }, OL_A_TOKEN);
+    assert('DUP-9  Buffer edit duplicate blocked', rBufferEditDup.status === 409,
+      `status=${rBufferEditDup.status} body=${JSON.stringify(rBufferEditDup.json)}`);
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // LOCK-1..7: Existing process workflow lock by originalProcessId
+    // ══════════════════════════════════════════════════════════════════════════
+    section('LOCK-1: Update entry locks by original process ID');
+    resetMockState();
+    const rLockUpdate = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'update',
+      process: { id: 'prod_fr_001', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'lock update' }
+    }, OL_A_TOKEN);
+    assert('LOCK-1  Update entry created', rLockUpdate.ok,
+      `status=${rLockUpdate.status} body=${JSON.stringify(rLockUpdate.json)}`);
+    assert('LOCK-1b originalProcessId stored on entry', rLockUpdate.json?.entry?.originalProcessId === 'prod_fr_001', '');
+
+    section('LOCK-2: Second update/delete on same originalProcessId blocked');
+    const rLockSecond = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'delete',
+      process: { id: 'prod_fr_001', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-UNIQUE' }
+    }, MANAGER_A_TOKEN);
+    assert('LOCK-2  Second workflow blocked', rLockSecond.status === 409,
+      `status=${rLockSecond.status} body=${JSON.stringify(rLockSecond.json)}`);
+
+    section('LOCK-3: Changing Issue/Subject during update does not unlock original process');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_update_lock_1',
+              type: 'update',
+              originalProcessId: 'prod_fr_001',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_update_lock_1', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-RENAMED', category: 'Contract', machineType: '', process: 'renamed draft' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const rLockRenameStillLocked = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'delete',
+      process: { id: 'prod_fr_001', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-UNIQUE' }
+    }, MANAGER_A_TOKEN);
+    assert('LOCK-3  Renamed draft still keeps original process locked', rLockRenameStillLocked.status === 409,
+      `status=${rLockRenameStillLocked.status} body=${JSON.stringify(rLockRenameStillLocked.json)}`);
+
+    section('LOCK-4: Removing pre-PR Buffer entry unlocks original process');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_update_unlock_1',
+              type: 'update',
+              originalProcessId: 'prod_fr_001',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_update_unlock_1', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'draft' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const rCancelLock = await apiCall('POST', '/api/ops/cancel', { country: 'fr', user: 'ol-a@ibm.com', index: 0 }, OL_A_TOKEN);
+    assert('LOCK-4  Cancel pre-PR entry succeeds', rCancelLock.ok,
+      `status=${rCancelLock.status} body=${JSON.stringify(rCancelLock.json)}`);
+    const rAfterCancelUnlock = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'delete',
+      process: { id: 'prod_fr_001', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-UNIQUE' }
+    }, MANAGER_A_TOKEN);
+    assert('LOCK-4b  New workflow allowed after cancel unlock', rAfterCancelUnlock.ok,
+      `status=${rAfterCancelUnlock.status} body=${JSON.stringify(rAfterCancelUnlock.json)}`);
+
+    section('LOCK-5: Active Publish Request keeps process locked');
+    resetMockState({
+      'data/ops/history.json': {
+        fr: [
+          { id: 'hist_lock_001', type: 'update', originalProcessId: 'prod_fr_001', user: 'ol-a@ibm.com', status: 'validated',
+            pr_status: 'pending_merge', prNumber: PR_NUM, branchName: 'ops/fr/20260710-1000',
+            process: { id: 'hist_lock_001', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-RENAMED', category: 'Contract', machineType: '', process: 'pending merge' } }
+        ]
+      }
+    });
+    const rActivePRLock = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'delete',
+      process: { id: 'prod_fr_001', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-UNIQUE' }
+    }, MANAGER_A_TOKEN);
+    assert('LOCK-5  Active Publish Request keeps lock', rActivePRLock.status === 409,
+      `status=${rActivePRLock.status} body=${JSON.stringify(rActivePRLock.json)}`);
+
+    section('LOCK-6: Admin reject unlocks original process');
+    resetMockState({
+      'data/ops/history.json': {
+        fr: [
+          { id: 'hist_reject_001', type: 'update', originalProcessId: 'prod_fr_001', user: 'ol-a@ibm.com', status: 'validated',
+            pr_status: 'pending_merge', prNumber: PR_NUM, prUrl: `https://github.ibm.com/nlabib/process-finder/pull/${PR_NUM}`,
+            branchName: 'ops/fr/20260710-1000',
+            process: { id: 'hist_reject_001', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-RENAMED', category: 'Contract', machineType: '', process: 'pending reject' } }
+        ]
+      }
+    });
+    const rRejectUnlock = await apiCall('POST', '/api/admin/pr/close', { country: 'fr', prNumber: PR_NUM }, ADMIN_A_TOKEN);
+    assert('LOCK-6  Reject succeeds', rRejectUnlock.ok,
+      `status=${rRejectUnlock.status} body=${JSON.stringify(rRejectUnlock.json)}`);
+    const rAfterRejectUnlock = await apiCall('POST', '/api/ops/buffer', {
+      country: 'fr',
+      type: 'update',
+      process: { id: 'prod_fr_001', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'new draft after reject' }
+    }, MANAGER_A_TOKEN);
+    assert('LOCK-6b  Original process unlocked after reject', rAfterRejectUnlock.ok,
+      `status=${rAfterRejectUnlock.status} body=${JSON.stringify(rAfterRejectUnlock.json)}`);
+
+    section('LOCK-7: Admin approve modify unlocks new version');
+    resetMockState({
+      'data/ops/history.json': {
+        fr: [
+          { id: 'hist_approve_001', type: 'update', originalProcessId: 'prod_fr_001', user: 'ol-a@ibm.com', status: 'validated',
+            pr_status: 'pending_merge', prNumber: PR_NUM, prUrl: `https://github.ibm.com/nlabib/process-finder/pull/${PR_NUM}`,
+            branchName: 'ops/fr/20260710-1000',
+            process: { id: 'hist_approve_001', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-RENAMED', category: 'Contract', machineType: '', process: 'pending approve' } },
+          { id: 'hist_delete_001', type: 'delete', originalProcessId: 'prod_fr_002', user: 'ol-a@ibm.com', status: 'validated',
+            pr_status: 'pending_merge', prNumber: PR_NUM, prUrl: `https://github.ibm.com/nlabib/process-finder/pull/${PR_NUM}`,
+            branchName: 'ops/fr/20260710-1000',
+            process: { id: 'hist_delete_001', originalProcessId: 'prod_fr_002', issue: 'PROD-FR-KEEP' } }
+        ]
+      }
+    });
+    const rApproveUnlock = await apiCall('POST', '/api/admin/pr/approve', { country: 'fr', prNumber: PR_NUM }, ADMIN_A_TOKEN);
+    assert('LOCK-7  Approve succeeds', rApproveUnlock.ok,
+      `status=${rApproveUnlock.status} body=${JSON.stringify(rApproveUnlock.json)}`);
+    const histAfterApprove = mockState['data/ops/history.json']?.fr || [];
+    assert('LOCK-7b  Modify entry marked merged', histAfterApprove.some(h => h.id === 'hist_approve_001' && h.pr_status === 'merged'), '');
+    assert('LOCK-7c  Delete entry marked merged', histAfterApprove.some(h => h.id === 'hist_delete_001' && h.pr_status === 'merged'), '');
 
     // ══════════════════════════════════════════════════════════════════════════
     // COUNTDOWN-1: Approve/Reject blocked while countdown active (existing rule)
