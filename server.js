@@ -1139,13 +1139,14 @@ app.post("/send-otp", async (req, res) => {
     // ── 6. Send email (or mock) ───────────────────────────────────────────────
     if (EMAIL_SEND_MODE === 'mock') {
       // Mock mode: log only — never calls Resend. Safe for local dev and tests.
-      // OTP code is intentionally NOT logged even in mock mode.
+      // Code is logged to console ONLY in mock mode so local validation can proceed.
       console.log(
         "[OTP MOCK SENT]", normalized,
         "from:", OTP_FROM_ADDRESS,
         "subject:", OTP_SUBJECT,
         "(mock — Resend not called)"
       );
+      console.log(`[OTP MOCK CODE] ${normalized} code: ${code}`);
     } else {
       // Real mode: call Resend API. from/subject are fixed constants — never
       // derived from request body or any user-supplied input.
