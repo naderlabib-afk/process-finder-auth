@@ -514,6 +514,148 @@ async function appendAdminAudit(entry) {
   }
 }
 
+// ─── Assignment history helper ───────────────────────────────────────────────
+const ASSIGNMENT_HISTORY_PATH = 'data/ops/assignment_history.json';
+
+/**
+ * Appends one or more assignment-history events.
+ * Never throws — must never block the calling operation.
+ *
+ * eventType: 'added' | 'removed' | 'changed' | 'promoted' | 'demoted'
+ * Each event shape (Part F):
+ *   eventId, userEmail, userName?, role, country/scope, action,
+ *   effectiveAt, changedBy, reason?, previousRole?, previousCountries?,
+ *   newRole?, newCountries?
+ */
+async function appendAssignmentHistory(events) {
+  try {
+    const history = await fetchGitHubJson(ASSIGNMENT_HISTORY_PATH, []);
+    const now = new Date().toISOString();
+    for (const ev of events) {
+      history.push({
+        eventId:    `asgn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        effectiveAt: now,
+        ...ev
+      });
+    }
+    await commitJsonToMainBranch(
+      ASSIGNMENT_HISTORY_PATH, history,
+      `ops: assignment history — ${events.map(e => e.action || 'event').join(', ')}`
+    );
+  } catch (err) {
+    console.error('[assignment history] write failed:', err.message);
+  }
+}
+
+/**
+ * Resolves operational ownership of orphaned OL or Manager entries for a country
+ * when a user is removed from a country-role assignment.
+ *
+ * Rules (Part D):
+ *   - Find the OL/Manager who was already active for the same country at the
+ *     time of departure — they inherit the orphaned work.
+ *   - If no peer was active, the next assigned OL/Manager for that country
+ *     inherits the orphaned work.
+ *   - If no one is available, entries remain in buffer with original owner
+ *     and are flagged as orphaned for Admin resolution.
+ *
+ * @param {string} departedEmail - email of user being removed/changed
+ * @param {string} role          - 'OL' | 'Manager'
+ * @param {string} country       - country key
+ * @param {Array}  allUsers      - current users.json AFTER the update is applied
+ * @returns {{ inheritedBy: string|null, orphaned: boolean }}
+ */
+function _resolveInheritance(departedEmail, role, country, allUsers) {
+  const norm = e => (e || '').toLowerCase().trim();
+  const normDeparted = norm(departedEmail);
+
+  // Find other active users with the same role in the same country
+  // (excluding the departed user)
+  const peers = allUsers.filter(u =>
+    norm(u.email) !== normDeparted &&
+    u.role === role &&
+    Array.isArray(u.countries) &&
+    u.countries.some(c => norm(c) === norm(country))
+  );
+
+  if (peers.length > 0) {
+    // Return the first peer (oldest assignment assumed by array order in users.json)
+    return { inheritedBy: peers[0].email, orphaned: false };
+  }
+  return { inheritedBy: null, orphaned: true };
+}
+
+/**
+ * Transfers orphaned buffer entries from a departed user to an inheritor.
+ * Only transfers entries that are not locked by an active/pending PR.
+ * Records an ownership-transfer audit event.
+ * Never throws.
+ *
+ * @param {string} departedEmail  - original owner
+ * @param {string} inheritedBy    - new operational owner
+ * @param {string} country        - country key
+ * @param {string} changedBy      - Admin email who made the change
+ */
+async function _transferOrphanedBufferEntries(departedEmail, inheritedBy, country, changedBy) {
+  try {
+    const norm = e => (e || '').toLowerCase().trim();
+    const [buffer, history] = await Promise.all([
+      fetchGitHubJson('data/ops/buffer.json', {}),
+      fetchGitHubJson('data/ops/history.json', {})
+    ]);
+
+    const entries = (buffer[country] && buffer[country][departedEmail]) || [];
+    if (!entries.length) return;
+
+    // Entries locked by open PR must not be transferred
+    const lockedIds = new Set(
+      (history[country] || [])
+        .filter(h => h.pr_status === 'pending_merge' && h.user && norm(h.user) === norm(departedEmail))
+        .map(h => h.id)
+    );
+
+    const transferable = entries.filter(e => !lockedIds.has(e.id));
+    const kept         = entries.filter(e =>  lockedIds.has(e.id));
+
+    if (!transferable.length) return;
+
+    // Move to inheritor's queue
+    if (!buffer[country][inheritedBy]) buffer[country][inheritedBy] = [];
+    for (const e of transferable) {
+      buffer[country][inheritedBy].push({
+        ...e,
+        _originalOwner:       departedEmail,
+        _ownershipTransferAt: new Date().toISOString(),
+        _ownershipTransferBy: changedBy,
+        _inheritedBy:         inheritedBy
+      });
+    }
+
+    // Keep locked entries under departed user (Admin must resolve via Logs)
+    buffer[country][departedEmail] = kept;
+
+    await commitJsonToMainBranch(
+      'data/ops/buffer.json', buffer,
+      `ops: transfer ${transferable.length} entries from ${departedEmail} to ${inheritedBy} for ${country}`
+    );
+
+    appendActivityLog({
+      event:            'ownership-transferred',
+      country,
+      departedUser:     departedEmail,
+      inheritedBy,
+      transferCount:    transferable.length,
+      lockedCount:      lockedIds.size,
+      changedBy,
+      effectiveAt:      new Date().toISOString()
+    });
+
+    console.log(`[Inheritance] Transferred ${transferable.length} entries from ${departedEmail} → ${inheritedBy} for ${country}`);
+  } catch (err) {
+    console.error('[Inheritance] _transferOrphanedBufferEntries failed:', err.message);
+  }
+}
+
 // ─── Idempotency guard ────────────────────────────────────────────────────────
 const _processingEntries = new Set();
 
@@ -551,7 +693,7 @@ async function _generateOPSBranchName(country) {
 async function _verifyPRFileScope(prNumber) {
   try {
     const res = await fetch(
-      `https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/files`,
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/files`,
       { headers: ghHeaders() }
     );
     if (!res.ok) {
@@ -1238,6 +1380,121 @@ function validateProcessEntry(p) {
 // ── Process edit-lock constants (used by POST /api/ops/buffer and the lock endpoints) ──
 const PROCESS_EDIT_LOCKS_PATH = 'data/ops/process_edit_locks.json';
 const PROC_LOCK_TTL_MS        = 15 * 60 * 1000;
+const MIN_ADMIN_ERROR_MESSAGE = 'This change cannot be saved because Process Finder must always have at least one Admin. Assign another Admin first, then you may change this role.';
+
+function _normalizeIssue(issue) {
+  return String(issue || '').trim();
+}
+
+function _getProcessLockKey(entryOrProcess) {
+  return entryOrProcess?.originalProcessId || entryOrProcess?.process?.originalProcessId || entryOrProcess?.process?.id || entryOrProcess?.id || null;
+}
+
+function _getDuplicateProcessIdentity(entryOrProcess) {
+  return entryOrProcess?.originalProcessId || entryOrProcess?.process?.originalProcessId || entryOrProcess?.process?.id || entryOrProcess?.id || null;
+}
+
+function _buildDuplicateError(country, issue) {
+  return {
+    error: `This Issue/Subject already exists in ${country.toUpperCase()}. Please change the Issue/Subject or modify the existing process instead.`,
+    code: 'DUPLICATE_ISSUE_SUBJECT',
+    opsMessage: `This Issue/Subject already exists in ${country.toUpperCase()}. Please change the Issue/Subject or modify the existing process instead.`,
+    country,
+    issue
+  };
+}
+
+async function _findDuplicateIssueInCountry(country, issue, excludedIdentity = null) {
+  const normalizedIssue = _normalizeIssue(issue);
+  if (!normalizedIssue) return null;
+
+  const [production, buffer, history, schedule] = await Promise.all([
+    readProcessData(country),
+    fetchGitHubJson('data/ops/buffer.json', {}),
+    fetchGitHubJson('data/ops/history.json', {}),
+    fetchGitHubJson(PR_SCHEDULE_PATH, {})
+  ]);
+
+  const excluded = excludedIdentity || null;
+  const matchesIdentity = candidate => excluded && candidate && candidate === excluded;
+
+  for (const proc of (production?.data || [])) {
+    if (_normalizeIssue(proc.issue) !== normalizedIssue) continue;
+    if (matchesIdentity(proc.id)) continue;
+    return { source: 'production', issue: proc.issue, identity: proc.id || null };
+  }
+
+  const countryBuffer = buffer[country] || {};
+  const scheduleEntryIds = new Set(Array.isArray(schedule[country]?.entry_ids) ? schedule[country].entry_ids : []);
+  for (const entries of Object.values(countryBuffer)) {
+    for (const entry of (entries || [])) {
+      if (_normalizeIssue(entry.process?.issue) !== normalizedIssue) continue;
+      const identity = _getDuplicateProcessIdentity(entry);
+      if (matchesIdentity(identity)) continue;
+      return {
+        source: scheduleEntryIds.has(entry.id) ? 'scheduled' : `buffer_${entry.status || 'pending'}`,
+        issue: entry.process?.issue,
+        identity: identity || null,
+        entryId: entry.id
+      };
+    }
+  }
+
+  for (const histEntry of (history[country] || [])) {
+    if (_normalizeIssue(histEntry.process?.issue) !== normalizedIssue) continue;
+    if (!['pending_merge'].includes(histEntry.pr_status)) continue;
+    const identity = _getDuplicateProcessIdentity(histEntry);
+    if (matchesIdentity(identity)) continue;
+    return {
+      source: 'active_publish_request',
+      issue: histEntry.process?.issue,
+      identity: identity || null,
+      entryId: histEntry.id,
+      prNumber: histEntry.prNumber || null
+    };
+  }
+
+  return null;
+}
+
+async function _findActiveWorkflowLock(country, originalProcessId, excludedEntryId = null) {
+  if (!originalProcessId) return null;
+
+  const [buffer, history, schedule] = await Promise.all([
+    fetchGitHubJson('data/ops/buffer.json', {}),
+    fetchGitHubJson('data/ops/history.json', {}),
+    fetchGitHubJson(PR_SCHEDULE_PATH, {})
+  ]);
+
+  const countryBuffer = buffer[country] || {};
+  const scheduleEntryIds = new Set(Array.isArray(schedule[country]?.entry_ids) ? schedule[country].entry_ids : []);
+
+  for (const entries of Object.values(countryBuffer)) {
+    for (const entry of (entries || [])) {
+      if (excludedEntryId && entry.id === excludedEntryId) continue;
+      if (_getProcessLockKey(entry) !== originalProcessId) continue;
+      return {
+        source: scheduleEntryIds.has(entry.id) ? 'scheduled' : `buffer_${entry.status || 'pending'}`,
+        entryId: entry.id,
+        originalProcessId
+      };
+    }
+  }
+
+  for (const histEntry of (history[country] || [])) {
+    if (excludedEntryId && histEntry.id === excludedEntryId) continue;
+    if (histEntry.pr_status !== 'pending_merge') continue;
+    if (_getProcessLockKey(histEntry) !== originalProcessId) continue;
+    return {
+      source: 'active_publish_request',
+      entryId: histEntry.id,
+      originalProcessId,
+      prNumber: histEntry.prNumber || null
+    };
+  }
+
+  return null;
+}
 
 /**
  * POST /api/ops/buffer
@@ -1272,13 +1529,15 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
   if (!buffer[country]) buffer[country] = {};
   if (!buffer[country][user]) buffer[country][user] = [];
 
+  const processIdentity = process.originalProcessId || process.id || null;
+
   // ── Process edit-lock guard (update only) ────────────────────────────────────
   // Reject update submissions if another user holds a live process edit lock.
   // This prevents a race where two users save simultaneously; the second save
   // (which won the lock check on the frontend) is blocked here as the canonical guard.
-  if (type === 'update' && process.id) {
+  if (type === 'update' && processIdentity) {
     const procLocks = await fetchGitHubJson(PROCESS_EDIT_LOCKS_PATH, {});
-    const lock = (procLocks[country] || {})[process.id];
+    const lock = (procLocks[country] || {})[processIdentity];
     if (lock && lock.editingBy) {
       const norm = e => (e || '').toLowerCase().trim();
       const lockAge = lock.editingLastActivityAt
@@ -1294,6 +1553,35 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
           editingLastActivityAt: lock.editingLastActivityAt
         });
       }
+    }
+  }
+
+  if (type === 'update' || type === 'delete') {
+    if (!processIdentity) {
+      return res.status(400).json({ error: 'originalProcessId or process.id is required for update/delete' });
+    }
+    const activeLock = await _findActiveWorkflowLock(country, processIdentity);
+    if (activeLock) {
+      return res.status(409).json({
+        error: 'This process already has an active workflow and remains locked until that request is resolved.',
+        code: 'PROCESS_WORKFLOW_LOCKED',
+        originalProcessId: processIdentity,
+        ...activeLock
+      });
+    }
+  }
+
+  if (type !== 'delete') {
+    const duplicate = await _findDuplicateIssueInCountry(
+      country,
+      process.issue,
+      type === 'update' ? processIdentity : null
+    );
+    if (duplicate) {
+      return res.status(409).json({
+        ..._buildDuplicateError(country, process.issue),
+        duplicate
+      });
     }
   }
 
@@ -1344,7 +1632,15 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
   const entry = {
     id: process.id || `${country}_${Date.now()}`,
     type,
-    process,
+    process: {
+      ...process,
+      ...(type === 'update' || type === 'delete'
+        ? { originalProcessId: processIdentity }
+        : {})
+    },
+    ...(type === 'update' || type === 'delete'
+      ? { originalProcessId: processIdentity }
+      : {}),
     user,
     createdAt: new Date().toISOString(),
     status: 'pending'
@@ -1398,6 +1694,38 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
           });
         }
         break outer;
+      }
+    }
+  }
+
+  const liveBuffer = await fetchGitHubJson('data/ops/buffer.json', {});
+  for (const ck of Object.keys(newBuffer)) {
+    const countryEntries = newBuffer[ck] || {};
+    const liveEntries = liveBuffer[ck] || {};
+    for (const [owner, entries] of Object.entries(countryEntries)) {
+      const liveUserEntries = liveEntries[owner] || [];
+      for (let index = 0; index < (entries || []).length; index++) {
+        const entry = entries[index];
+        if (!entry?.process || entry.type === 'delete') continue;
+
+        const liveEntry = liveUserEntries.find(e => e.id === entry.id) || null;
+        const originalProcessId = entry.originalProcessId || entry.process.originalProcessId || liveEntry?.originalProcessId || liveEntry?.process?.originalProcessId || null;
+        if ((entry.type === 'update' || liveEntry?.type === 'update' || entry.type === 'delete' || liveEntry?.type === 'delete') && !originalProcessId) {
+          return res.status(400).json({ error: 'originalProcessId must be preserved for existing process workflows.' });
+        }
+        if (liveEntry?.originalProcessId && originalProcessId !== liveEntry.originalProcessId) {
+          return res.status(400).json({ error: 'originalProcessId cannot be changed for an existing process workflow.' });
+        }
+        if (entry.type === 'update') {
+          const duplicate = await _findDuplicateIssueInCountry(ck, entry.process.issue, originalProcessId);
+          if (duplicate) {
+            return res.status(409).json({ ..._buildDuplicateError(ck, entry.process.issue), duplicate });
+          }
+        }
+        if (originalProcessId) {
+          entry.originalProcessId = originalProcessId;
+          entry.process.originalProcessId = originalProcessId;
+        }
       }
     }
   }
@@ -2170,12 +2498,14 @@ function validateUserEntry(u) {
 /**
  * POST /api/admin/users
  * PATCH-like merge: applies an array of change operations to config/users.json on GitHub.
+ * Parts D, E, F: also handles replacement/inheritance, promotion/demotion detection,
+ * and assignment history recording.
  */
 app.post('/api/admin/users', requireAuth, async (req, res) => {
   if (req.user.role !== 'Admin') {
     return res.status(403).json({ error: 'Only Admin can manage users' });
   }
-  const { users } = req.body;
+  const { users, reason } = req.body;
   if (!Array.isArray(users) || users.length === 0) {
     return res.status(400).json({ error: 'users array of operations required' });
   }
@@ -2184,6 +2514,13 @@ app.post('/api/admin/users', requireAuth, async (req, res) => {
   const working    = before.map(u => ({ ...u }));
   const seenEmails = new Set(working.map(u => u.email.toLowerCase()));
   const batchSeen  = new Set();
+
+  // Collect assignment events for post-save processing
+  const assignmentEvents = [];
+  // Collect inheritance transfers to fire after the users.json write
+  const pendingInheritance = [];
+
+  const norm = e => (e || '').toLowerCase().trim();
 
   for (const op of users) {
     const opType = op.op;
@@ -2214,13 +2551,148 @@ app.post('/api/admin/users', requireAuth, async (req, res) => {
       working.push(result.user);
       seenEmails.add(emailKey);
 
+      // Record add events per country
+      const newCountries = result.user.role === 'Admin' ? ['all'] : (result.user.countries || []);
+      for (const c of newCountries) {
+        assignmentEvents.push({
+          action:       'added',
+          userEmail:    result.user.email,
+          userName:     result.user.name || null,
+          role:         result.user.role,
+          country:      c,
+          changedBy:    req.user.email,
+          reason:       reason || null
+        });
+      }
+
     } else if (opType === 'update') {
       if (existIdx === -1) {
         return res.status(404).json({ error: `User ${u.email} not found — use op="add" to create` });
       }
-      const result = validateUserEntry(u);
+      const oldUser = working[existIdx];
+      const result  = validateUserEntry(u);
       if (!result.ok) return res.status(400).json({ error: result.error });
+
+      const oldRole      = oldUser.role;
+      const newRole      = result.user.role;
+      const oldCountries = Array.isArray(oldUser.countries) ? oldUser.countries : [];
+      const newCountries = Array.isArray(result.user.countries) ? result.user.countries : [];
+
       working[existIdx] = result.user;
+
+      // ── Part E: Promotion / demotion detection ──────────────────────────────
+      // A user cannot hold two roles simultaneously.
+      // Detect role change and record appropriate event.
+      if (norm(oldRole) !== norm(newRole)) {
+        const isPromotion = (oldRole === 'OL' && newRole === 'Manager') ||
+                            (oldRole === 'Manager' && newRole === 'Admin') ||
+                            (oldRole === 'OL' && newRole === 'Admin');
+        const isDemotion  = !isPromotion;
+        const eventAction = isPromotion ? 'promoted' : 'demoted';
+
+        // Record the role change per affected country
+        const allAffected = new Set([...oldCountries, ...newCountries]);
+        for (const c of allAffected) {
+          assignmentEvents.push({
+            action:           eventAction,
+            userEmail:        result.user.email,
+            userName:         result.user.name || null,
+            role:             newRole,
+            country:          c,
+            previousRole:     oldRole,
+            previousCountries: oldCountries,
+            newRole,
+            newCountries,
+            changedBy:        req.user.email,
+            reason:           reason || null
+          });
+        }
+
+        // Part D/E: OL assignment ends — trigger inheritance for countries they
+        // are leaving (countries in old role but not new role, or all if role changed)
+        const leavingCountries = oldRole !== 'Admin'
+          ? oldCountries.filter(c => !newCountries.includes(c) || oldRole !== newRole)
+          : [];
+
+        for (const c of leavingCountries) {
+          // working already has the updated user — resolve inheritance from post-update state
+          const inheritance = _resolveInheritance(result.user.email, oldRole, c, working);
+          if (inheritance.inheritedBy) {
+            pendingInheritance.push({
+              departedEmail: result.user.email,
+              inheritedBy:   inheritance.inheritedBy,
+              country:       c,
+              changedBy:     req.user.email
+            });
+            assignmentEvents.push({
+              action:        'ownership-inherited',
+              userEmail:     inheritance.inheritedBy,
+              previousOwner: result.user.email,
+              role:          oldRole,
+              country:       c,
+              changedBy:     req.user.email,
+              reason:        `${eventAction} — operational ownership transferred`
+            });
+          } else {
+            // No inheritor: flag as orphaned in audit
+            assignmentEvents.push({
+              action:    'ownership-orphaned',
+              userEmail: result.user.email,
+              role:      oldRole,
+              country:   c,
+              changedBy: req.user.email,
+              reason:    `${eventAction} — no peer available to inherit, Admin resolution required`
+            });
+          }
+        }
+
+      } else {
+        // Same role — record country scope changes
+        const removedCountries = oldCountries.filter(c => !newCountries.some(nc => norm(nc) === norm(c)));
+        const addedCountries   = newCountries.filter(c => !oldCountries.some(oc => norm(oc) === norm(c)));
+
+        for (const c of removedCountries) {
+          assignmentEvents.push({
+            action:       'removed',
+            userEmail:    result.user.email,
+            userName:     result.user.name || null,
+            role:         newRole,
+            country:      c,
+            changedBy:    req.user.email,
+            reason:       reason || null
+          });
+          // Trigger inheritance for removed country-role
+          const inheritance = _resolveInheritance(result.user.email, newRole, c, working);
+          if (inheritance.inheritedBy) {
+            pendingInheritance.push({
+              departedEmail: result.user.email,
+              inheritedBy:   inheritance.inheritedBy,
+              country:       c,
+              changedBy:     req.user.email
+            });
+            assignmentEvents.push({
+              action:        'ownership-inherited',
+              userEmail:     inheritance.inheritedBy,
+              previousOwner: result.user.email,
+              role:          newRole,
+              country:       c,
+              changedBy:     req.user.email,
+              reason:        'country removed from user assignment'
+            });
+          }
+        }
+        for (const c of addedCountries) {
+          assignmentEvents.push({
+            action:       'added',
+            userEmail:    result.user.email,
+            userName:     result.user.name || null,
+            role:         newRole,
+            country:      c,
+            changedBy:    req.user.email,
+            reason:       reason || null
+          });
+        }
+      }
 
     } else if (opType === 'remove') {
       if (existIdx === -1) {
@@ -2229,9 +2701,64 @@ app.post('/api/admin/users', requireAuth, async (req, res) => {
       if (emailKey === req.user.email.toLowerCase()) {
         return res.status(400).json({ error: 'You cannot remove your own account' });
       }
+      const removedUser = working[existIdx];
       working.splice(existIdx, 1);
       seenEmails.delete(emailKey);
+
+      // Record removed events per country and trigger inheritance
+      const removedCountries = removedUser.role === 'Admin'
+        ? ['all']
+        : (Array.isArray(removedUser.countries) ? removedUser.countries : []);
+
+      for (const c of removedCountries) {
+        assignmentEvents.push({
+          action:       'removed',
+          userEmail:    removedUser.email,
+          userName:     removedUser.name || null,
+          role:         removedUser.role,
+          country:      c,
+          changedBy:    req.user.email,
+          reason:       reason || null
+        });
+        if (removedUser.role === 'OL' || removedUser.role === 'Manager') {
+          const inheritance = _resolveInheritance(removedUser.email, removedUser.role, c, working);
+          if (inheritance.inheritedBy) {
+            pendingInheritance.push({
+              departedEmail: removedUser.email,
+              inheritedBy:   inheritance.inheritedBy,
+              country:       c,
+              changedBy:     req.user.email
+            });
+            assignmentEvents.push({
+              action:        'ownership-inherited',
+              userEmail:     inheritance.inheritedBy,
+              previousOwner: removedUser.email,
+              role:          removedUser.role,
+              country:       c,
+              changedBy:     req.user.email,
+              reason:        'user removed from system'
+            });
+          } else {
+            assignmentEvents.push({
+              action:    'ownership-orphaned',
+              userEmail: removedUser.email,
+              role:      removedUser.role,
+              country:   c,
+              changedBy: req.user.email,
+              reason:    'user removed — no peer available to inherit, Admin resolution required'
+            });
+          }
+        }
+      }
     }
+  }
+
+  const activeAdminCount = working.filter(u => u.role === 'Admin').length;
+  if (activeAdminCount === 0) {
+    return res.status(400).json({
+      error: MIN_ADMIN_ERROR_MESSAGE,
+      opsMessage: MIN_ADMIN_ERROR_MESSAGE
+    });
   }
 
   await commitJsonToMainBranch('config/users.json', working, `admin: update users (${users.length} op(s)) by ${req.user.email}`);
@@ -2244,7 +2771,27 @@ app.post('/api/admin/users', requireAuth, async (req, res) => {
     opCount: users.length
   });
 
-  res.json({ success: true, count: working.length });
+  // Fire-and-forget: assignment history and inheritance transfers
+  if (assignmentEvents.length > 0) {
+    appendAssignmentHistory(assignmentEvents).catch(() => {});
+  }
+  for (const t of pendingInheritance) {
+    _transferOrphanedBufferEntries(t.departedEmail, t.inheritedBy, t.country, t.changedBy).catch(() => {});
+  }
+
+  res.json({ success: true, count: working.length, assignmentEvents: assignmentEvents.length });
+});
+
+/**
+ * GET /api/ops/assignment-history
+ * Returns assignment_history.json — Admin only.
+ * Supports the inheritance audit trail (Part F).
+ */
+app.get('/api/ops/assignment-history', requireAuth, async (req, res) => {
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  res.json(await fetchGitHubJson(ASSIGNMENT_HISTORY_PATH, []));
 });
 
 /**
@@ -3246,7 +3793,7 @@ app.get('/api/ops/pr/details/:prNumber', requireAuth, async (req, res) => {
   try {
     const [prRes, filesRes] = await Promise.all([
       fetch(`https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`, { headers: ghHeaders() }),
-      fetch(`https://api.github.ibm.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/files`, { headers: ghHeaders() })
+      fetch(`${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/files`, { headers: ghHeaders() })
     ]);
 
     if (!prRes.ok) return res.status(prRes.status).json({ error: `GitHub returned ${prRes.status} for PR #${prNumber}` });
@@ -3407,13 +3954,209 @@ app.delete('/api/ops/history/entry', requireAuth, async (req, res) => {
 // ─── Admin OPS-based Approve & Publish / Reject Request (Admin only) ─────────
 
 /**
+ * _adminPreflightCheck — Part K re-check helper for all critical Admin actions.
+ *
+ * Re-verifies live backend state immediately before any destructive Admin action:
+ *   - Authenticated Admin (role re-checked live from token, not stale cache)
+ *   - No active countdown for this country
+ *   - History has pending_merge entries for the expected PR
+ *   - PR still exists and has expected state on GitHub
+ *   - No duplicate PR for same country (stale-action guard for multiple Admins)
+ *   - Changed files remain within allowed scope
+ *   - Target branch valid (only if expectedBase supplied)
+ *
+ * Returns { ok: true, prData, matchingEntries } or { ok: false, httpStatus, error, opsMessage, productionChanged, entriesLocked }
+ */
+async function _adminPreflightCheck(user, country, prNumber, expectedGitHubState) {
+  const norm = e => (e || '').toLowerCase().trim();
+
+  // 1. Re-confirm Admin role live from JWT payload (not from stale session assumption)
+  if (user.role !== 'Admin') {
+    return { ok: false, httpStatus: 403, error: 'Admin only', opsMessage: 'You do not have Admin permissions for this action.' };
+  }
+
+  // 2. Countdown guard
+  const schedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+  if (schedule[country]) {
+    return {
+      ok: false, httpStatus: 409,
+      error: `A PR countdown is running for "${country}". Wait for it to complete or cancel it before proceeding.`,
+      opsMessage: 'A Publish Request countdown is in progress for this country. You must wait for it to finish or cancel it before approving or rejecting.',
+      productionChanged: false,
+      entriesLocked: true
+    };
+  }
+
+  // 3. History pre-flight — re-fetch fresh to catch stale Admin state
+  const historyPre = await fetchGitHubJson('data/ops/history.json', {});
+  const matchingEntries = (historyPre[country] || []).filter(
+    h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
+  );
+  if (matchingEntries.length === 0) {
+    // Check if already processed by another Admin (Part A — stale-action guard)
+    const alreadyDone = (historyPre[country] || []).some(
+      h => h.prNumber === prNumber && (h.pr_status === 'merged' || h.pr_status === 'refused')
+    );
+    if (alreadyDone) {
+      return {
+        ok: false, httpStatus: 409,
+        error: `Publish Request #${prNumber} for "${country}" has already been processed (merged or refused). This action was likely completed by another Admin.`,
+        opsMessage: 'This Publish Request has already been acted on. Refresh OPS to see the current state.',
+        productionChanged: true,   // may have merged already
+        entriesLocked: false
+      };
+    }
+    return {
+      ok: false, httpStatus: 409,
+      error: `No pending Publish Request entries found for country "${country}" PR #${prNumber}.`,
+      opsMessage: 'No entries are waiting for this Publish Request. It may have been cancelled or already processed.',
+      productionChanged: false,
+      entriesLocked: false
+    };
+  }
+
+  // 4. Live GitHub PR state check
+  let prData = null;
+  try {
+    const prRes = await fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`,
+      { headers: ghHeaders() }
+    );
+    if (!prRes.ok) {
+      const errBody = await prRes.text().catch(() => '');
+      return {
+        ok: false, httpStatus: prRes.status,
+        error: `GitHub returned ${prRes.status} checking Publish Request #${prNumber}: ${errBody}`,
+        opsMessage: `OPS could not verify the current state of Publish Request #${prNumber} on GitHub. No changes were made. Try Refresh Status.`,
+        productionChanged: false,
+        entriesLocked: true
+      };
+    }
+    prData = await prRes.json();
+  } catch (err) {
+    return {
+      ok: false, httpStatus: 502,
+      error: `Network error fetching PR #${prNumber}: ${err.message}`,
+      opsMessage: 'OPS could not reach GitHub to verify the Publish Request state. No changes were made. Check your connection and try Refresh Status.',
+      productionChanged: false,
+      entriesLocked: true
+    };
+  }
+
+  // 5. Expected state check — detect external mismatch (Part J)
+  if (expectedGitHubState === 'open' && prData.state !== 'open') {
+    const isExternallyMerged = prData.state === 'closed' && !!prData.merged_at;
+    const isExternallyClosed = prData.state === 'closed' && !prData.merged_at;
+
+    // Part J — mismatch detected: log it (await so the log is written before returning)
+    await appendActivityLog({
+      event:           'github-mismatch-detected',
+      country,
+      prNumber,
+      expectedState:   'open',
+      actualState:     prData.state,
+      merged:          !!prData.merged_at,
+      prUrl:           prData.html_url,
+      branchName:      prData.head?.ref || null,
+      detectedBy:      user.email,
+      detectedAt:      new Date().toISOString()
+    });
+
+    if (isExternallyMerged) {
+      return {
+        ok: false, httpStatus: 409,
+        error: `External mismatch: Publish Request #${prNumber} was merged outside OPS (merged_at: ${prData.merged_at}).`,
+        opsMessage: `Publish Request #${prNumber} was merged directly on GitHub — not through OPS. Production may have changed. Use "Sync as Published" from OPS after verifying the file scope below.`,
+        productionChanged: true,
+        entriesLocked: true,
+        mismatch: { type: 'externally-merged', prData }
+      };
+    }
+    if (isExternallyClosed) {
+      return {
+        ok: false, httpStatus: 409,
+        error: `External mismatch: Publish Request #${prNumber} was closed outside OPS without merging.`,
+        opsMessage: `Publish Request #${prNumber} was closed directly on GitHub without merging. Production did NOT change. Use "Sync as Refused" from OPS to close it cleanly.`,
+        productionChanged: false,
+        entriesLocked: true,
+        mismatch: { type: 'externally-closed', prData }
+      };
+    }
+    return {
+      ok: false, httpStatus: 409,
+      error: `Publish Request #${prNumber} is in unexpected state: "${prData.state}".`,
+      opsMessage: `Publish Request #${prNumber} is in an unexpected state. No action was taken. Use Refresh Status to re-check.`,
+      productionChanged: false,
+      entriesLocked: true
+    };
+  }
+
+  // 6. File scope check — Part J: verify no unexpected files
+  try {
+    const filesRes = await fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/files`,
+      { headers: ghHeaders() }
+    );
+    if (filesRes.ok) {
+      const files = await filesRes.json();
+      const blocked = (Array.isArray(files) ? files : [])
+        .map(f => f.filename)
+        .filter(f => !_isAllowedPRPath(f));
+      if (blocked.length > 0) {
+        appendActivityLog({
+          event:        'github-mismatch-detected',
+          country,
+          prNumber,
+          issue:        'unexpected-files',
+          blockedFiles: blocked,
+          detectedBy:   user.email,
+          detectedAt:   new Date().toISOString()
+        }).catch(() => {});
+        return {
+          ok: false, httpStatus: 409,
+          error: `Publish Request #${prNumber} contains unexpected files outside allowed scope: ${blocked.join(', ')}`,
+          opsMessage: `Publish Request #${prNumber} was found to contain unexpected files (${blocked.join(', ')}). This is unsafe. Reject this request and ask the country owner to submit a clean corrected request.`,
+          productionChanged: false,
+          entriesLocked: true,
+          blockedFiles: blocked
+        };
+      }
+    }
+  } catch {}  // scope check failure is non-fatal but logged above
+
+  // 7. Target branch check
+  if (prData.base?.ref && prData.base.ref !== GITHUB_TARGET_BRANCH) {
+    appendActivityLog({
+      event:          'github-mismatch-detected',
+      country,
+      prNumber,
+      issue:          'wrong-target-branch',
+      expectedBase:   GITHUB_TARGET_BRANCH,
+      actualBase:     prData.base.ref,
+      detectedBy:     user.email,
+      detectedAt:     new Date().toISOString()
+    }).catch(() => {});
+    return {
+      ok: false, httpStatus: 409,
+      error: `Publish Request #${prNumber} targets "${prData.base.ref}" instead of expected "${GITHUB_TARGET_BRANCH}".`,
+      opsMessage: `Publish Request #${prNumber} is targeting the wrong branch. No action was taken. Reject this request.`,
+      productionChanged: false,
+      entriesLocked: true
+    };
+  }
+
+  return { ok: true, prData, matchingEntries, historyPre };
+}
+
+/**
  * POST /api/admin/pr/approve
  * OPS-based Admin Approve & Publish.
- * Admin acts from the OPS panel — backend merges the GitHub PR, updates
- * History to merged/published, and writes a Logs audit record.
+ * Parts A, B, H, K: re-checks live state before every merge, detects mismatch,
+ * handles merge failure with safe error state, blocks stale/duplicate Admin actions.
  *
  * Body: { country: string, prNumber: number }
  * Returns: { success, country, prNumber, mergedCount, sha }
+ *          OR failure shape: { error, opsMessage, productionChanged, entriesLocked, availableActions }
  */
 app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
   if (req.user.role !== 'Admin') {
@@ -3432,45 +4175,35 @@ app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
   const now      = new Date().toISOString();
 
   try {
-    // ── Governance: block Approve while a countdown is active for this country ─
-    // A countdown means a PR creation or append is in-flight for the country.
-    // Approving while a new batch is mid-schedule could corrupt state.
-    const scheduleNow = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
-    if (scheduleNow[country]) {
-      return res.status(409).json({
-        error: `A PR countdown is currently running for "${country}". Wait for it to complete or be cancelled before approving.`,
-        countdown: true
+    // Part K — full re-check before approve
+    const precheck = await _adminPreflightCheck(req.user, country, prNumber, 'open');
+    if (!precheck.ok) {
+      // Log the failed attempt (Part M)
+      appendActivityLog({
+        event:             'approve-preflight-failed',
+        by:                approver,
+        country,
+        prNumber,
+        error:             precheck.error,
+        productionChanged: precheck.productionChanged,
+        mismatch:          precheck.mismatch || null,
+        blockedFiles:      precheck.blockedFiles || null,
+        attemptedAt:       now
+      }).catch(() => {});
+      return res.status(precheck.httpStatus || 409).json({
+        error:             precheck.error,
+        opsMessage:        precheck.opsMessage,
+        productionChanged: precheck.productionChanged,
+        entriesLocked:     precheck.entriesLocked,
+        mismatch:          precheck.mismatch || null,
+        blockedFiles:      precheck.blockedFiles || null,
+        availableActions:  _buildApproveFailureActions(precheck)
       });
     }
 
-    // ── Pre-flight: verify History has pending_merge entries for this PR ──────
-    // Must happen before any GitHub call so we never merge a PR whose History
-    // record is missing or already transitioned.
-    const historyPre = await fetchGitHubJson('data/ops/history.json', {});
-    const matchingEntries = (historyPre[country] || []).filter(
-      h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
-    );
-    if (matchingEntries.length === 0) {
-      return res.status(409).json({
-        error: `No pending_merge History entries found for country "${country}" PR #${prNumber}. Approve aborted.`
-      });
-    }
+    const { prData, matchingEntries, historyPre } = precheck;
 
-    // ── Verify PR is open before attempting merge ─────────────────────────────
-    const prCheckRes = await fetch(
-      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`,
-      { headers: ghHeaders() }
-    );
-    if (!prCheckRes.ok) {
-      const errBody = await prCheckRes.text().catch(() => '');
-      return res.status(prCheckRes.status).json({ error: `GitHub returned ${prCheckRes.status} fetching PR #${prNumber}: ${errBody}` });
-    }
-    const prData = await prCheckRes.json();
-    if (prData.state !== 'open') {
-      return res.status(409).json({ error: `PR #${prNumber} is not open (state: ${prData.state}). Cannot approve.` });
-    }
-
-    // ── Squash-merge the PR via GitHub API ────────────────────────────────────
+    // ── Squash-merge the PR via GitHub API (Part H) ───────────────────────────
     const mergeRes = await fetch(
       `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/merge`,
       {
@@ -3483,19 +4216,43 @@ app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
         })
       }
     );
+
     if (!mergeRes.ok) {
       const errBody = await mergeRes.text().catch(() => '');
-      // 405 = not mergeable (conflicts or already merged)
-      if (mergeRes.status === 405) {
-        return res.status(409).json({ error: `PR #${prNumber} is not mergeable — may have conflicts or was already merged. GitHub: ${errBody}` });
-      }
-      return res.status(mergeRes.status).json({ error: `GitHub merge failed for PR #${prNumber}: ${mergeRes.status} ${errBody}` });
+      const isConflict = mergeRes.status === 405 || mergeRes.status === 422;
+
+      // Part H — merge failure: log, keep entries locked, return actionable state
+      appendActivityLog({
+        event:           isConflict ? 'approve-conflict-detected' : 'approve-merge-failed',
+        by:              approver,
+        country,
+        prNumber,
+        httpStatus:      mergeRes.status,
+        error:           errBody,
+        attemptedAt:     now
+      }).catch(() => {});
+
+      const opsMessage = isConflict
+        ? `Publish Request #${prNumber} has a merge conflict and cannot be approved. Production was NOT changed. Entries remain locked. Reject this request and ask the country owner to submit a corrected request.`
+        : `GitHub rejected the merge for Publish Request #${prNumber} (HTTP ${mergeRes.status}). Production was NOT changed. Entries remain locked. Use Retry Approve or Reject Publish Request.`;
+
+      return res.status(409).json({
+        error:             `Approval failed: ${isConflict ? 'merge conflict' : `GitHub error ${mergeRes.status}`}`,
+        opsMessage,
+        productionChanged: false,
+        entriesLocked:     true,
+        httpStatus:        mergeRes.status,
+        details:           errBody,
+        availableActions:  isConflict
+          ? ['rejectRequest', 'refreshStatus', 'viewErrorDetails']
+          : ['retryApprove', 'rejectRequest', 'refreshStatus', 'viewErrorDetails']
+      });
     }
+
     const mergeData = await mergeRes.json();
     const mergeSha  = mergeData.sha || null;
 
     // ── Update History: pending_merge → merged ────────────────────────────────
-    // Re-use the pre-fetched history object — mutate the matched entries in place.
     let mergedCount = 0;
     matchingEntries.forEach(h => {
       h.pr_status  = 'merged';
@@ -3530,18 +4287,33 @@ app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
 
   } catch (err) {
     console.error('[Admin approve] error:', err.message);
-    res.status(500).json({ error: err.message });
+    appendActivityLog({
+      event:       'approve-merge-failed',
+      by:          approver,
+      country,
+      prNumber,
+      error:       err.message,
+      attemptedAt: now
+    }).catch(() => {});
+    res.status(500).json({
+      error:             err.message,
+      opsMessage:        `An unexpected error occurred while approving Publish Request #${prNumber}. Production status is uncertain. Use Refresh Status to verify, then Retry Approve or Reject as appropriate.`,
+      productionChanged: null,
+      entriesLocked:     true,
+      availableActions:  ['refreshStatus', 'retryApprove', 'rejectRequest', 'viewErrorDetails']
+    });
   }
 });
 
 /**
  * POST /api/admin/pr/close
  * OPS-based Admin Reject Request.
- * Admin acts from the OPS panel — backend closes the GitHub PR, updates
- * History to refused, and writes a request-rejected Logs audit record.
+ * Parts A, B, I, K: re-checks live state before every close, handles close failure
+ * safely, blocks stale/duplicate Admin actions.
  *
  * Body: { country: string, prNumber: number, reason?: string }
  * Returns: { success, country, prNumber, refusedCount }
+ *          OR failure shape: { error, opsMessage, productionChanged, entriesLocked, availableActions }
  */
 app.post('/api/admin/pr/close', requireAuth, async (req, res) => {
   if (req.user.role !== 'Admin') {
@@ -3559,29 +4331,30 @@ app.post('/api/admin/pr/close', requireAuth, async (req, res) => {
   const now      = new Date().toISOString();
 
   try {
-    // ── Governance: block Reject while a countdown is active for this country ─
-    // A countdown means a PR creation or append is in-flight for the country.
-    // Rejecting while a new batch is mid-schedule could corrupt state.
-    const scheduleNow = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
-    if (scheduleNow[country]) {
-      return res.status(409).json({
-        error: `A PR countdown is currently running for "${country}". Wait for it to complete or be cancelled before rejecting.`,
-        countdown: true
+    // Part K — full re-check before reject (pass 'open' as expected state)
+    const precheck = await _adminPreflightCheck(req.user, country, prNumber, 'open');
+    if (!precheck.ok) {
+      appendActivityLog({
+        event:             'reject-preflight-failed',
+        by:                rejecter,
+        country,
+        prNumber,
+        error:             precheck.error,
+        productionChanged: precheck.productionChanged,
+        mismatch:          precheck.mismatch || null,
+        attemptedAt:       now
+      }).catch(() => {});
+      return res.status(precheck.httpStatus || 409).json({
+        error:             precheck.error,
+        opsMessage:        precheck.opsMessage,
+        productionChanged: precheck.productionChanged,
+        entriesLocked:     precheck.entriesLocked,
+        mismatch:          precheck.mismatch || null,
+        availableActions:  _buildRejectFailureActions(precheck)
       });
     }
 
-    // ── Pre-flight: verify History has pending_merge entries for this PR ──────
-    // Must happen before any GitHub call so we never close a PR whose History
-    // record is missing or already transitioned.
-    const historyPre = await fetchGitHubJson('data/ops/history.json', {});
-    const matchingEntries = (historyPre[country] || []).filter(
-      h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
-    );
-    if (matchingEntries.length === 0) {
-      return res.status(409).json({
-        error: `No pending_merge History entries found for country "${country}" PR #${prNumber}. Reject aborted.`
-      });
-    }
+    const { prData, matchingEntries, historyPre } = precheck;
 
     // ── Close the PR via GitHub API ───────────────────────────────────────────
     const closeRes = await fetch(
@@ -3595,14 +4368,53 @@ app.post('/api/admin/pr/close', requireAuth, async (req, res) => {
         })
       }
     );
+
     if (!closeRes.ok) {
       const errBody = await closeRes.text().catch(() => '');
-      return res.status(closeRes.status).json({ error: `GitHub returned ${closeRes.status}: ${errBody}` });
+      // Part I — close failure: do NOT mark as refused. Keep active/error.
+      appendActivityLog({
+        event:       'reject-close-failed',
+        by:          rejecter,
+        country,
+        prNumber,
+        httpStatus:  closeRes.status,
+        error:       errBody,
+        attemptedAt: now
+      }).catch(() => {});
+      return res.status(closeRes.status || 500).json({
+        error:             `GitHub rejected the close for Publish Request #${prNumber} (HTTP ${closeRes.status}).`,
+        opsMessage:        `OPS could not close Publish Request #${prNumber} on GitHub. Production was NOT changed. The request remains active. Use Retry Reject or Refresh Status. Do NOT use Force Sync unless Refresh Status confirms the PR is already closed.`,
+        productionChanged: false,
+        entriesLocked:     true,
+        details:           errBody,
+        availableActions:  ['retryReject', 'refreshStatus', 'viewErrorDetails']
+      });
     }
     const pr = await closeRes.json();
 
-    // ── Update History: pending_merge → refused ───────────────────────────────
-    // Re-use the pre-fetched history object — mutate the matched entries in place.
+    // Part I — verify GitHub actually closed it before marking as refused
+    // The PATCH returns the updated PR object. State must be 'closed' and NOT merged.
+    if (pr.state !== 'closed' || pr.merged_at) {
+      appendActivityLog({
+        event:       'reject-close-failed',
+        by:          rejecter,
+        country,
+        prNumber,
+        issue:       'pr-not-closed-after-patch',
+        prState:     pr.state,
+        mergedAt:    pr.merged_at || null,
+        attemptedAt: now
+      }).catch(() => {});
+      return res.status(409).json({
+        error:             `Publish Request #${prNumber} was not confirmed closed by GitHub (state: ${pr.state}).`,
+        opsMessage:        `OPS could not confirm Publish Request #${prNumber} was closed. No OPS state was changed. Use Refresh Status to verify the actual GitHub state before retrying.`,
+        productionChanged: !!pr.merged_at,
+        entriesLocked:     true,
+        availableActions:  ['retryReject', 'refreshStatus', 'viewErrorDetails']
+      });
+    }
+
+    // ── GitHub confirmed closed — update History: pending_merge → refused ─────
     let refusedCount = 0;
     matchingEntries.forEach(h => {
       h.pr_status        = 'refused';
@@ -3637,7 +4449,417 @@ app.post('/api/admin/pr/close', requireAuth, async (req, res) => {
 
   } catch (err) {
     console.error('[Admin reject] error:', err.message);
+    appendActivityLog({
+      event:       'reject-close-failed',
+      by:          rejecter,
+      country,
+      prNumber,
+      error:       err.message,
+      attemptedAt: now
+    }).catch(() => {});
+    res.status(500).json({
+      error:             err.message,
+      opsMessage:        `An unexpected error occurred while rejecting Publish Request #${prNumber}. Production status is uncertain. Use Refresh Status to verify the GitHub state before retrying.`,
+      productionChanged: null,
+      entriesLocked:     true,
+      availableActions:  ['retryReject', 'refreshStatus', 'viewErrorDetails']
+    });
+  }
+});
+
+// ─── Failure-action builders (Part L) ─────────────────────────────────────────
+
+/**
+ * Returns the list of safe OPS actions available after an approve pre-flight failure.
+ */
+function _buildApproveFailureActions(precheck) {
+  if (precheck.mismatch?.type === 'externally-merged') {
+    return ['syncAsPublished', 'refreshStatus', 'viewErrorDetails'];
+  }
+  if (precheck.mismatch?.type === 'externally-closed') {
+    return ['syncAsRefused', 'refreshStatus', 'viewErrorDetails'];
+  }
+  if (precheck.blockedFiles?.length) {
+    return ['rejectRequest', 'viewErrorDetails'];
+  }
+  if (precheck.productionChanged) {
+    return ['refreshStatus', 'viewErrorDetails'];
+  }
+  return ['retryApprove', 'rejectRequest', 'refreshStatus', 'viewErrorDetails'];
+}
+
+/**
+ * Returns the list of safe OPS actions available after a reject pre-flight failure.
+ */
+function _buildRejectFailureActions(precheck) {
+  if (precheck.mismatch?.type === 'externally-merged') {
+    return ['syncAsPublished', 'refreshStatus', 'viewErrorDetails'];
+  }
+  if (precheck.mismatch?.type === 'externally-closed') {
+    return ['syncAsRefused', 'refreshStatus', 'viewErrorDetails'];
+  }
+  if (precheck.productionChanged) {
+    return ['refreshStatus', 'viewErrorDetails'];
+  }
+  return ['retryReject', 'refreshStatus', 'viewErrorDetails'];
+}
+
+// ─── OPS GitHub Sync routes (Part J — Admin only) ─────────────────────────────
+
+/**
+ * POST /api/admin/pr/sync-published
+ * Allows Admin to sync an externally-merged PR as Published from OPS, ONLY after
+ * the backend verifies: PR is merged, files are in allowed scope, expected country.
+ * Part J rule: do not blindly trust external state — backend must verify.
+ *
+ * Body: { country, prNumber }
+ */
+app.post('/api/admin/pr/sync-published', requireAuth, async (req, res) => {
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  const { country, prNumber } = req.body;
+  if (!country || !validateCountry(country)) return res.status(400).json({ error: 'Valid country is required' });
+  if (!prNumber || typeof prNumber !== 'number') return res.status(400).json({ error: 'prNumber (number) is required' });
+
+  const actor = req.user.email;
+  const now   = new Date().toISOString();
+
+  try {
+    // 1. Verify PR exists and is genuinely merged on GitHub
+    const prRes = await fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`,
+      { headers: ghHeaders() }
+    );
+    if (!prRes.ok) {
+      return res.status(prRes.status).json({ error: `GitHub returned ${prRes.status} checking PR #${prNumber}` });
+    }
+    const pr = await prRes.json();
+
+    if (!pr.merged_at || pr.state !== 'closed') {
+      return res.status(409).json({
+        error: `PR #${prNumber} is not merged (state=${pr.state}, merged_at=${pr.merged_at || 'null'}). Sync as Published is only available for genuinely merged PRs.`,
+        opsMessage: 'This Publish Request has not been merged. Sync as Published is only allowed after GitHub confirms the merge. Use Refresh Status first.'
+      });
+    }
+
+    // 2. Verify files remain in allowed scope
+    const filesRes = await fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/files`,
+      { headers: ghHeaders() }
+    );
+    if (filesRes.ok) {
+      const files = await filesRes.json();
+      const blocked = (Array.isArray(files) ? files : []).map(f => f.filename).filter(f => !_isAllowedPRPath(f));
+      if (blocked.length > 0) {
+        return res.status(409).json({
+          error: `Cannot sync as Published — PR #${prNumber} contains out-of-scope files: ${blocked.join(', ')}`,
+          opsMessage: 'Sync as Published was blocked because this Publish Request contained unexpected files outside the allowed scope. Investigate before taking further action.'
+        });
+      }
+    }
+
+    // 3. Update History entries
+    const history = await fetchGitHubJson('data/ops/history.json', {});
+    const matching = (history[country] || []).filter(
+      h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
+    );
+    if (matching.length === 0) {
+      return res.status(409).json({
+        error: `No pending_merge History entries found for country "${country}" PR #${prNumber}.`,
+        opsMessage: 'No entries found to sync. The Publish Request may have already been processed.'
+      });
+    }
+
+    const mergeSha = pr.merge_commit_sha || null;
+    matching.forEach(h => {
+      h.pr_status          = 'merged';
+      h.mergedAt           = pr.merged_at;
+      h.approvedBy         = actor;
+      h.approvedAt         = now;
+      h.syncedFromExternal = true;
+      if (mergeSha) h.mergeCommitSha = mergeSha;
+    });
+
+    await commitJsonToMainBranch(
+      'data/ops/history.json', history,
+      `ops: sync PR #${prNumber} as published (external merge) for ${country} by ${actor}`
+    );
+
+    appendActivityLog({
+      event:             'sync-as-published',
+      by:                actor,
+      country,
+      prNumber,
+      prUrl:             pr.html_url,
+      mergeCommitSha:    mergeSha,
+      mergedAt:          pr.merged_at,
+      syncedCount:       matching.length,
+      syncedAt:          now
+    });
+
+    console.log(`[Admin sync] PR #${prNumber} synced as Published for "${country}" by ${actor}`);
+    res.json({ success: true, country, prNumber, syncedCount: matching.length });
+
+  } catch (err) {
+    console.error('[Admin sync-published] error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/admin/pr/sync-refused
+ * Allows Admin to sync an externally-closed (unmerged) PR as Refused from OPS,
+ * ONLY after backend verifies: PR is closed AND not merged.
+ * Part J rule: do not blindly trust external state.
+ *
+ * Body: { country, prNumber, reason? }
+ */
+app.post('/api/admin/pr/sync-refused', requireAuth, async (req, res) => {
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  const { country, prNumber, reason } = req.body;
+  if (!country || !validateCountry(country)) return res.status(400).json({ error: 'Valid country is required' });
+  if (!prNumber || typeof prNumber !== 'number') return res.status(400).json({ error: 'prNumber (number) is required' });
+
+  const actor = req.user.email;
+  const now   = new Date().toISOString();
+
+  try {
+    // 1. Verify PR is closed and NOT merged on GitHub
+    const prRes = await fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`,
+      { headers: ghHeaders() }
+    );
+    if (!prRes.ok) {
+      return res.status(prRes.status).json({ error: `GitHub returned ${prRes.status} checking PR #${prNumber}` });
+    }
+    const pr = await prRes.json();
+
+    if (pr.state !== 'closed' || pr.merged_at) {
+      return res.status(409).json({
+        error: `PR #${prNumber} is not closed-unmerged (state=${pr.state}, merged_at=${pr.merged_at || 'null'}). Sync as Refused is only available for closed unmerged PRs.`,
+        opsMessage: 'This Publish Request has not been closed without merging. Verify the current GitHub state before using Sync as Refused.'
+      });
+    }
+
+    // 2. Update History entries
+    const history = await fetchGitHubJson('data/ops/history.json', {});
+    const matching = (history[country] || []).filter(
+      h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
+    );
+    if (matching.length === 0) {
+      return res.status(409).json({
+        error: `No pending_merge History entries found for country "${country}" PR #${prNumber}.`,
+        opsMessage: 'No entries found to sync. The Publish Request may have already been processed.'
+      });
+    }
+
+    matching.forEach(h => {
+      h.pr_status          = 'refused';
+      h.closedAt           = pr.closed_at || now;
+      h.rejectedBy         = actor;
+      h.rejectedAt         = now;
+      h.syncedFromExternal = true;
+      if (reason) h.rejectionReason = reason.trim();
+    });
+
+    await commitJsonToMainBranch(
+      'data/ops/history.json', history,
+      `ops: sync PR #${prNumber} as refused (external close) for ${country} by ${actor}`
+    );
+
+    appendActivityLog({
+      event:             'sync-as-refused',
+      by:                actor,
+      country,
+      prNumber,
+      prUrl:             pr.html_url,
+      closedAt:          pr.closed_at || now,
+      rejectionReason:   reason ? reason.trim() : null,
+      syncedCount:       matching.length,
+      syncedAt:          now
+    });
+
+    console.log(`[Admin sync] PR #${prNumber} synced as Refused for "${country}" by ${actor}`);
+    res.json({ success: true, country, prNumber, syncedCount: matching.length });
+
+  } catch (err) {
+    console.error('[Admin sync-refused] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/admin/pr/verify/:prNumber
+ * Backend-verified status check for a specific PR (Part J, Part K).
+ * Returns full state: merged, closed, files scope, target branch, head branch,
+ * expected country scope, mismatch flags.
+ * Admin only.
+ */
+app.get('/api/admin/pr/verify/:prNumber', requireAuth, async (req, res) => {
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  const prNumber = parseInt(req.params.prNumber, 10);
+  if (!prNumber || isNaN(prNumber)) {
+    return res.status(400).json({ error: 'Valid PR number required' });
+  }
+
+  try {
+    const [prRes, filesRes] = await Promise.all([
+      fetch(`${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}`, { headers: ghHeaders() }),
+      fetch(`${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls/${prNumber}/files`, { headers: ghHeaders() })
+    ]);
+
+    if (!prRes.ok) {
+      return res.status(prRes.status).json({ error: `GitHub returned ${prRes.status}` });
+    }
+
+    const pr    = await prRes.json();
+    const files = filesRes.ok ? await filesRes.json() : [];
+
+    const fileList = (Array.isArray(files) ? files : []).map(f => ({
+      filename: f.filename,
+      status:   f.status,
+      allowed:  _isAllowedPRPath(f.filename)
+    }));
+    const blockedFiles  = fileList.filter(f => !f.allowed).map(f => f.filename);
+    const scopeClean    = blockedFiles.length === 0;
+    const targetCorrect = pr.base?.ref === GITHUB_TARGET_BRANCH;
+
+    // Detect mismatch type
+    let mismatchType = null;
+    if (pr.state === 'closed' && pr.merged_at)  mismatchType = 'externally-merged';
+    if (pr.state === 'closed' && !pr.merged_at) mismatchType = 'externally-closed';
+    if (!scopeClean)                             mismatchType = mismatchType || 'unexpected-files';
+    if (!targetCorrect)                          mismatchType = mismatchType || 'wrong-target-branch';
+
+    // Available sync actions based on verified state
+    const syncActions = [];
+    if (pr.state === 'closed' && pr.merged_at && scopeClean)  syncActions.push('syncAsPublished');
+    if (pr.state === 'closed' && !pr.merged_at)               syncActions.push('syncAsRefused');
+
+    res.json({
+      prNumber,
+      prUrl:          pr.html_url,
+      state:          pr.state,
+      merged:         !!pr.merged_at,
+      mergedAt:       pr.merged_at || null,
+      closedAt:       pr.closed_at || null,
+      baseBranch:     pr.base?.ref || null,
+      headBranch:     pr.head?.ref || null,
+      targetCorrect,
+      scopeClean,
+      blockedFiles,
+      files:          fileList,
+      mismatchType,
+      mismatchDetected: mismatchType !== null,
+      syncActions,
+      title:          pr.title,
+      mergeable:      pr.mergeable,
+      mergeableState: pr.mergeable_state,
+      verifiedAt:     new Date().toISOString()
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/admin/pr/retry-create
+ * Retries Publish Request creation for a country when the initial attempt failed
+ * before a real GitHub PR was created. Part G.
+ * Entries must still be in Buffer as validated to be eligible.
+ * Admin only.
+ *
+ * Body: { country }
+ */
+app.post('/api/admin/pr/retry-create', requireAuth, async (req, res) => {
+  if (req.user.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin only' });
+  }
+  const { country } = req.body;
+  if (!country || !validateCountry(country)) {
+    return res.status(400).json({ error: 'Valid country is required' });
+  }
+  if (DISABLE_PR_CREATION) {
+    return res.status(503).json({ error: 'PR creation is currently disabled on this server.' });
+  }
+
+  const actor = req.user.email;
+  const now   = new Date().toISOString();
+
+  try {
+    // Re-use the same pre-flight and create flow as approve-and-merge
+    const buffer       = await fetchGitHubJson('data/ops/buffer.json', {});
+    const countryBuf   = buffer[country] || {};
+    const allEntries   = Object.values(countryBuf).flat();
+    const mergeUsers   = await fetchGitHubJson('config/users.json', []);
+    const scopedEntries = _filterEntriesByPRScope(allEntries, mergeUsers, actor);
+    const validatedEntries = scopedEntries.filter(e => e.status === 'validated');
+
+    if (!validatedEntries.length) {
+      return res.status(400).json({
+        error: 'No validated entries available for retry.',
+        opsMessage: 'There are no validated entries in the Buffer for this country. The previous creation failure left entries safely in Buffer. Validate entries first, then retry.',
+        productionChanged: false,
+        entriesLocked: false
+      });
+    }
+
+    const preflight = await _preflightPRCheck(country, validatedEntries);
+    if (!preflight.ok) {
+      return res.status(preflight.httpStatus || 400).json({
+        error:             preflight.error,
+        opsMessage:        `Retry Create was blocked: ${preflight.error}. No production changes were made. Entries remain in Buffer.`,
+        productionChanged: false,
+        entriesLocked:     false
+      });
+    }
+
+    appendActivityLog({ event: 'pr-create-retry', by: actor, country, entryCount: validatedEntries.length, attemptedAt: now });
+
+    const prResult = await _createPRForCountry(country, validatedEntries, actor);
+
+    if (!prResult.success) {
+      appendActivityLog({ event: 'pr-create-failed', by: actor, country, error: prResult.error, attemptedAt: now });
+      return res.status(500).json({
+        error:             `Retry failed: ${prResult.error}`,
+        opsMessage:        `Retry Create failed again. No production changes were made. Entries remain in Buffer. Retry again later or cancel the attempt.`,
+        productionChanged: false,
+        entriesLocked:     false,
+        availableActions:  ['retryCreate', 'cancelAttempt', 'refreshStatus', 'viewErrorDetails']
+      });
+    }
+
+    await _moveBufToHistoryAfterPR(country, validatedEntries, prResult, actor);
+
+    appendActivityLog({
+      event:      'pr-created',
+      by:         actor,
+      country,
+      branchName: prResult.branchName,
+      prNumber:   prResult.prNumber,
+      prUrl:      prResult.prUrl,
+      entryCount: validatedEntries.length,
+      trigger:    'retry-create'
+    });
+
+    res.json({ success: true, country, prUrl: prResult.prUrl, prNumber: prResult.prNumber, branchName: prResult.branchName });
+
+  } catch (err) {
+    console.error('[Admin retry-create] error:', err.message);
+    appendActivityLog({ event: 'pr-create-failed', by: actor, country, error: err.message, attemptedAt: now }).catch(() => {});
+    res.status(500).json({
+      error:             err.message,
+      opsMessage:        'An unexpected error occurred during Retry Create. Entries remain in Buffer. No production changes were made.',
+      productionChanged: false,
+      entriesLocked:     false,
+      availableActions:  ['retryCreate', 'cancelAttempt', 'refreshStatus', 'viewErrorDetails']
+    });
   }
 });
 
