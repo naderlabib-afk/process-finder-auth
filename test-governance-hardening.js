@@ -1126,7 +1126,7 @@ function waitForPort(port, retries = 20, delay = 300) {
     assert('DUP-8  Update to another active issue blocked', rUpdateToDuplicate.status === 409,
       `status=${rUpdateToDuplicate.status} body=${JSON.stringify(rUpdateToDuplicate.json)}`);
 
-    section('DUP-9: Buffer edit changing Issue/Subject to duplicate blocked');
+    section('DUP-9: Buffer edit update changing Issue/Subject to duplicate blocked');
     resetMockState({
       'data/ops/buffer.json': {
         fr: {
@@ -1153,7 +1153,291 @@ function waitForPort(port, retries = 20, delay = 300) {
     assert('DUP-9  Buffer edit duplicate blocked', rBufferEditDup.status === 409,
       `status=${rBufferEditDup.status} body=${JSON.stringify(rBufferEditDup.json)}`);
 
-    section('DUP-10: Legacy update entry without originalProcessId is normalized from process.id');
+    section('DUP-10: Buffer edit create to duplicate production same-country blocked');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_create_001',
+              type: 'create',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_create_001', issue: 'TEMP DUP TEST 0507', category: 'Contract', machineType: '', process: 'draft create' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const editedCreateVsProd = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    editedCreateVsProd.fr['ol-a@ibm.com'][0].process.issue = 'PROD-FR-UNIQUE';
+    const rBufferCreateVsProd = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: editedCreateVsProd,
+      editEntryId: 'buf_create_001'
+    }, OL_A_TOKEN);
+    assert('DUP-10  Buffer create edit duplicate vs production blocked', rBufferCreateVsProd.status === 409,
+      `status=${rBufferCreateVsProd.status} body=${JSON.stringify(rBufferCreateVsProd.json)}`);
+
+    section('DUP-11: Buffer edit create to duplicate Buffer pending same-country blocked');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_create_001',
+              type: 'create',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_create_001', issue: 'TEMP DUP TEST 0507', category: 'Contract', machineType: '', process: 'draft create' },
+              createdAt: new Date().toISOString()
+            }
+          ],
+          'ol-b@ibm.com': [
+            {
+              id: 'fr_ol_b_001',
+              type: 'create',
+              user: 'ol-b@ibm.com',
+              status: 'pending',
+              process: { id: 'fr_ol_b_001', issue: 'OL-B-ISSUE', category: 'Contract', machineType: '', process: 'pending duplicate target' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const editedCreateVsPending = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    editedCreateVsPending.fr['ol-a@ibm.com'][0].process.issue = 'OL-B-ISSUE';
+    const rBufferCreateVsPending = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: editedCreateVsPending,
+      editEntryId: 'buf_create_001'
+    }, OL_A_TOKEN);
+    assert('DUP-11  Buffer create edit duplicate vs pending blocked', rBufferCreateVsPending.status === 409,
+      `status=${rBufferCreateVsPending.status} body=${JSON.stringify(rBufferCreateVsPending.json)}`);
+
+    section('DUP-12: Buffer edit create to duplicate Buffer validated same-country blocked');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_create_001',
+              type: 'create',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_create_001', issue: 'TEMP DUP TEST 0507', category: 'Contract', machineType: '', process: 'draft create' },
+              createdAt: new Date().toISOString()
+            },
+            {
+              id: 'fr_ol_a_001',
+              type: 'create',
+              user: 'ol-a@ibm.com',
+              status: 'validated',
+              process: { id: 'fr_ol_a_001', issue: 'OL-A-ISSUE', category: 'Contract', machineType: '', process: 'validated duplicate target' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const editedCreateVsValidated = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    editedCreateVsValidated.fr['ol-a@ibm.com'][0].process.issue = 'OL-A-ISSUE';
+    const rBufferCreateVsValidated = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: editedCreateVsValidated,
+      editEntryId: 'buf_create_001'
+    }, OL_A_TOKEN);
+    assert('DUP-12  Buffer create edit duplicate vs validated blocked', rBufferCreateVsValidated.status === 409,
+      `status=${rBufferCreateVsValidated.status} body=${JSON.stringify(rBufferCreateVsValidated.json)}`);
+
+    section('DUP-13: Buffer edit create to duplicate scheduled same-country blocked');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_create_001',
+              type: 'create',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_create_001', issue: 'TEMP DUP TEST 0507', category: 'Contract', machineType: '', process: 'draft create' },
+              createdAt: new Date().toISOString()
+            },
+            {
+              id: 'fr_sched_001',
+              type: 'create',
+              user: 'ol-a@ibm.com',
+              status: 'validated',
+              process: { id: 'fr_sched_001', issue: 'SCHEDULED-DUP', category: 'Contract', machineType: '', process: 'scheduled duplicate target' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      },
+      'data/ops/pr_schedule.json': {
+        fr: { country: 'fr', entry_ids: ['fr_sched_001'], created_by: 'ol-a@ibm.com', execute_after: new Date(Date.now() + 60000).toISOString() }
+      }
+    });
+    const editedCreateVsScheduled = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    editedCreateVsScheduled.fr['ol-a@ibm.com'][0].process.issue = 'SCHEDULED-DUP';
+    const rBufferCreateVsScheduled = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: editedCreateVsScheduled,
+      editEntryId: 'buf_create_001'
+    }, OL_A_TOKEN);
+    assert('DUP-13  Buffer create edit duplicate vs scheduled blocked', rBufferCreateVsScheduled.status === 409,
+      `status=${rBufferCreateVsScheduled.status} body=${JSON.stringify(rBufferCreateVsScheduled.json)}`);
+
+    section('DUP-14: Buffer edit create to duplicate active Publish Request blocked');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_create_001',
+              type: 'create',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_create_001', issue: 'TEMP DUP TEST 0507', category: 'Contract', machineType: '', process: 'draft create' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      },
+      'data/ops/history.json': {
+        fr: [
+          {
+            id: 'fr_pr_dup_001',
+            type: 'create',
+            user: 'manager-a@ibm.com',
+            pr_status: 'pending_merge',
+            prNumber: PR_NUM,
+            process: { id: 'fr_pr_dup_001', issue: 'PR-TEST', category: 'Contract', machineType: '', process: 'active pr duplicate target' }
+          }
+        ]
+      }
+    });
+    const editedCreateVsPR = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    editedCreateVsPR.fr['ol-a@ibm.com'][0].process.issue = 'PR-TEST';
+    const rBufferCreateVsPR = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: editedCreateVsPR,
+      editEntryId: 'buf_create_001'
+    }, OL_A_TOKEN);
+    assert('DUP-14  Buffer create edit duplicate vs active Publish Request blocked', rBufferCreateVsPR.status === 409,
+      `status=${rBufferCreateVsPR.status} body=${JSON.stringify(rBufferCreateVsPR.json)}`);
+
+    section('DUP-15: Buffer edit create same Issue/Subject in another country allowed');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_create_001',
+              type: 'create',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_create_001', issue: 'TEMP DUP TEST 0507', category: 'Contract', machineType: '', process: 'draft create' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      },
+      'data/processes/mea.json': {
+        processes: [
+          { id: 'prod_mea_dup_001', issue: 'MEA-UNIQUE', category: 'Contract', machineType: '', process: 'other country duplicate baseline' }
+        ]
+      }
+    });
+    const editedCreateOtherCountry = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    editedCreateOtherCountry.fr['ol-a@ibm.com'][0].process.issue = 'MEA-UNIQUE';
+    const rBufferCreateOtherCountry = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: editedCreateOtherCountry,
+      editEntryId: 'buf_create_001'
+    }, OL_A_TOKEN);
+    assert('DUP-15  Buffer create edit same issue in another country allowed', rBufferCreateOtherCountry.ok,
+      `status=${rBufferCreateOtherCountry.status} body=${JSON.stringify(rBufferCreateOtherCountry.json)}`);
+
+    section('DUP-16: Buffer edit create unique non-duplicate subject saves');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_create_001',
+              type: 'create',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_create_001', issue: 'TEMP DUP TEST 0507', category: 'Contract', machineType: '', process: 'draft create' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const editedCreateUnique = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    editedCreateUnique.fr['ol-a@ibm.com'][0].process.issue = 'UNIQUE-BUFFER-CREATE-EDIT';
+    const rBufferCreateUnique = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: editedCreateUnique,
+      editEntryId: 'buf_create_001'
+    }, OL_A_TOKEN);
+    assert('DUP-16  Buffer create edit unique issue saves', rBufferCreateUnique.ok,
+      `status=${rBufferCreateUnique.status} body=${JSON.stringify(rBufferCreateUnique.json)}`);
+    assert('DUP-16b edited create entry persisted unique issue',
+      mockState['data/ops/buffer.json']?.fr?.['ol-a@ibm.com']?.[0]?.process?.issue === 'UNIQUE-BUFFER-CREATE-EDIT', '');
+
+    section('DUP-17: Update same original process keeping own Issue/Subject allowed on Buffer edit');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_update_001',
+              type: 'update',
+              originalProcessId: 'prod_fr_001',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_update_001', originalProcessId: 'prod_fr_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'update keep own issue' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const editedUpdateOwn = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    editedUpdateOwn.fr['ol-a@ibm.com'][0].process.process = 'updated text';
+    const rBufferUpdateOwn = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: editedUpdateOwn,
+      editEntryId: 'buf_update_001'
+    }, OL_A_TOKEN);
+    assert('DUP-17  Buffer update edit keeping own issue allowed', rBufferUpdateOwn.ok,
+      `status=${rBufferUpdateOwn.status} body=${JSON.stringify(rBufferUpdateOwn.json)}`);
+
+    section('DUP-18: Update changing to another same-country Issue/Subject blocked on Buffer edit');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'buf_update_001',
+              type: 'update',
+              originalProcessId: 'prod_fr_002',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'buf_update_001', originalProcessId: 'prod_fr_002', issue: 'PROD-FR-KEEP', category: 'Contract', machineType: '', process: 'draft update' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const editedUpdateDuplicate = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    editedUpdateDuplicate.fr['ol-a@ibm.com'][0].process.issue = 'PROD-FR-UNIQUE';
+    const rBufferUpdateDuplicate = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: editedUpdateDuplicate,
+      editEntryId: 'buf_update_001'
+    }, OL_A_TOKEN);
+    assert('DUP-18  Buffer update edit to another active issue blocked', rBufferUpdateDuplicate.status === 409,
+      `status=${rBufferUpdateDuplicate.status} body=${JSON.stringify(rBufferUpdateDuplicate.json)}`);
+
+    section('DUP-19: Legacy update entry without originalProcessId is normalized from process.id');
     resetMockState({
       'data/ops/buffer.json': {
         fr: {
