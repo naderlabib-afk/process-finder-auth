@@ -850,10 +850,26 @@ function waitForPort(port, retries = 20, delay = 300) {
       'config/users.json': [
         { email: 'admin-a@ibm.com',  name: 'Admin A',   role: 'Admin',   countries: ['all'] },
         { email: 'ol-a@ibm.com',     name: 'OL A',      role: 'OL',      countries: ['fr'] },
-        { email: 'ol-mea@ibm.com',   name: 'OL MEA',    role: 'OL',      countries: ['mea'] }
-      ]
+        { email: 'ol-mea@ibm.com',   name: 'OL MEA',    role: 'OL',      countries: ['mea'] },
+        { email: 'ol-it@ibm.com',    name: 'OL IT',     role: 'OL',      countries: ['it'] },
+        { email: 'ol-es@ibm.com',    name: 'OL ES',     role: 'OL',      countries: ['es'] }
+      ],
+      'data/processes/it.json': {
+        lastUpdated: '2026-06-01T00:00:00.000Z',
+        processes: [
+          { id: 'prod_it_001', issue: 'IT-UNIQUE', category: 'Contract', machineType: '', process: 'italy production baseline' }
+        ]
+      },
+      'data/processes/es.json': {
+        lastUpdated: '2026-06-01T00:00:00.000Z',
+        processes: [
+          { id: 'prod_es_001', issue: 'ES-UNIQUE', category: 'Contract', machineType: '', process: 'spain production baseline' }
+        ]
+      }
     });
     const OL_MEA_TOKEN = mintJwt({ email: 'ol-mea@ibm.com', role: 'OL', iat: now, exp: now + 28800 });
+    const OL_IT_TOKEN = mintJwt({ email: 'ol-it@ibm.com', role: 'OL', iat: now, exp: now + 28800 });
+    const OL_ES_TOKEN = mintJwt({ email: 'ol-es@ibm.com', role: 'OL', iat: now, exp: now + 28800 });
     const rDupOtherCountry = await apiCall('POST', '/api/ops/buffer', {
       country: 'mea',
       type: 'create',
@@ -861,6 +877,234 @@ function waitForPort(port, retries = 20, delay = 300) {
     }, OL_MEA_TOKEN);
     assert('DUP-6  Same issue in different country allowed', rDupOtherCountry.ok,
       `status=${rDupOtherCountry.status} body=${JSON.stringify(rDupOtherCountry.json)}`);
+
+    section('COPY-DUP-1: Copy to target country without duplicate is allowed');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com',  name: 'Admin A',   role: 'Admin',   countries: ['all'] },
+        { email: 'ol-a@ibm.com',     name: 'OL A',      role: 'OL',      countries: ['fr'] },
+        { email: 'ol-it@ibm.com',    name: 'OL IT',     role: 'OL',      countries: ['it'] },
+        { email: 'ol-es@ibm.com',    name: 'OL ES',     role: 'OL',      countries: ['es'] }
+      ],
+      'data/processes/it.json': {
+        lastUpdated: '2026-06-01T00:00:00.000Z',
+        processes: [
+          { id: 'prod_it_001', issue: 'IT-UNIQUE', category: 'Contract', machineType: '', process: 'italy production baseline' }
+        ]
+      }
+    });
+    const rCopyAllowed = await apiCall('POST', '/api/ops/buffer', {
+      country: 'it',
+      type: 'create',
+      process: { id: 'copy_it_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'copied into italy' }
+    }, OL_IT_TOKEN);
+    assert('COPY-DUP-1  Copy create into duplicate-free target country allowed', rCopyAllowed.ok,
+      `status=${rCopyAllowed.status} body=${JSON.stringify(rCopyAllowed.json)}`);
+
+    section('COPY-DUP-2: Copy blocked when target country already has duplicate in production');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com',  name: 'Admin A',   role: 'Admin',   countries: ['all'] },
+        { email: 'ol-a@ibm.com',     name: 'OL A',      role: 'OL',      countries: ['fr'] },
+        { email: 'ol-it@ibm.com',    name: 'OL IT',     role: 'OL',      countries: ['it'] }
+      ],
+      'data/processes/it.json': {
+        lastUpdated: '2026-06-01T00:00:00.000Z',
+        processes: [
+          { id: 'prod_it_dup_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'italy duplicate in production' }
+        ]
+      }
+    });
+    const rCopyDupProd = await apiCall('POST', '/api/ops/buffer', {
+      country: 'it',
+      type: 'create',
+      process: { id: 'copy_it_dup_prod', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'copy blocked by italy prod' }
+    }, OL_IT_TOKEN);
+    assert('COPY-DUP-2  Copy duplicate against target production blocked', rCopyDupProd.status === 409,
+      `status=${rCopyDupProd.status} body=${JSON.stringify(rCopyDupProd.json)}`);
+
+    section('COPY-DUP-3: Copy blocked when target country has duplicate in Buffer pending');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com',  name: 'Admin A',   role: 'Admin',   countries: ['all'] },
+        { email: 'ol-it@ibm.com',    name: 'OL IT',     role: 'OL',      countries: ['it'] }
+      ],
+      'data/ops/buffer.json': {
+        it: {
+          'ol-it@ibm.com': [
+            {
+              id: 'it_pending_dup_001',
+              type: 'create',
+              user: 'ol-it@ibm.com',
+              status: 'pending',
+              process: { id: 'it_pending_proc_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'italy pending duplicate' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const rCopyDupPending = await apiCall('POST', '/api/ops/buffer', {
+      country: 'it',
+      type: 'create',
+      process: { id: 'copy_it_dup_pending', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'copy blocked by italy pending' }
+    }, OL_IT_TOKEN);
+    assert('COPY-DUP-3  Copy duplicate against target pending buffer blocked', rCopyDupPending.status === 409,
+      `status=${rCopyDupPending.status} body=${JSON.stringify(rCopyDupPending.json)}`);
+
+    section('COPY-DUP-4: Copy blocked when target country has duplicate in Buffer validated');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com',  name: 'Admin A',   role: 'Admin',   countries: ['all'] },
+        { email: 'ol-it@ibm.com',    name: 'OL IT',     role: 'OL',      countries: ['it'] }
+      ],
+      'data/ops/buffer.json': {
+        it: {
+          'ol-it@ibm.com': [
+            {
+              id: 'it_valid_dup_001',
+              type: 'create',
+              user: 'ol-it@ibm.com',
+              status: 'validated',
+              process: { id: 'it_valid_proc_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'italy validated duplicate' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const rCopyDupValidated = await apiCall('POST', '/api/ops/buffer', {
+      country: 'it',
+      type: 'create',
+      process: { id: 'copy_it_dup_validated', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'copy blocked by italy validated' }
+    }, OL_IT_TOKEN);
+    assert('COPY-DUP-4  Copy duplicate against target validated buffer blocked', rCopyDupValidated.status === 409,
+      `status=${rCopyDupValidated.status} body=${JSON.stringify(rCopyDupValidated.json)}`);
+
+    section('COPY-DUP-5: Copy blocked when target country has duplicate in scheduled Publish Request');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com',  name: 'Admin A',   role: 'Admin',   countries: ['all'] },
+        { email: 'ol-it@ibm.com',    name: 'OL IT',     role: 'OL',      countries: ['it'] }
+      ],
+      'data/ops/buffer.json': {
+        it: {
+          'ol-it@ibm.com': [
+            {
+              id: 'it_sched_dup_001',
+              type: 'create',
+              user: 'ol-it@ibm.com',
+              status: 'validated',
+              process: { id: 'it_sched_proc_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'italy scheduled duplicate' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      },
+      'data/ops/pr_schedule.json': {
+        it: { country: 'it', entry_ids: ['it_sched_dup_001'], created_by: 'ol-it@ibm.com', execute_after: new Date(Date.now() + 60000).toISOString() }
+      }
+    });
+    const rCopyDupScheduled = await apiCall('POST', '/api/ops/buffer', {
+      country: 'it',
+      type: 'create',
+      process: { id: 'copy_it_dup_sched', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'copy blocked by italy scheduled' }
+    }, OL_IT_TOKEN);
+    assert('COPY-DUP-5  Copy duplicate against target scheduled request blocked', rCopyDupScheduled.status === 409,
+      `status=${rCopyDupScheduled.status} body=${JSON.stringify(rCopyDupScheduled.json)}`);
+
+    section('COPY-DUP-6: Copy blocked when target country has duplicate in active Publish Request');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com',  name: 'Admin A',   role: 'Admin',   countries: ['all'] },
+        { email: 'ol-it@ibm.com',    name: 'OL IT',     role: 'OL',      countries: ['it'] }
+      ],
+      'data/ops/history.json': {
+        fr: [
+          {
+            id: 'hist_fr_001',
+            type: 'create',
+            user: 'manager-a@ibm.com',
+            pr_status: 'pending_merge',
+            prNumber: 77,
+            process: { id: 'hist_fr_proc_001', issue: 'PR-TEST', category: 'Contract', machineType: '', process: 'fr active pr baseline' }
+          }
+        ],
+        it: [
+          {
+            id: 'hist_it_001',
+            type: 'create',
+            user: 'ol-it@ibm.com',
+            pr_status: 'pending_merge',
+            prNumber: 88,
+            process: { id: 'hist_it_proc_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'italy active pr duplicate' }
+          }
+        ]
+      }
+    });
+    const rCopyDupActivePR = await apiCall('POST', '/api/ops/buffer', {
+      country: 'it',
+      type: 'create',
+      process: { id: 'copy_it_dup_pr', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'copy blocked by italy active pr' }
+    }, OL_IT_TOKEN);
+    assert('COPY-DUP-6  Copy duplicate against target active Publish Request blocked', rCopyDupActivePR.status === 409,
+      `status=${rCopyDupActivePR.status} body=${JSON.stringify(rCopyDupActivePR.json)}`);
+
+    section('COPY-DUP-7: Multi-target copy behavior remains country-scoped');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com',  name: 'Admin A',   role: 'Admin',   countries: ['all'] },
+        { email: 'ol-it@ibm.com',    name: 'OL IT',     role: 'OL',      countries: ['it'] },
+        { email: 'ol-es@ibm.com',    name: 'OL ES',     role: 'OL',      countries: ['es'] }
+      ],
+      'data/processes/it.json': {
+        lastUpdated: '2026-06-01T00:00:00.000Z',
+        processes: [
+          { id: 'prod_it_dup_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'italy duplicate in production' }
+        ]
+      },
+      'data/processes/es.json': {
+        lastUpdated: '2026-06-01T00:00:00.000Z',
+        processes: [
+          { id: 'prod_es_001', issue: 'ES-UNIQUE', category: 'Contract', machineType: '', process: 'spain production baseline' }
+        ]
+      }
+    });
+    const rCopyMultiBlocked = await apiCall('POST', '/api/ops/buffer', {
+      country: 'it',
+      type: 'create',
+      process: { id: 'copy_multi_it_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'copy multi blocked in italy' }
+    }, OL_IT_TOKEN);
+    const rCopyMultiAllowed = await apiCall('POST', '/api/ops/buffer', {
+      country: 'es',
+      type: 'create',
+      process: { id: 'copy_multi_es_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'copy multi allowed in spain' }
+    }, OL_ES_TOKEN);
+    assert('COPY-DUP-7  Multi-target blocked country stays blocked', rCopyMultiBlocked.status === 409,
+      `status=${rCopyMultiBlocked.status} body=${JSON.stringify(rCopyMultiBlocked.json)}`);
+    assert('COPY-DUP-7b Multi-target duplicate-free country succeeds', rCopyMultiAllowed.ok,
+      `status=${rCopyMultiAllowed.status} body=${JSON.stringify(rCopyMultiAllowed.json)}`);
+
+    section('COPY-DUP-8: Source-country duplicate alone does not block target-country copy');
+    resetMockState({
+      'config/users.json': [
+        { email: 'admin-a@ibm.com',  name: 'Admin A',   role: 'Admin',   countries: ['all'] },
+        { email: 'ol-it@ibm.com',    name: 'OL IT',     role: 'OL',      countries: ['it'] }
+      ],
+      'data/processes/it.json': {
+        lastUpdated: '2026-06-01T00:00:00.000Z',
+        processes: [
+          { id: 'prod_it_001', issue: 'IT-UNIQUE', category: 'Contract', machineType: '', process: 'italy production baseline' }
+        ]
+      }
+    });
+    const rCopySourceOnly = await apiCall('POST', '/api/ops/buffer', {
+      country: 'it',
+      type: 'create',
+      process: { id: 'copy_source_only_001', issue: 'PROD-FR-UNIQUE', category: 'Contract', machineType: '', process: 'copy allowed because only source country matches' }
+    }, OL_IT_TOKEN);
+    assert('COPY-DUP-8  Source-country duplicate alone does not block target', rCopySourceOnly.ok,
+      `status=${rCopySourceOnly.status} body=${JSON.stringify(rCopySourceOnly.json)}`);
 
     section('DUP-7: Update same process keeping same Issue/Subject allowed');
     resetMockState();
@@ -908,6 +1152,116 @@ function waitForPort(port, retries = 20, delay = 300) {
     }, OL_A_TOKEN);
     assert('DUP-9  Buffer edit duplicate blocked', rBufferEditDup.status === 409,
       `status=${rBufferEditDup.status} body=${JSON.stringify(rBufferEditDup.json)}`);
+
+    section('DUP-10: Legacy update entry without originalProcessId is normalized from process.id');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'legacy_update_001',
+              type: 'update',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'prod_fr_002', issue: 'PROD-FR-KEEP', category: 'Contract', machineType: '', process: 'legacy update draft' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const legacyUpdateBuffer = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    legacyUpdateBuffer.fr['ol-a@ibm.com'][0].process.issue = 'UNIQUE-LEGACY-UPDATE';
+    const rLegacyUpdateNorm = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: legacyUpdateBuffer,
+      editEntryId: 'legacy_update_001'
+    }, OL_A_TOKEN);
+    assert('DUP-10  Legacy update normalized successfully', rLegacyUpdateNorm.ok,
+      `status=${rLegacyUpdateNorm.status} body=${JSON.stringify(rLegacyUpdateNorm.json)}`);
+    assert('DUP-10b originalProcessId backfilled on entry',
+      mockState['data/ops/buffer.json']?.fr?.['ol-a@ibm.com']?.[0]?.originalProcessId === 'prod_fr_002', '');
+    assert('DUP-10c originalProcessId backfilled on process',
+      mockState['data/ops/buffer.json']?.fr?.['ol-a@ibm.com']?.[0]?.process?.originalProcessId === 'prod_fr_002', '');
+
+    section('DUP-11: Legacy delete entry without originalProcessId is normalized from process.id');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'legacy_delete_001',
+              type: 'delete',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'prod_fr_001', issue: 'PROD-FR-UNIQUE' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const legacyDeleteBuffer = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    const rLegacyDeleteNorm = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: legacyDeleteBuffer,
+      editEntryId: 'legacy_delete_001'
+    }, OL_A_TOKEN);
+    assert('DUP-11  Legacy delete normalized successfully', rLegacyDeleteNorm.ok,
+      `status=${rLegacyDeleteNorm.status} body=${JSON.stringify(rLegacyDeleteNorm.json)}`);
+    assert('DUP-11b originalProcessId backfilled on delete entry',
+      mockState['data/ops/buffer.json']?.fr?.['ol-a@ibm.com']?.[0]?.originalProcessId === 'prod_fr_001', '');
+
+    section('DUP-12: Create entry does not require originalProcessId');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'create_entry_001',
+              type: 'create',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { id: 'create_entry_001', issue: 'CREATE-UNIQUE', category: 'Contract', machineType: '', process: 'create draft' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const createBuffer = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    createBuffer.fr['ol-a@ibm.com'][0].process.issue = 'CREATE-UNIQUE-EDIT';
+    const rCreateNoOriginal = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: createBuffer,
+      editEntryId: 'create_entry_001'
+    }, OL_A_TOKEN);
+    assert('DUP-12  Create entry save does not require originalProcessId', rCreateNoOriginal.ok,
+      `status=${rCreateNoOriginal.status} body=${JSON.stringify(rCreateNoOriginal.json)}`);
+
+    section('DUP-13: Unresolvable existing workflow returns MISSING_ORIGINAL_PROCESS_ID details');
+    resetMockState({
+      'data/ops/buffer.json': {
+        fr: {
+          'ol-a@ibm.com': [
+            {
+              id: 'broken_update_001',
+              type: 'update',
+              user: 'ol-a@ibm.com',
+              status: 'pending',
+              process: { issue: 'BROKEN-UPDATE', category: 'Contract', machineType: '', process: 'broken draft' },
+              createdAt: new Date().toISOString()
+            }
+          ]
+        }
+      }
+    });
+    const brokenBuffer = JSON.parse(JSON.stringify(mockState['data/ops/buffer.json']));
+    const rBrokenIdentity = await apiCall('PUT', '/api/ops/buffer', {
+      buffer: brokenBuffer,
+      editEntryId: 'broken_update_001'
+    }, OL_A_TOKEN);
+    assert('DUP-13  Unresolvable workflow returns 400', rBrokenIdentity.status === 400,
+      `status=${rBrokenIdentity.status} body=${JSON.stringify(rBrokenIdentity.json)}`);
+    assert('DUP-13b returns MISSING_ORIGINAL_PROCESS_ID code', rBrokenIdentity.json?.code === 'MISSING_ORIGINAL_PROCESS_ID', '');
+    assert('DUP-13c diagnostic entryId included', rBrokenIdentity.json?.details?.entryId === 'broken_update_001', '');
 
     // ══════════════════════════════════════════════════════════════════════════
     // LOCK-1..7: Existing process workflow lock by originalProcessId
