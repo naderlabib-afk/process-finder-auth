@@ -1706,15 +1706,37 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
       const liveUserEntries = liveEntries[owner] || [];
       for (let index = 0; index < (entries || []).length; index++) {
         const entry = entries[index];
-        if (!entry?.process || entry.type === 'delete') continue;
-
         const liveEntry = liveUserEntries.find(e => e.id === entry.id) || null;
-        const originalProcessId = entry.originalProcessId || entry.process.originalProcessId || liveEntry?.originalProcessId || liveEntry?.process?.originalProcessId || null;
-        if ((entry.type === 'update' || liveEntry?.type === 'update' || entry.type === 'delete' || liveEntry?.type === 'delete') && !originalProcessId) {
-          return res.status(400).json({ error: 'originalProcessId must be preserved for existing process workflows.' });
+        const isExistingWorkflow = entry?.type === 'update' || liveEntry?.type === 'update' || entry?.type === 'delete' || liveEntry?.type === 'delete';
+        const originalProcessId = entry?.originalProcessId || entry?.process?.originalProcessId || liveEntry?.originalProcessId || liveEntry?.process?.originalProcessId || entry?.process?.id || liveEntry?.process?.id || null;
+        if (!entry?.process) continue;
+        if (isExistingWorkflow && !originalProcessId) {
+          return res.status(400).json({
+            error: 'originalProcessId must be preserved for existing process workflows.',
+            code: 'MISSING_ORIGINAL_PROCESS_ID',
+            details: {
+              country: ck,
+              owner,
+              entryId: entry.id,
+              type: entry.type || liveEntry?.type || null,
+              processId: entry.process?.id || liveEntry?.process?.id || null,
+              issue: entry.process?.issue || liveEntry?.process?.issue || null
+            }
+          });
         }
         if (liveEntry?.originalProcessId && originalProcessId !== liveEntry.originalProcessId) {
-          return res.status(400).json({ error: 'originalProcessId cannot be changed for an existing process workflow.' });
+          return res.status(400).json({
+            error: 'originalProcessId cannot be changed for an existing process workflow.',
+            code: 'CHANGED_ORIGINAL_PROCESS_ID',
+            details: {
+              country: ck,
+              owner,
+              entryId: entry.id,
+              type: entry.type || liveEntry?.type || null,
+              processId: entry.process?.id || liveEntry?.process?.id || null,
+              issue: entry.process?.issue || liveEntry?.process?.issue || null
+            }
+          });
         }
         if (entry.type === 'update') {
           const duplicate = await _findDuplicateIssueInCountry(ck, entry.process.issue, originalProcessId);
