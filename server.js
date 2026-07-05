@@ -1404,7 +1404,7 @@ function _buildDuplicateError(country, issue) {
   };
 }
 
-async function _findDuplicateIssueInCountry(country, issue, excludedIdentity = null) {
+async function _findDuplicateIssueInCountry(country, issue, excludedIdentity = null, excludedEntryId = null) {
   const normalizedIssue = _normalizeIssue(issue);
   if (!normalizedIssue) return null;
 
@@ -1416,6 +1416,7 @@ async function _findDuplicateIssueInCountry(country, issue, excludedIdentity = n
   ]);
 
   const excluded = excludedIdentity || null;
+  const excludedBufferEntryId = excludedEntryId || null;
   const matchesIdentity = candidate => excluded && candidate && candidate === excluded;
 
   for (const proc of (production?.data || [])) {
@@ -1429,6 +1430,7 @@ async function _findDuplicateIssueInCountry(country, issue, excludedIdentity = n
   for (const entries of Object.values(countryBuffer)) {
     for (const entry of (entries || [])) {
       if (_normalizeIssue(entry.process?.issue) !== normalizedIssue) continue;
+      if (excludedBufferEntryId && entry.id === excludedBufferEntryId) continue;
       const identity = _getDuplicateProcessIdentity(entry);
       if (matchesIdentity(identity)) continue;
       return {
@@ -1738,8 +1740,13 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
             }
           });
         }
-        if (entry.type === 'update') {
-          const duplicate = await _findDuplicateIssueInCountry(ck, entry.process.issue, originalProcessId);
+        if (entry.type === 'create' || entry.type === 'update') {
+          const duplicate = await _findDuplicateIssueInCountry(
+            ck,
+            entry.process.issue,
+            entry.type === 'update' ? originalProcessId : null,
+            entry.id || null
+          );
           if (duplicate) {
             return res.status(409).json({ ..._buildDuplicateError(ck, entry.process.issue), duplicate });
           }
