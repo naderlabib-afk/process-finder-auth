@@ -1483,40 +1483,6 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
     }
   }
 
-  // ── Item 2: Save-time duplicate issue check ──────────────────────────────────
-  // For create-type entries, block if the same issue already exists in:
-  //   a) the current production process file for this country, or
-  //   b) another buffer entry (any user) for this country.
-  // update/delete are exempt — they are acting on existing entries.
-  if (type === 'create' && process.issue) {
-    const norm = s => (s || '').toLowerCase().trim();
-    const targetIssue = norm(process.issue);
-
-    // Check existing buffer entries across all users for this country
-    const bufferDuplicate = Object.values(buffer[country] || {})
-      .flat()
-      .some(e => norm(e.process?.issue) === targetIssue);
-
-    if (bufferDuplicate) {
-      return res.status(409).json({
-        error: `An entry with issue "${process.issue}" already exists in the Buffer for ${country}. Duplicate submissions are not allowed.`,
-        duplicateIssue: process.issue
-      });
-    }
-
-    // Check production process file
-    const prodPath = `data/processes/${country}.json`;
-    const prod = await fetchGitHubJson(prodPath, { processes: [] });
-    const prodDuplicate = (prod.processes || []).some(p => norm(p.issue) === targetIssue);
-
-    if (prodDuplicate) {
-      return res.status(409).json({
-        error: `Process "${process.issue}" already exists in production for ${country}. Use type="update" to modify an existing process.`,
-        duplicateIssue: process.issue
-      });
-    }
-  }
-
   const entry = {
     id: process.id || `${country}_${Date.now()}`,
     type,
@@ -2599,18 +2565,6 @@ app.post('/api/admin/users', requireAuth, async (req, res) => {
         }
       }
     }
-  }
-
-  // ── Part A: Minimum Admin protection ─────────────────────────────────────
-  // At least one Admin must remain active after the batch completes.
-  // The acting Admin's own account is always present in working (self-remove
-  // is blocked above), so this catches attempts to remove or demote every
-  // other Admin while only one exists.
-  const remainingAdmins = working.filter(u => u.role === 'Admin');
-  if (remainingAdmins.length === 0) {
-    return res.status(400).json({
-      error: 'Operation blocked: at least one Admin must remain active. Add or promote another Admin before removing or demoting this one.'
-    });
   }
 
   await commitJsonToMainBranch('config/users.json', working, `admin: update users (${users.length} op(s)) by ${req.user.email}`);
