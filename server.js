@@ -5627,25 +5627,29 @@ function _generateImageId() {
  * Creates or overwrites the file at path with the given base64 content.
  */
 async function _uploadMediaToGitHub(filePath, base64Content, message) {
-  // Check if file already exists (need its SHA to update)
-  const existing = await getGitHubFileContent(filePath);
-  const sha = existing?.sha || undefined;
+  async function _putWithLatestSha() {
+    const existing = await getGitHubFileContent(filePath);
+    const sha = existing?.sha || undefined;
+    const body = {
+      message,
+      content: base64Content,
+      branch: GITHUB_BRANCH
+    };
+    if (sha) body.sha = sha;
+    return fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
+      {
+        method: 'PUT',
+        headers: ghHeaders(),
+        body: JSON.stringify(body)
+      }
+    );
+  }
 
-  const body = {
-    message,
-    content: base64Content,
-    branch: GITHUB_BRANCH
-  };
-  if (sha) body.sha = sha;
-
-  const res = await fetch(
-    `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
-    {
-      method: 'PUT',
-      headers: ghHeaders(),
-      body: JSON.stringify(body)
-    }
-  );
+  let res = await _putWithLatestSha();
+  if (res.status === 409) {
+    res = await _putWithLatestSha();
+  }
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
     throw new Error(`GitHub media upload failed (HTTP ${res.status}): ${errText}`);
