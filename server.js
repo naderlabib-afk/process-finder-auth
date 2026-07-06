@@ -1624,9 +1624,13 @@ const _SANITIZE_OPTIONS = {
   // (non-text subtree tags are handled via nonTextTags above)
   disallowedTagsMode: 'discard',
 
-  // Extra safety: strip data: and javascript: from any attribute value
+  // allowedSchemes applies to href/action only.
+  // img src is governed exclusively by transformTags.img + _safeMediaSrc above
+  // (allows assets/process-media/ relative paths; rejects data:, javascript:, external).
+  // Do NOT add 'src' here — sanitize-html's scheme filter would reject relative paths
+  // like assets/process-media/_staged/... even after transformTags validates them.
   allowedSchemes: ['http','https','mailto'],
-  allowedSchemesAppliedToAttributes: ['href','src','action'],
+  allowedSchemesAppliedToAttributes: ['href','action'],
   allowedSchemesAllowRelative: false,
 
   // Prevent URL encoding bypass
