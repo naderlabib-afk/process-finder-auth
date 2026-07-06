@@ -516,9 +516,22 @@ async function commitToGitHub(branchName, commits) {
  * Uses PUT /contents — creates the file if it doesn't exist, updates with sha if it does.
  */
 async function commitJsonToMainBranch(filePath, data, message, _retries = 3) {
+  const isUsersFile  = filePath === 'config/users.json';
+  const isBufferFile = filePath === 'data/ops/buffer.json';
   for (let attempt = 1; attempt <= _retries; attempt++) {
     try {
       const fileInfo = await getGitHubFileContent(filePath);
+      const shaBefore = fileInfo?.sha || '(none)';
+      if (isBufferFile) {
+        const entryId = message.match(/entry ([^ ]+)/)?.[1] || 'n/a';
+        console.log(`[TIMESTAMP] ${new Date().toISOString()}`);
+        console.log(`[OPERATION] ${message}`);
+        console.log(`[ENTRY ID] ${entryId}`);
+        console.log(`[SHA BEFORE] ${shaBefore}`);
+      }
+      if (isUsersFile) {
+        console.log(`[users.json] attempt ${attempt} — writing to branch "${GITHUB_BRANCH}" sha=${shaBefore} token_set=${!!GITHUB_TOKEN}`);
+      }
       const res = await fetch(
         `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
         {
@@ -532,10 +545,25 @@ async function commitJsonToMainBranch(filePath, data, message, _retries = 3) {
           })
         }
       );
-      if (res.ok) return true;
+      if (res.ok) {
+        if (isBufferFile) {
+          const okBody = await res.json().catch(() => null);
+          const shaAfter = okBody?.content?.sha || okBody?.commit?.sha || '(unknown)';
+          console.log(`[SHA AFTER] ${shaAfter}`);
+        }
+        if (isUsersFile) {
+          const okBody = await res.json().catch(() => null);
+          const shaAfter = okBody?.content?.sha || okBody?.commit?.sha || '(unknown)';
+          console.log(`[users.json] write OK — sha_after=${shaAfter}`);
+        }
+        return true;
+      }
       // 409/422 = SHA conflict — re-fetch and retry
       if (res.status === 409 || res.status === 422) {
         const body = await res.text().catch(() => '');
+        if (isBufferFile) {
+          console.log(`[SHA AFTER] CONFLICT ${res.status} ${body}`);
+        }
         console.warn(`[GitHub] commitJsonToMainBranch SHA conflict for "${filePath}" (attempt ${attempt}): ${res.status} ${body}`);
         if (attempt < _retries) {
           await new Promise(r => setTimeout(r, 300 * attempt)); // back-off
@@ -544,9 +572,15 @@ async function commitJsonToMainBranch(filePath, data, message, _retries = 3) {
       }
       const errBody = await res.text().catch(() => '');
       console.error(`[GitHub] commitJsonToMainBranch failed for "${filePath}": ${res.status} ${errBody}`);
+      if (isUsersFile) {
+        console.error(`[users.json] WRITE FAILED — http=${res.status} branch="${GITHUB_BRANCH}" token_set=${!!GITHUB_TOKEN} body=${errBody}`);
+      }
       return false;
     } catch (err) {
       console.error(`[GitHub] commitJsonToMainBranch threw for "${filePath}" (attempt ${attempt}):`, err.message);
+      if (isUsersFile) {
+        console.error(`[users.json] WRITE THREW — attempt=${attempt} error="${err.message}" token_set=${!!GITHUB_TOKEN}`);
+      }
       if (attempt < _retries) {
         await new Promise(r => setTimeout(r, 300 * attempt));
         continue;
@@ -1680,7 +1714,7 @@ const PROC_LOCK_TTL_MS        = 15 * 60 * 1000;
 const MIN_ADMIN_ERROR_MESSAGE = 'This change cannot be saved because Process Finder must always have at least one Admin. Assign another Admin first, then you may change this role.';
 
 function _normalizeIssue(issue) {
-  return String(issue || '').trim();
+  return String(issue || '').trim().toLowerCase();
 }
 
 function _getProcessLockKey(entryOrProcess) {
@@ -2836,7 +2870,22 @@ app.post('/api/admin/users', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'users array of operations required' });
   }
 
-  const before     = await fetchGitHubJson('config/users.json', []);
+  // Guard: verify GitHub is reachable before mutating anything.
+  // getGitHubFileContent returns null on any network/auth failure.
+  // If it returns null for a file we know exists, the token is missing or wrong.
+  if (!GITHUB_TOKEN) {
+    console.error('[users.json] WRITE BLOCKED — GITHUB_TOKEN is not set on this server.');
+    return res.status(503).json({ error: 'Server is not configured for GitHub writes — GITHUB_TOKEN missing. Contact the system administrator.' });
+  }
+
+  const before = await fetchGitHubJson('config/users.json', null);
+  if (before === null) {
+    // null means the GitHub read itself failed (auth error, network error, wrong repo).
+    // Do NOT proceed — writing would create a truncated file with only the new user.
+    console.error(`[users.json] READ FAILED before write — token_set=${!!GITHUB_TOKEN} branch="${GITHUB_BRANCH}" api="${GITHUB_API_BASE}"`);
+    return res.status(503).json({ error: 'Could not read current users from GitHub — write blocked to prevent data loss. Check GITHUB_TOKEN, GITHUB_BRANCH, and GITHUB_API_BASE in Render environment.' });
+  }
+
   const working    = before.map(u => ({ ...u }));
   const seenEmails = new Set(working.map(u => u.email.toLowerCase()));
   const batchSeen  = new Set();
@@ -3087,7 +3136,10 @@ app.post('/api/admin/users', requireAuth, async (req, res) => {
     });
   }
 
-  await commitJsonToMainBranch('config/users.json', working, `admin: update users (${users.length} op(s)) by ${req.user.email}`);
+  const usersWriteOk = await commitJsonToMainBranch('config/users.json', working, `admin: update users (${users.length} op(s)) by ${req.user.email}`);
+  if (!usersWriteOk) {
+    return res.status(503).json({ error: 'GitHub write failed — user change not persisted. Please retry.' });
+  }
 
   appendAdminAudit({
     action:  'users-updated',
@@ -3599,22 +3651,23 @@ async function _preflightAppendCheck(country, newEntries, activePR) {
   // Read the process JSON from the PR branch (authoritative) and build a Set of
   // existing issue/id values. Also cross-check against history pending_merge entries
   // for this PR (covers batches already moved from buffer).
+  const normI = s => (s || '').trim().toLowerCase();
   const newIssues = new Set(
-    newEntries.map(e => e.process?.issue || e.process?.id).filter(Boolean)
+    newEntries.map(e => normI(e.process?.issue || e.process?.id)).filter(Boolean)
   );
 
   // 5a. Check PR branch content
   const branchData = await _readProcessDataFromBranch(country, branchName);
   if (branchData) {
     const branchIssues = new Set(
-      branchData.data.map(p => p.issue || p.id).filter(Boolean)
+      branchData.data.map(p => normI(p.issue || p.id)).filter(Boolean)
     );
     // Compare against main branch to find net-new issues already on the PR branch
     // that weren't there before (i.e. added by previous batches).
     // We do this by comparing against main content.
     const mainData = await readProcessData(country);
     const mainIssues = new Set(
-      (mainData?.data || []).map(p => p.issue || p.id).filter(Boolean)
+      (mainData?.data || []).map(p => normI(p.issue || p.id)).filter(Boolean)
     );
     // Issues present on the PR branch but NOT on main were added by batch 1
     const addedByPR = new Set([...branchIssues].filter(i => !mainIssues.has(i)));
@@ -3624,15 +3677,15 @@ async function _preflightAppendCheck(country, newEntries, activePR) {
 
     const conflictCreate = newEntries.filter(e =>
       e.type === 'create' && (e.process?.issue || e.process?.id) &&
-      addedByPR.has(e.process?.issue || e.process?.id)
+      addedByPR.has(normI(e.process?.issue || e.process?.id))
     );
     const conflictDelete = newEntries.filter(e =>
       e.type === 'delete' && (e.process?.issue || e.process?.id) &&
-      deletedByPR.has(e.process?.issue || e.process?.id)
+      deletedByPR.has(normI(e.process?.issue || e.process?.id))
     );
     const conflictUpdate = newEntries.filter(e =>
       e.type === 'update' && (e.process?.issue || e.process?.id) &&
-      addedByPR.has(e.process?.issue || e.process?.id)
+      addedByPR.has(normI(e.process?.issue || e.process?.id))
     );
 
     const conflicts = [...conflictCreate, ...conflictDelete, ...conflictUpdate];
@@ -3652,7 +3705,7 @@ async function _preflightAppendCheck(country, newEntries, activePR) {
       h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
     );
     const historyIssues = new Set(
-      activePRHistory.map(h => h.process?.issue || h.process?.id).filter(Boolean)
+      activePRHistory.map(h => normI(h.process?.issue || h.process?.id)).filter(Boolean)
     );
     const histDuplicates = [...newIssues].filter(i => historyIssues.has(i));
     if (histDuplicates.length > 0) {
@@ -3906,8 +3959,9 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     const activePRHistory = (history[country] || []).filter(
       h => h.prNumber === activePR.prNumber && h.pr_status === 'pending_merge'
     );
+    const normSched = s => (s || '').trim().toLowerCase();
     const activePRIssues = new Set(
-      activePRHistory.map(h => h.process?.issue || h.process?.id).filter(Boolean)
+      activePRHistory.map(h => normSched(h.process?.issue || h.process?.id)).filter(Boolean)
     );
 
     // Source 2: any previously scheduled (but not yet executed) append batch for
@@ -3922,14 +3976,14 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
       Object.values(countryBufForCheck).flat()
         .filter(e => priorEntryIds.has(e.id))
         .forEach(e => {
-          const issue = e.process?.issue || e.process?.id;
+          const issue = normSched(e.process?.issue || e.process?.id);
           if (issue) activePRIssues.add(issue);
         });
     }
 
     const newValidated = scopedEntries.filter(e => e.status === 'validated');
     const duplicates   = newValidated.filter(e => {
-      const issue = e.process?.issue || e.process?.id;
+      const issue = normSched(e.process?.issue || e.process?.id);
       return issue && activePRIssues.has(issue);
     });
     if (duplicates.length > 0) {
@@ -5627,16 +5681,17 @@ function _generateImageId() {
  * Creates or overwrites the file at path with the given base64 content.
  */
 async function _uploadMediaToGitHub(filePath, base64Content, message) {
-  async function _putWithLatestSha() {
+  async function _putWithLatestSha(attempt) {
     const existing = await getGitHubFileContent(filePath);
     const sha = existing?.sha || undefined;
+    console.log(`[media upload] ${attempt} filePath=${filePath} sha=${sha || '(none)'}`);
     const body = {
       message,
       content: base64Content,
       branch: GITHUB_BRANCH
     };
     if (sha) body.sha = sha;
-    return fetch(
+    const res = await fetch(
       `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
       {
         method: 'PUT',
@@ -5644,17 +5699,21 @@ async function _uploadMediaToGitHub(filePath, base64Content, message) {
         body: JSON.stringify(body)
       }
     );
+    const errText = res.ok ? '' : await res.text().catch(() => '');
+    console.log(`[media upload] ${attempt} result status=${res.status} retryTriggered=${res.status === 409 ? 'yes' : 'no'}${errText ? ` body=${errText}` : ''}`);
+    return { res, sha, errText };
   }
 
-  let res = await _putWithLatestSha();
-  if (res.status === 409) {
-    res = await _putWithLatestSha();
+  const first = await _putWithLatestSha('first');
+  let final = first;
+  if (first.res.status === 409) {
+    const second = await _putWithLatestSha('retry');
+    final = second;
   }
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(`GitHub media upload failed (HTTP ${res.status}): ${errText}`);
+  if (!final.res.ok) {
+    throw new Error(`GitHub media upload failed (HTTP ${final.res.status}): ${final.errText}`);
   }
-  return res.json();
+  return final.res.json();
 }
 
 /**
@@ -6311,6 +6370,28 @@ if (require.main === module) app.listen(port, () => {
     : `[OPS] WARNING: GITHUB_TOKEN not configured — PR automation disabled`);
   if (GITHUB_TARGET_BRANCH !== 'main') {
     console.warn(`[OPS] WARNING: GITHUB_TARGET_BRANCH="${GITHUB_TARGET_BRANCH}", not "main". Set GITHUB_TARGET_BRANCH=main in Render for production — PRs are currently targeting the wrong branch.`);
+  }
+
+  // ── Startup GitHub connectivity self-test ────────────────────────────────
+  // Fires a single authenticated GET against config/users.json immediately on
+  // startup. The result appears in Render logs within the first few seconds and
+  // tells you exactly whether the token and repo config are correct, without
+  // waiting for a user to trigger a write.
+  if (GITHUB_TOKEN) {
+    setImmediate(async () => {
+      try {
+        const testFile = await getGitHubFileContent('config/users.json');
+        if (testFile && testFile.sha) {
+          console.log(`[STARTUP] GitHub connectivity OK — config/users.json sha=${testFile.sha} branch="${GITHUB_BRANCH}"`);
+        } else {
+          console.error(`[STARTUP] GitHub connectivity FAIL — config/users.json returned null. Check GITHUB_BRANCH="${GITHUB_BRANCH}", GITHUB_OWNER="${GITHUB_OWNER}", GITHUB_REPO="${GITHUB_REPO}".`);
+        }
+      } catch (err) {
+        console.error(`[STARTUP] GitHub connectivity ERROR — ${err.message}`);
+      }
+    });
+  } else {
+    console.error('[STARTUP] GITHUB_TOKEN is not set — all GitHub writes will be blocked. Set GITHUB_TOKEN in Render environment variables.');
   }
   if (DISABLE_PR_CREATION) {
     console.warn('[OPS] WARNING: DISABLE_PR_CREATION=true — all PR creation, branch creation, and buffer-to-history movements are disabled.');
