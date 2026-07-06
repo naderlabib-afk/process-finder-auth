@@ -2,12 +2,16 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
+const sharp = require('sharp');
+const multer = require('multer');
+const sanitizeHtml = require('sanitize-html');
 
 const app = express();
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header("Access-Control-Allow-Credentials", 'true');
 
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
@@ -41,7 +45,70 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('he
 const TOKEN_TTL = 8 * 60 * 60;
 
 app.use(bodyParser.json({ limit: '10mb' }));
+
+// ─── Media proxy: serve process images from GitHub ────────────────────────────
+//
+// Intercepts GET /assets/process-media/* before express.static so the browser
+// can load images that live on GitHub (not on the server's local disk).
+//
+// Access tiers:
+//   _staged/…  — requires a valid OPS JWT (pre-approval images, OPS-only)
+//   final/…    — public, no auth (published production images)
+//
+// Path governance: validated by _isAllowedPRPath() — the same allowlist used
+// by PR scope verification. Invalid paths are rejected with 400.
+// Cache-Control:
+//   staged → no-store (images may be cleaned up at any time)
+//   final  → 1-year immutable (UUID-named, content-addressed)
+//
+app.get('/assets/process-media/*', async (req, res) => {
+  const suffix   = req.params[0] || '';
+  const filePath = `assets/process-media/${suffix}`;
+
+  // 1. Validate path via existing governance allowlist
+  if (!_isAllowedPRPath(filePath)) {
+    return res.status(400).json({ error: 'Invalid media path' });
+  }
+
+  // 2. Staged images require an authenticated OPS session
+  if (_isStagedPath(filePath)) {
+    const authHeader = req.headers.authorization || '';
+    const cookieToken = (req.headers.cookie || '').match(/(?:^|;\s*)ops_session=([^;]+)/)?.[1] || '';
+    const rawToken    = authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : (authHeader || cookieToken);
+    const token = rawToken ? decodeURIComponent(rawToken) : '';
+    const check = token ? verifyJwt(token) : { ok: false };
+    if (!check.ok) {
+      return res.status(401).json({ error: 'Authentication required for staged media' });
+    }
+  }
+
+  // 3. Fetch raw bytes from GitHub
+  try {
+    const fileInfo = await getGitHubFileContent(filePath);
+    if (!fileInfo?.content) {
+      return res.status(404).send('Not found');
+    }
+    const buf = Buffer.from(fileInfo.content, 'base64');
+    res.set('Content-Type', 'image/webp');
+    res.set('Cache-Control', _isStagedPath(filePath)
+      ? 'no-store'
+      : 'public, max-age=31536000, immutable');
+    return res.send(buf);
+  } catch (err) {
+    console.warn('[media proxy] fetch failed:', filePath, err.message);
+    return res.status(502).json({ error: 'Media fetch failed' });
+  }
+});
+
 app.use(express.static(__dirname));
+
+// ─── Media upload: memory storage, 2MB raw limit (we validate 1MB after read) ──
+const _mediaUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 }
+});
 
 // ─── Minimal JWT helpers (no external dependency) ────────────────────────────
 function b64url(buf) {
@@ -244,10 +311,55 @@ async function _readProcessDataFromBranch(country, branchName) {
  * When GITHUB_TARGET_BRANCH === 'feature/pre-live' (legacy pre-live phase):
  *   data/processes/{country}.json  (still the same — we no longer use pre-live/ prefix)
  */
-const OPS_PR_ALLOWED_PATH_PREFIX = 'data/processes/';
+const OPS_PR_ALLOWED_PATH_PREFIX  = 'data/processes/';
 
+/**
+ * Validates whether a file path is allowed to appear in an OPS Publish Request.
+ *
+ * Allowed:
+ *   - data/processes/{country}.json
+ *   - assets/process-media/{country}/{processId}/{uuid}.webp  (final, post-promote)
+ *   - assets/process-media/_staged/{country}/{processId}/{uuid}.webp  (staged, pre-approve)
+ *
+ * Blocked:
+ *   - arbitrary assets/**
+ *   - non-WebP media outputs
+ *   - path traversal (..)
+ *   - unsupported extensions
+ *   - files outside governed country/process folders
+ */
 function _isAllowedPRPath(filePath) {
-  return typeof filePath === 'string' && filePath.startsWith(OPS_PR_ALLOWED_PATH_PREFIX);
+  if (typeof filePath !== 'string') return false;
+  // Process data files
+  if (filePath.startsWith(OPS_PR_ALLOWED_PATH_PREFIX)) {
+    // Must be data/processes/{country}.json (no subdirectories)
+    const rel = filePath.slice(OPS_PR_ALLOWED_PATH_PREFIX.length);
+    return /^[a-z0-9_-]+\.json$/.test(rel);
+  }
+  // Media files — only .webp, no path traversal, governed structure
+  if (!filePath.endsWith('.webp')) return false;
+  if (filePath.includes('..')) return false;
+  if (!/^[a-zA-Z0-9/_.\-]+$/.test(filePath)) return false;
+  // Final media: assets/process-media/{country}/{processId}/{uuid}.webp
+  // Staged media: assets/process-media/_staged/{country}/{processId}/{uuid}.webp
+  // Both accepted in PR (promote step may include both old staged and new final)
+  if (filePath.startsWith('assets/process-media/_staged/')) {
+    const rel = filePath.slice('assets/process-media/_staged/'.length);
+    const parts = rel.split('/');
+    return parts.length === 3 &&
+      /^[a-z0-9_-]+$/.test(parts[0]) &&    // country
+      /^[a-zA-Z0-9_-]+$/.test(parts[1]) &&  // processId
+      /^[a-f0-9-]{36}\.webp$/.test(parts[2]); // uuid.webp
+  }
+  if (filePath.startsWith('assets/process-media/')) {
+    const rel = filePath.slice('assets/process-media/'.length);
+    const parts = rel.split('/');
+    return parts.length === 3 &&
+      /^[a-z0-9_-]+$/.test(parts[0]) &&    // country
+      /^[a-zA-Z0-9_-]+$/.test(parts[1]) &&  // processId
+      /^[a-f0-9-]{36}\.webp$/.test(parts[2]); // uuid.webp
+  }
+  return false;
 }
 
 // ─── GitHub branch helpers ────────────────────────────────────────────────────
@@ -404,9 +516,22 @@ async function commitToGitHub(branchName, commits) {
  * Uses PUT /contents — creates the file if it doesn't exist, updates with sha if it does.
  */
 async function commitJsonToMainBranch(filePath, data, message, _retries = 3) {
+  const isUsersFile  = filePath === 'config/users.json';
+  const isBufferFile = filePath === 'data/ops/buffer.json';
   for (let attempt = 1; attempt <= _retries; attempt++) {
     try {
       const fileInfo = await getGitHubFileContent(filePath);
+      const shaBefore = fileInfo?.sha || '(none)';
+      if (isBufferFile) {
+        const entryId = message.match(/entry ([^ ]+)/)?.[1] || 'n/a';
+        console.log(`[TIMESTAMP] ${new Date().toISOString()}`);
+        console.log(`[OPERATION] ${message}`);
+        console.log(`[ENTRY ID] ${entryId}`);
+        console.log(`[SHA BEFORE] ${shaBefore}`);
+      }
+      if (isUsersFile) {
+        console.log(`[users.json] attempt ${attempt} — writing to branch "${GITHUB_BRANCH}" sha=${shaBefore} token_set=${!!GITHUB_TOKEN}`);
+      }
       const res = await fetch(
         `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
         {
@@ -420,10 +545,25 @@ async function commitJsonToMainBranch(filePath, data, message, _retries = 3) {
           })
         }
       );
-      if (res.ok) return true;
+      if (res.ok) {
+        if (isBufferFile) {
+          const okBody = await res.json().catch(() => null);
+          const shaAfter = okBody?.content?.sha || okBody?.commit?.sha || '(unknown)';
+          console.log(`[SHA AFTER] ${shaAfter}`);
+        }
+        if (isUsersFile) {
+          const okBody = await res.json().catch(() => null);
+          const shaAfter = okBody?.content?.sha || okBody?.commit?.sha || '(unknown)';
+          console.log(`[users.json] write OK — sha_after=${shaAfter}`);
+        }
+        return true;
+      }
       // 409/422 = SHA conflict — re-fetch and retry
       if (res.status === 409 || res.status === 422) {
         const body = await res.text().catch(() => '');
+        if (isBufferFile) {
+          console.log(`[SHA AFTER] CONFLICT ${res.status} ${body}`);
+        }
         console.warn(`[GitHub] commitJsonToMainBranch SHA conflict for "${filePath}" (attempt ${attempt}): ${res.status} ${body}`);
         if (attempt < _retries) {
           await new Promise(r => setTimeout(r, 300 * attempt)); // back-off
@@ -432,9 +572,15 @@ async function commitJsonToMainBranch(filePath, data, message, _retries = 3) {
       }
       const errBody = await res.text().catch(() => '');
       console.error(`[GitHub] commitJsonToMainBranch failed for "${filePath}": ${res.status} ${errBody}`);
+      if (isUsersFile) {
+        console.error(`[users.json] WRITE FAILED — http=${res.status} branch="${GITHUB_BRANCH}" token_set=${!!GITHUB_TOKEN} body=${errBody}`);
+      }
       return false;
     } catch (err) {
       console.error(`[GitHub] commitJsonToMainBranch threw for "${filePath}" (attempt ${attempt}):`, err.message);
+      if (isUsersFile) {
+        console.error(`[users.json] WRITE THREW — attempt=${attempt} error="${err.message}" token_set=${!!GITHUB_TOKEN}`);
+      }
       if (attempt < _retries) {
         await new Promise(r => setTimeout(r, 300 * attempt));
         continue;
@@ -1085,13 +1231,14 @@ app.post("/send-otp", async (req, res) => {
     // ── 6. Send email (or mock) ───────────────────────────────────────────────
     if (EMAIL_SEND_MODE === 'mock') {
       // Mock mode: log only — never calls Resend. Safe for local dev and tests.
-      // OTP code is intentionally NOT logged even in mock mode.
+      // Code is logged to console ONLY in mock mode so local validation can proceed.
       console.log(
         "[OTP MOCK SENT]", normalized,
         "from:", OTP_FROM_ADDRESS,
         "subject:", OTP_SUBJECT,
         "(mock — Resend not called)"
       );
+      console.log(`[OTP MOCK CODE] ${normalized} code: ${code}`);
     } else {
       // Real mode: call Resend API. from/subject are fixed constants — never
       // derived from request body or any user-supplied input.
@@ -1278,6 +1425,7 @@ app.post('/api/auth/session', async (req, res) => {
   const now = Math.floor(Date.now() / 1000);
   const token = signJwt({ email: user.email, role: user.role, iat: now, exp: now + TOKEN_TTL });
   console.log("[SESSION ISSUED]", user.email, user.role);
+  res.setHeader('Set-Cookie', `ops_session=${encodeURIComponent(token)}; Path=/; Max-Age=${TOKEN_TTL}; HttpOnly; SameSite=None; Secure`);
   res.json({ success: true, token, email: user.email, role: user.role });
 });
 
@@ -1353,9 +1501,166 @@ app.get('/api/ops/settings', requireAuth, async (req, res) => {
 
 // ─── OPS writes (authenticated) ───────────────────────────────────────────────
 
+// ─── Rich-content HTML sanitizer (parser-based via sanitize-html) ─────────────
+/**
+ * Server-side HTML sanitizer for process.process content.
+ * Uses the `sanitize-html` library (parser-based, not regex) for robust
+ * protection against malformed HTML, nested injection, uppercase/mixed-case
+ * tags, unquoted attributes, and adversarial input.
+ *
+ * Allowed tag set: p, br, strong, b, em, i, u, ul, ol, li, h2, h3,
+ *                  a (safe href only), img (internal media src only),
+ *                  blockquote, span, pre
+ *
+ * Blocked entirely (subtree removed): script, style, iframe, object, embed,
+ *   form, input, button, svg, math, link, base, noscript, template,
+ *   and ALL unknown tags (text content preserved for most; subtree removed
+ *   for the dangerous set above).
+ *
+ * img rules:
+ *   - src must start with assets/process-media/ or /assets/process-media/
+ *   - src must NOT be data:, javascript:, or any external URL
+ *   - Only allowed attrs: src, alt, data-width (200-800), loading
+ *   - loading is always forced to "lazy"
+ *
+ * a rules:
+ *   - href must be http:, https:, or mailto: only
+ *   - rel="noopener noreferrer" and target="_blank" always added
+ *
+ * All on* event attributes blocked globally.
+ * All style attributes blocked globally.
+ * Plain text (no leading '<') is returned unchanged — caller handles escaping.
+ */
+
+/**
+ * Validates an internal media src.
+ * Allows: assets/process-media/... or /assets/process-media/...
+ * Rejects: anything else (data:, http:, //, relative paths outside media).
+ */
+function _safeMediaSrc(src) {
+  if (!src || typeof src !== 'string') return null;
+  const s = src.trim();
+  // Reject any protocol-containing value
+  if (/^(javascript|data|vbscript):/i.test(s)) return null;
+  // Allow staged paths (during Buffer preview)
+  if (s.startsWith('assets/process-media/_staged/')) return s;
+  // Allow final paths (after approval)
+  if (s.startsWith('assets/process-media/')) return s;
+  // Allow root-relative forms
+  if (s.startsWith('/assets/process-media/')) return s;
+  return null;
+}
+
+/**
+ * The sanitize-html options object — defined once and reused.
+ * Parser-based: handles malformed HTML, uppercase tags, unquoted attrs, etc.
+ */
+const _SANITIZE_OPTIONS = {
+  // Tags whose entire subtree is removed (content not preserved)
+  nonTextTags: ['script','style','iframe','object','embed','form','input',
+                'button','svg','math','link','base','noscript','template'],
+
+  allowedTags: [
+    'p','br','strong','b','em','i','u',
+    'ul','ol','li',
+    'h2','h3',
+    'a','img',
+    'blockquote','span','pre'
+  ],
+
+  allowedAttributes: {
+    // img: only src, alt, data-width, loading — all others stripped
+    'img': ['src','alt','data-width','loading'],
+    // a: href, rel, target — rel and target are forced below
+    'a':   ['href','rel','target'],
+    // All other allowed tags: no attributes (strips class, id, style, on*)
+    '*':   []
+  },
+
+  // Validate img src: internal media paths only
+  allowedSchemesByTag: {
+    // a uses explicit transform below; img uses exclusiveFilter
+  },
+
+  // Force safe values on allowed attributes
+  transformTags: {
+    'a': (tagName, attribs) => {
+      const href = (attribs.href || '').trim();
+      const lh = href.toLowerCase();
+      const safeHref = (
+        lh.startsWith('http://') ||
+        lh.startsWith('https://') ||
+        lh.startsWith('mailto:')
+      ) ? href : '';
+      return {
+        tagName: 'a',
+        attribs: safeHref
+          ? { href: safeHref, rel: 'noopener noreferrer', target: '_blank' }
+          : { rel: 'noopener noreferrer' } // no href if unsafe
+      };
+    },
+    'img': (tagName, attribs) => {
+      const src = attribs.src || '';
+      const safeSrc = _safeMediaSrc(src);
+      if (!safeSrc) {
+        // Return an empty span — sanitize-html will render text only
+        return { tagName: false };
+      }
+      const w = parseInt(attribs['data-width'] || '', 10);
+      const safeW = (w >= 200 && w <= 800) ? w : null;
+      return {
+        tagName: 'img',
+        attribs: {
+          src: safeSrc,
+          ...(attribs.alt ? { alt: String(attribs.alt).replace(/"/g, '&quot;') } : {}),
+          ...(safeW ? { 'data-width': String(safeW) } : {}),
+          loading: 'lazy'
+        }
+      };
+    }
+  },
+
+  // disallowedTagsMode: 'discard' means unknown tags' text content is kept
+  // (non-text subtree tags are handled via nonTextTags above)
+  disallowedTagsMode: 'discard',
+
+  // Extra safety: strip data: and javascript: from any attribute value
+  allowedSchemes: ['http','https','mailto'],
+  allowedSchemesAppliedToAttributes: ['href','src','action'],
+  allowedSchemesAllowRelative: false,
+
+  // Prevent URL encoding bypass
+  parseStyleAttributes: false
+};
+
+/**
+ * Parser-based HTML sanitizer for process.process content.
+ * Uses sanitize-html (underlying htmlparser2) — handles malformed/adversarial HTML.
+ * Plain text (no leading '<') is returned unchanged.
+ */
+function sanitizeProcessHtml(html) {
+  if (!html || typeof html !== 'string') return '';
+  const t = html.trim();
+  if (!t) return '';
+  // Plain text — return as-is; callers handle escaping
+  if (!t.startsWith('<')) return html;
+  return sanitizeHtml(t, _SANITIZE_OPTIONS);
+}
+
+// Keep helpers accessible for tests
+function _safeLinkHref(href) {
+  if (!href) return null;
+  const h = href.trim().toLowerCase();
+  if (h.startsWith('http://') || h.startsWith('https://') || h.startsWith('mailto:')) {
+    return href.trim();
+  }
+  return null;
+}
+
 /**
  * Validates a single process entry object.
  * Returns null if valid, or an error string describing the first violation.
+ * Also sanitizes process.process HTML content in-place.
  */
 function validateProcessEntry(p) {
   if (!p || typeof p !== 'object') return 'process must be an object';
@@ -1374,6 +1679,32 @@ function validateProcessEntry(p) {
   if (p.id !== undefined && typeof p.id !== 'string') {
     return 'process.id must be a string';
   }
+  // Sanitize rich HTML content before accepting into Buffer
+  if (p.process && p.process.trim().startsWith('<')) {
+    p.process = sanitizeProcessHtml(p.process);
+    if (!p.process.trim()) {
+      return 'process.process content was fully stripped by sanitization — unsafe content detected';
+    }
+
+    // MOD-5: backend enforcement — max 3 images per process (matches MEDIA_MAX_IMAGES_PER_PROCESS)
+    const _imgRe = /<img\b[^>]*>/gi;
+    const imgMatches = p.process.match(_imgRe) || [];
+    if (imgMatches.length > 3) {
+      return `Maximum 3 images allowed per process (${imgMatches.length} found after sanitization)`;
+    }
+
+    // MOD-5: backend enforcement — no external or data: image srcs allowed
+    // After sanitization, all img tags must have internal assets/process-media/ src only.
+    // This catches any smuggled external src that survived the sanitizer (belt-and-suspenders).
+    const _srcRe = /<img\b[^>]*\bsrc="([^"]*)"[^>]*>/gi;
+    let m;
+    while ((m = _srcRe.exec(p.process)) !== null) {
+      const src = m[1];
+      if (!src.startsWith('assets/process-media/') && !src.startsWith('/assets/process-media/')) {
+        return `Invalid image source detected — only internal media paths are allowed (found: ${src.slice(0, 80)})`;
+      }
+    }
+  }
   return null;
 }
 
@@ -1383,7 +1714,7 @@ const PROC_LOCK_TTL_MS        = 15 * 60 * 1000;
 const MIN_ADMIN_ERROR_MESSAGE = 'This change cannot be saved because Process Finder must always have at least one Admin. Assign another Admin first, then you may change this role.';
 
 function _normalizeIssue(issue) {
-  return String(issue || '').trim();
+  return String(issue || '').trim().toLowerCase();
 }
 
 function _getProcessLockKey(entryOrProcess) {
@@ -2539,7 +2870,22 @@ app.post('/api/admin/users', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'users array of operations required' });
   }
 
-  const before     = await fetchGitHubJson('config/users.json', []);
+  // Guard: verify GitHub is reachable before mutating anything.
+  // getGitHubFileContent returns null on any network/auth failure.
+  // If it returns null for a file we know exists, the token is missing or wrong.
+  if (!GITHUB_TOKEN) {
+    console.error('[users.json] WRITE BLOCKED — GITHUB_TOKEN is not set on this server.');
+    return res.status(503).json({ error: 'Server is not configured for GitHub writes — GITHUB_TOKEN missing. Contact the system administrator.' });
+  }
+
+  const before = await fetchGitHubJson('config/users.json', null);
+  if (before === null) {
+    // null means the GitHub read itself failed (auth error, network error, wrong repo).
+    // Do NOT proceed — writing would create a truncated file with only the new user.
+    console.error(`[users.json] READ FAILED before write — token_set=${!!GITHUB_TOKEN} branch="${GITHUB_BRANCH}" api="${GITHUB_API_BASE}"`);
+    return res.status(503).json({ error: 'Could not read current users from GitHub — write blocked to prevent data loss. Check GITHUB_TOKEN, GITHUB_BRANCH, and GITHUB_API_BASE in Render environment.' });
+  }
+
   const working    = before.map(u => ({ ...u }));
   const seenEmails = new Set(working.map(u => u.email.toLowerCase()));
   const batchSeen  = new Set();
@@ -2790,7 +3136,10 @@ app.post('/api/admin/users', requireAuth, async (req, res) => {
     });
   }
 
-  await commitJsonToMainBranch('config/users.json', working, `admin: update users (${users.length} op(s)) by ${req.user.email}`);
+  const usersWriteOk = await commitJsonToMainBranch('config/users.json', working, `admin: update users (${users.length} op(s)) by ${req.user.email}`);
+  if (!usersWriteOk) {
+    return res.status(503).json({ error: 'GitHub write failed — user change not persisted. Please retry.' });
+  }
 
   appendAdminAudit({
     action:  'users-updated',
@@ -3302,22 +3651,23 @@ async function _preflightAppendCheck(country, newEntries, activePR) {
   // Read the process JSON from the PR branch (authoritative) and build a Set of
   // existing issue/id values. Also cross-check against history pending_merge entries
   // for this PR (covers batches already moved from buffer).
+  const normI = s => (s || '').trim().toLowerCase();
   const newIssues = new Set(
-    newEntries.map(e => e.process?.issue || e.process?.id).filter(Boolean)
+    newEntries.map(e => normI(e.process?.issue || e.process?.id)).filter(Boolean)
   );
 
   // 5a. Check PR branch content
   const branchData = await _readProcessDataFromBranch(country, branchName);
   if (branchData) {
     const branchIssues = new Set(
-      branchData.data.map(p => p.issue || p.id).filter(Boolean)
+      branchData.data.map(p => normI(p.issue || p.id)).filter(Boolean)
     );
     // Compare against main branch to find net-new issues already on the PR branch
     // that weren't there before (i.e. added by previous batches).
     // We do this by comparing against main content.
     const mainData = await readProcessData(country);
     const mainIssues = new Set(
-      (mainData?.data || []).map(p => p.issue || p.id).filter(Boolean)
+      (mainData?.data || []).map(p => normI(p.issue || p.id)).filter(Boolean)
     );
     // Issues present on the PR branch but NOT on main were added by batch 1
     const addedByPR = new Set([...branchIssues].filter(i => !mainIssues.has(i)));
@@ -3327,15 +3677,15 @@ async function _preflightAppendCheck(country, newEntries, activePR) {
 
     const conflictCreate = newEntries.filter(e =>
       e.type === 'create' && (e.process?.issue || e.process?.id) &&
-      addedByPR.has(e.process?.issue || e.process?.id)
+      addedByPR.has(normI(e.process?.issue || e.process?.id))
     );
     const conflictDelete = newEntries.filter(e =>
       e.type === 'delete' && (e.process?.issue || e.process?.id) &&
-      deletedByPR.has(e.process?.issue || e.process?.id)
+      deletedByPR.has(normI(e.process?.issue || e.process?.id))
     );
     const conflictUpdate = newEntries.filter(e =>
       e.type === 'update' && (e.process?.issue || e.process?.id) &&
-      addedByPR.has(e.process?.issue || e.process?.id)
+      addedByPR.has(normI(e.process?.issue || e.process?.id))
     );
 
     const conflicts = [...conflictCreate, ...conflictDelete, ...conflictUpdate];
@@ -3355,7 +3705,7 @@ async function _preflightAppendCheck(country, newEntries, activePR) {
       h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
     );
     const historyIssues = new Set(
-      activePRHistory.map(h => h.process?.issue || h.process?.id).filter(Boolean)
+      activePRHistory.map(h => normI(h.process?.issue || h.process?.id)).filter(Boolean)
     );
     const histDuplicates = [...newIssues].filter(i => historyIssues.has(i));
     if (histDuplicates.length > 0) {
@@ -3609,8 +3959,9 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     const activePRHistory = (history[country] || []).filter(
       h => h.prNumber === activePR.prNumber && h.pr_status === 'pending_merge'
     );
+    const normSched = s => (s || '').trim().toLowerCase();
     const activePRIssues = new Set(
-      activePRHistory.map(h => h.process?.issue || h.process?.id).filter(Boolean)
+      activePRHistory.map(h => normSched(h.process?.issue || h.process?.id)).filter(Boolean)
     );
 
     // Source 2: any previously scheduled (but not yet executed) append batch for
@@ -3625,14 +3976,14 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
       Object.values(countryBufForCheck).flat()
         .filter(e => priorEntryIds.has(e.id))
         .forEach(e => {
-          const issue = e.process?.issue || e.process?.id;
+          const issue = normSched(e.process?.issue || e.process?.id);
           if (issue) activePRIssues.add(issue);
         });
     }
 
     const newValidated = scopedEntries.filter(e => e.status === 'validated');
     const duplicates   = newValidated.filter(e => {
-      const issue = e.process?.issue || e.process?.id;
+      const issue = normSched(e.process?.issue || e.process?.id);
       return issue && activePRIssues.has(issue);
     });
     if (duplicates.length > 0) {
@@ -4297,6 +4648,70 @@ app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
       `ops: mark ${country} PR #${prNumber} as merged — approved by ${approver}`
     );
 
+    // ── J2/J3: Media lifecycle hooks (fire-and-forget after successful merge) ────
+    // These run asynchronously and never block or fail the approve response.
+    setImmediate(async () => {
+      try {
+        // Step 1: Promote staged media → final paths for all merged entries
+        const promoteResult = await _promoteStagedMedia(country, matchingEntries);
+        if (promoteResult.promoted.length > 0) {
+          // Step 2: Rewrite production process data with final paths
+          const pathMap = {};
+          promoteResult.promoted.forEach(({ staged, final }) => { pathMap[staged] = final; });
+          await _rewriteProductionMediaPaths(country, pathMap);
+          // Step 3: Update history JSON with rewritten HTML (matchingEntries mutated in-place)
+          const historyPost = await fetchGitHubJson('data/ops/history.json', {});
+          if (historyPost[country]) {
+            matchingEntries.forEach(updated => {
+              const idx = historyPost[country].findIndex(h => h.id === updated.id);
+              if (idx !== -1) historyPost[country][idx] = updated;
+            });
+            await commitJsonToMainBranch('data/ops/history.json', historyPost,
+              `ops: rewrite staged→final media refs after PR #${prNumber} approved`
+            ).catch(e => console.warn('[media promote] history rewrite failed:', e.message));
+          }
+          appendActivityLog({
+            event: 'media-promoted', by: approver, country, prNumber,
+            promoted: promoteResult.promoted.length,
+            failed:   promoteResult.failed.length,
+            rewroteEntries: promoteResult.rewroteEntries
+          }).catch(() => {});
+        }
+        if (promoteResult.failed.length > 0) {
+          console.warn(`[Admin approve] media promote had ${promoteResult.failed.length} failure(s) for PR #${prNumber}`);
+        }
+        // Step 4: Cleanup removed images from update entries (J3)
+        const updateEntries = matchingEntries.filter(h => h.type === 'update');
+        if (updateEntries.length > 0) {
+          const modifyCleanup = await _cleanupRemovedImagesAfterApproval(country, updateEntries);
+          if (modifyCleanup.deleted.length > 0 || modifyCleanup.errors.length > 0) {
+            appendActivityLog({
+              event: 'media-cleanup-after-approve-modify', by: approver, country, prNumber,
+              deleted: modifyCleanup.deleted.length, kept: modifyCleanup.kept.length,
+              errors: modifyCleanup.errors
+            }).catch(() => {});
+          }
+        }
+        // Step 5: Cleanup images from deleted processes (J2)
+        const deleteEntries = matchingEntries.filter(h => h.type === 'delete');
+        if (deleteEntries.length > 0) {
+          const deleteCleanup = await _cleanupDeletedProcessImages(country, deleteEntries);
+          if (deleteCleanup.deleted.length > 0 || deleteCleanup.errors.length > 0) {
+            appendActivityLog({
+              event: 'media-cleanup-after-approve-delete', by: approver, country, prNumber,
+              deleted: deleteCleanup.deleted.length, kept: deleteCleanup.kept.length,
+              errors: deleteCleanup.errors
+            }).catch(() => {});
+          }
+        }
+      } catch (mediaErr) {
+        console.error('[Admin approve] media lifecycle error (non-blocking):', mediaErr.message);
+        appendActivityLog({
+          event: 'media-lifecycle-error', by: approver, country, prNumber, error: mediaErr.message
+        }).catch(() => {});
+      }
+    });
+
     // ── Write Logs audit record ───────────────────────────────────────────────
     appendActivityLog({
       event:       'request-approved',
@@ -4458,6 +4873,26 @@ app.post('/api/admin/pr/close', requireAuth, async (req, res) => {
       'data/ops/history.json', historyPre,
       `ops: mark ${country} PR #${prNumber} as refused — rejected by ${rejecter}`
     );
+
+    // ── J1: Cleanup staged media after PR rejection (fire-and-forget) ────────
+    setImmediate(async () => {
+      try {
+        const rejectCleanup = await _cleanupRejectedStagedMedia(country, matchingEntries);
+        if (rejectCleanup.deleted.length > 0 || rejectCleanup.errors.length > 0) {
+          appendActivityLog({
+            event:   'media-cleanup-after-reject',
+            by:      rejecter,
+            country,
+            prNumber,
+            deleted: rejectCleanup.deleted.length,
+            kept:    rejectCleanup.kept.length,
+            errors:  rejectCleanup.errors
+          }).catch(() => {});
+        }
+      } catch (mediaErr) {
+        console.error('[Admin reject] media cleanup error (non-blocking):', mediaErr.message);
+      }
+    });
 
     // ── Write Logs audit record ───────────────────────────────────────────────
     appendActivityLog({
@@ -5122,9 +5557,812 @@ async function _maybeTriggerScheduledPRs() {
   );
 }
 
+// ─── Rich Process Content V1: Staged/Final Media Model ───────────────────────
+//
+// Upload path:   assets/process-media/_staged/{country}/{processId}/{uuid}.webp
+// Final path:    assets/process-media/{country}/{processId}/{uuid}.webp
+//
+// Lifecycle:
+//   1. OPS user uploads image → stored at _staged path on main branch
+//   2. Buffer entry references staged src in its process HTML
+//   3. On PR approve (merge): staged files are copied to final paths,
+//      process HTML src refs are rewritten to final paths, staged files deleted
+//   4. On PR reject:  staged files (those no longer referenced) are cleaned up
+//   5. On Buffer cancel: staged files introduced only by that entry are cleaned up
+//
+// This ensures no unapproved media is ever committed to a non-staged final path.
+
+/**
+ * Governance constants for media uploads.
+ */
+const MEDIA_MAX_SIZE_BYTES        = 1 * 1024 * 1024; // 1 MB raw upload limit
+const MEDIA_MAX_STORED_WIDTH      = 1200;             // px — stored width after processing
+const MEDIA_MAX_DISPLAY_WIDTH     = 800;              // px — enforced by sanitizer
+const MEDIA_DEFAULT_DISPLAY_WIDTH = 600;              // px — default display width
+const MEDIA_MIN_DISPLAY_WIDTH     = 200;              // px — minimum display width
+const MEDIA_MAX_IMAGES_PER_PROCESS = 3;               // max images per process
+const MEDIA_ALLOWED_MIME = new Set(['image/png','image/jpeg','image/webp']);
+const MEDIA_ALLOWED_EXT  = new Set(['.png','.jpg','.jpeg','.webp']);
+
+// Path prefixes
+const MEDIA_STAGED_PREFIX = 'assets/process-media/_staged/';
+const MEDIA_FINAL_PREFIX  = 'assets/process-media/';
+
+/**
+ * Validates that `imagePath` is a safe path under assets/process-media/.
+ * Accepts both staged (_staged/) and final paths.
+ * Prevents path traversal and unsafe characters.
+ */
+function _isValidMediaPath(imagePath) {
+  if (!imagePath || typeof imagePath !== 'string') return false;
+  if (!imagePath.startsWith('assets/process-media/')) return false;
+  // No traversal
+  if (imagePath.includes('..')) return false;
+  // Only safe chars: letters, digits, /, -, _, .
+  if (!/^[a-zA-Z0-9/_.\-]+$/.test(imagePath)) return false;
+  // Must end in .webp (only stored format)
+  if (!imagePath.endsWith('.webp')) return false;
+  return true;
+}
+
+/**
+ * Check whether a media path is in the staging area (_staged/ prefix).
+ */
+function _isStagedPath(mediaPath) {
+  return typeof mediaPath === 'string' && mediaPath.startsWith(MEDIA_STAGED_PREFIX);
+}
+
+/**
+ * Check whether a media path is in the final (approved) area.
+ * Final paths: assets/process-media/{country}/... (not _staged/)
+ */
+function _isFinalPath(mediaPath) {
+  return typeof mediaPath === 'string' &&
+    mediaPath.startsWith(MEDIA_FINAL_PREFIX) &&
+    !mediaPath.startsWith(MEDIA_STAGED_PREFIX);
+}
+
+/**
+ * Validate a final (non-staged) media path structure.
+ * Pattern: assets/process-media/{country}/{processId}/{uuid}.webp
+ * where country = [a-z0-9_-]+, processId = [a-zA-Z0-9_-]+, uuid = valid uuid.webp
+ */
+function _isValidFinalMediaPath(p) {
+  if (!_isValidMediaPath(p)) return false;
+  if (_isStagedPath(p)) return false;
+  // Must be exactly assets/process-media/{country}/{processId}/{uuid}.webp — 4 segments
+  const rel = p.slice(MEDIA_FINAL_PREFIX.length); // country/processId/uuid.webp
+  const parts = rel.split('/');
+  if (parts.length !== 3) return false;
+  const [country, processId, file] = parts;
+  if (!country || !/^[a-z0-9_-]+$/.test(country)) return false;
+  if (!processId || !/^[a-zA-Z0-9_-]+$/.test(processId)) return false;
+  if (!file || !file.endsWith('.webp') || file.length < 40) return false; // uuid is 36 chars + .webp
+  return true;
+}
+
+/**
+ * Validate a staged media path structure.
+ * Pattern: assets/process-media/_staged/{country}/{processId}/{uuid}.webp
+ */
+function _isValidStagedMediaPath(p) {
+  if (!_isValidMediaPath(p)) return false;
+  if (!_isStagedPath(p)) return false;
+  const rel = p.slice(MEDIA_STAGED_PREFIX.length); // country/processId/uuid.webp
+  const parts = rel.split('/');
+  if (parts.length !== 3) return false;
+  const [country, processId, file] = parts;
+  if (!country || !/^[a-z0-9_-]+$/.test(country)) return false;
+  if (!processId || !/^[a-zA-Z0-9_-]+$/.test(processId)) return false;
+  if (!file || !file.endsWith('.webp') || file.length < 40) return false;
+  return true;
+}
+
+/**
+ * Convert a staged path to its final (approved) path equivalent.
+ * assets/process-media/_staged/{country}/{processId}/{uuid}.webp
+ *   → assets/process-media/{country}/{processId}/{uuid}.webp
+ */
+function _stagedToFinalPath(stagedPath) {
+  if (!_isStagedPath(stagedPath)) return stagedPath;
+  return MEDIA_FINAL_PREFIX + stagedPath.slice(MEDIA_STAGED_PREFIX.length);
+}
+
+/**
+ * Generate a deterministic image filename: {uuid}.webp
+ * Using crypto.randomUUID() — no original filename stored.
+ */
+function _generateImageId() {
+  return `${crypto.randomUUID()}.webp`;
+}
+
+/**
+ * Upload a GitHub binary (base64) file using the Contents API.
+ * Creates or overwrites the file at path with the given base64 content.
+ */
+async function _uploadMediaToGitHub(filePath, base64Content, message) {
+  async function _putWithLatestSha(attempt) {
+    const existing = await getGitHubFileContent(filePath);
+    const sha = existing?.sha || undefined;
+    console.log(`[media upload] ${attempt} filePath=${filePath} sha=${sha || '(none)'}`);
+    const body = {
+      message,
+      content: base64Content,
+      branch: GITHUB_BRANCH
+    };
+    if (sha) body.sha = sha;
+    const res = await fetch(
+      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
+      {
+        method: 'PUT',
+        headers: ghHeaders(),
+        body: JSON.stringify(body)
+      }
+    );
+    const errText = res.ok ? '' : await res.text().catch(() => '');
+    console.log(`[media upload] ${attempt} result status=${res.status} retryTriggered=${res.status === 409 ? 'yes' : 'no'}${errText ? ` body=${errText}` : ''}`);
+    return { res, sha, errText };
+  }
+
+  const first = await _putWithLatestSha('first');
+  let final = first;
+  if (first.res.status === 409) {
+    const second = await _putWithLatestSha('retry');
+    final = second;
+  }
+  if (!final.res.ok) {
+    throw new Error(`GitHub media upload failed (HTTP ${final.res.status}): ${final.errText}`);
+  }
+  return final.res.json();
+}
+
+/**
+ * Delete a file from GitHub using the Contents API.
+ * Returns true on success, false if file not found or delete failed.
+ */
+async function _deleteMediaFromGitHub(filePath, reason) {
+  const existing = await getGitHubFileContent(filePath);
+  if (!existing?.sha) return false; // already gone
+
+  const res = await fetch(
+    `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`,
+    {
+      method: 'DELETE',
+      headers: ghHeaders(),
+      body: JSON.stringify({
+        message: `ops: delete media ${filePath} — ${reason}`,
+        sha: existing.sha,
+        branch: GITHUB_BRANCH
+      })
+    }
+  );
+  return res.ok;
+}
+
+/**
+ * Collects all img src references from a process.process HTML string.
+ */
+function _extractMediaRefs(processHtml) {
+  if (!processHtml || typeof processHtml !== 'string') return new Set();
+  const refs = new Set();
+  const re = /src="(assets\/process-media\/[^"]+)"/gi;
+  let m;
+  while ((m = re.exec(processHtml)) !== null) refs.add(m[1]);
+  return refs;
+}
+
+/**
+ * Check if a media path is still referenced by any production process,
+ * active buffer entry, or history entry. Returns true if referenced (must NOT delete).
+ * @param {string}  mediaPath           - exact path to check
+ * @param {string}  [excludeProcessId]  - skip this process ID when scanning production
+ * @param {string}  [excludeBufferEntryId] - skip this buffer entry ID when scanning buffer
+ */
+async function _isMediaReferenced(mediaPath, excludeProcessId = null, excludeBufferEntryId = null) {
+  // 1. Production processes (all countries — media paths are globally unique by UUID)
+  const allCountriesRes = await fetchGitHubJson('config/countries.json', []);
+  for (const c of allCountriesRes) {
+    const pd = await readProcessData(c.key);
+    if (!pd) continue;
+    for (const p of pd.data) {
+      if (excludeProcessId && p.id === excludeProcessId) continue;
+      if (_extractMediaRefs(p.process).has(mediaPath)) return true;
+    }
+  }
+
+  // 2. Active buffer entries (all countries)
+  const buffer = await fetchGitHubJson('data/ops/buffer.json', {});
+  for (const ck of Object.keys(buffer)) {
+    for (const userEntries of Object.values(buffer[ck] || {})) {
+      for (const entry of (userEntries || [])) {
+        if (excludeBufferEntryId && entry.id === excludeBufferEntryId) continue;
+        if (entry.type !== 'delete' && _extractMediaRefs(entry.process?.process).has(mediaPath)) {
+          return true;
+        }
+      }
+    }
+  }
+
+  // 3. History entries (pending_merge and merged) — media from recently approved processes
+  const history = await fetchGitHubJson('data/ops/history.json', {});
+  for (const ck of Object.keys(history)) {
+    for (const entry of (history[ck] || [])) {
+      // Check both before and after snapshots if present
+      const snapshots = [entry.process?.process, entry.beforeSnapshot?.process, entry.afterSnapshot?.process];
+      for (const snap of snapshots) {
+        if (snap && _extractMediaRefs(snap).has(mediaPath)) return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Promote staged media files to final paths after Publish Request approval.
+ * For each staged src ref in matchingEntries' process HTML:
+ *   1. Read staged file from GitHub
+ *   2. Write to final path
+ *   3. Delete staged file
+ *   4. Rewrite process HTML src refs from staged → final
+ *
+ * Updates matchingEntries process HTML in-place and writes updated process data to GitHub.
+ * Returns summary { promoted[], failed[], rewroteEntries }.
+ *
+ * @param {string} country
+ * @param {Array}  matchingEntries - history entries for the approved PR
+ */
+async function _promoteStagedMedia(country, matchingEntries) {
+  const promoted = [];
+  const failed   = [];
+  let rewroteEntries = 0;
+
+  // Collect all staged refs across all matching history entries
+  const allStagedRefs = new Set();
+  for (const h of matchingEntries) {
+    const processHtml = h.process?.process || h.afterSnapshot?.process || '';
+    for (const ref of _extractMediaRefs(processHtml)) {
+      if (_isStagedPath(ref)) allStagedRefs.add(ref);
+    }
+  }
+
+  if (allStagedRefs.size === 0) return { promoted, failed, rewroteEntries };
+
+  // Promote each staged file
+  const pathMap = {}; // { stagedPath → finalPath }
+  for (const stagedPath of allStagedRefs) {
+    if (!_isValidStagedMediaPath(stagedPath)) {
+      failed.push({ path: stagedPath, reason: 'invalid staged path structure' });
+      continue;
+    }
+    const finalPath = _stagedToFinalPath(stagedPath);
+    try {
+      // Read staged file
+      const fileInfo = await getGitHubFileContent(stagedPath);
+      if (!fileInfo?.content) {
+        failed.push({ path: stagedPath, reason: 'staged file not found on GitHub' });
+        continue;
+      }
+      // Write to final path
+      await _uploadMediaToGitHub(
+        finalPath,
+        fileInfo.content,
+        `ops: promote staged media to final — ${country}`
+      );
+      // Delete staged file
+      await _deleteMediaFromGitHub(stagedPath, `promoted to final after PR approval for ${country}`);
+      pathMap[stagedPath] = finalPath;
+      promoted.push({ staged: stagedPath, final: finalPath });
+      console.log(`[media promote] ${stagedPath} → ${finalPath}`);
+    } catch (err) {
+      failed.push({ path: stagedPath, reason: err.message });
+      console.warn(`[media promote] FAILED ${stagedPath}:`, err.message);
+    }
+  }
+
+  // Rewrite HTML src refs in matchingEntries in-place
+  if (Object.keys(pathMap).length > 0) {
+    for (const h of matchingEntries) {
+      let changed = false;
+      // Rewrite in process snapshot
+      if (h.process?.process && typeof h.process.process === 'string') {
+        let html = h.process.process;
+        Object.entries(pathMap).forEach(([sp, fp]) => {
+          const next = html.split(`src="${sp}"`).join(`src="${fp}"`);
+          if (next !== html) { html = next; changed = true; }
+        });
+        if (changed) h.process.process = html;
+      }
+      // Also rewrite afterSnapshot if present
+      if (h.afterSnapshot?.process && typeof h.afterSnapshot.process === 'string') {
+        let html = h.afterSnapshot.process;
+        Object.entries(pathMap).forEach(([sp, fp]) => {
+          html = html.split(`src="${sp}"`).join(`src="${fp}"`);
+        });
+        h.afterSnapshot.process = html;
+      }
+      if (changed) rewroteEntries++;
+    }
+  }
+
+  return { promoted, failed, rewroteEntries };
+}
+
+/**
+ * After a Publish Request approval, rewrite staged → final paths in the
+ * live production process data on GitHub for the affected country.
+ * Called after _promoteStagedMedia() has already moved the actual files.
+ *
+ * @param {string} country
+ * @param {Object} pathMap - { stagedPath: finalPath }
+ */
+async function _rewriteProductionMediaPaths(country, pathMap) {
+  if (!pathMap || Object.keys(pathMap).length === 0) return;
+  const pd = await readProcessData(country);
+  if (!pd) return;
+
+  let changed = false;
+  for (const p of pd.data) {
+    if (!p.process || typeof p.process !== 'string') continue;
+    let html = p.process;
+    Object.entries(pathMap).forEach(([sp, fp]) => {
+      const next = html.split(`src="${sp}"`).join(`src="${fp}"`);
+      if (next !== html) { html = next; changed = true; }
+    });
+    if (changed) p.process = html;
+  }
+
+  if (changed) {
+    await writeProcessData(country, pd.data, pd.meta || {});
+    console.log(`[media rewrite] production data updated for ${country}`);
+  }
+}
+
+/**
+ * Cleanup staged media referenced by a specific set of history entries,
+ * after a Publish Request has been rejected (refused).
+ * Deletes staged files that are no longer referenced by production or active buffer.
+ *
+ * @param {string} country
+ * @param {Array}  refusedEntries - history entries with pr_status='refused'
+ */
+async function _cleanupRejectedStagedMedia(country, refusedEntries) {
+  const toClean = new Set();
+
+  for (const h of refusedEntries) {
+    const processHtml = h.process?.process || h.afterSnapshot?.process || '';
+    for (const ref of _extractMediaRefs(processHtml)) {
+      if (_isStagedPath(ref)) toClean.add(ref);
+    }
+  }
+
+  if (toClean.size === 0) return { deleted: [], kept: [], errors: [] };
+
+  const deleted = [], kept = [], errors = [];
+  for (const stagedPath of toClean) {
+    try {
+      const stillReferenced = await _isMediaReferenced(stagedPath);
+      if (stillReferenced) {
+        kept.push(stagedPath);
+        continue;
+      }
+      const ok = await _deleteMediaFromGitHub(stagedPath, `cleanup after PR rejection for ${country}`);
+      if (ok) {
+        deleted.push(stagedPath);
+        console.log(`[media cleanup/reject] deleted staged ${stagedPath}`);
+      } else {
+        kept.push(stagedPath); // file may already be gone — safe
+        errors.push(`${stagedPath}: delete returned false`);
+      }
+    } catch (err) {
+      errors.push(`${stagedPath}: ${err.message}`);
+      console.warn(`[media cleanup/reject] error cleaning ${stagedPath}:`, err.message);
+    }
+  }
+
+  return { deleted, kept, errors };
+}
+
+/**
+ * Cleanup images that were removed from a process when a modify entry is approved.
+ * Compares before/after HTML from history entries; deletes images that appeared
+ * in beforeSnapshot but not in afterSnapshot (i.e., removed during the edit),
+ * subject to reference check.
+ *
+ * @param {string} country
+ * @param {Array}  mergedEntries - history entries with type='update'
+ */
+async function _cleanupRemovedImagesAfterApproval(country, mergedEntries) {
+  const deleted = [], kept = [], errors = [];
+
+  for (const h of mergedEntries) {
+    if (h.type !== 'update') continue;
+    const beforeHtml = h.beforeSnapshot?.process || '';
+    const afterHtml  = h.process?.process || h.afterSnapshot?.process || '';
+    const beforeRefs = _extractMediaRefs(beforeHtml);
+    const afterRefs  = _extractMediaRefs(afterHtml);
+
+    // Images in before but not in after = removed during edit
+    for (const ref of beforeRefs) {
+      if (afterRefs.has(ref)) continue; // still present
+      try {
+        const stillReferenced = await _isMediaReferenced(ref, h.process?.originalProcessId);
+        if (stillReferenced) {
+          kept.push(ref);
+          continue;
+        }
+        const ok = await _deleteMediaFromGitHub(ref, `removed image cleanup after approval for ${country}`);
+        if (ok) {
+          deleted.push(ref);
+          console.log(`[media cleanup/approve-modify] deleted removed image ${ref}`);
+        } else {
+          kept.push(ref);
+          errors.push(`${ref}: delete returned false`);
+        }
+      } catch (err) {
+        errors.push(`${ref}: ${err.message}`);
+        console.warn(`[media cleanup/approve-modify] error for ${ref}:`, err.message);
+      }
+    }
+  }
+
+  return { deleted, kept, errors };
+}
+
+/**
+ * Cleanup images from a deleted process after Publish Request approval.
+ * Deletes all media files referenced by the deleted process,
+ * subject to reference check.
+ *
+ * @param {string} country
+ * @param {Array}  mergedDeleteEntries - history entries with type='delete'
+ */
+async function _cleanupDeletedProcessImages(country, mergedDeleteEntries) {
+  const deleted = [], kept = [], errors = [];
+
+  for (const h of mergedDeleteEntries) {
+    if (h.type !== 'delete') continue;
+    const processHtml = h.beforeSnapshot?.process || h.process?.process || '';
+    const refs = _extractMediaRefs(processHtml);
+
+    for (const ref of refs) {
+      try {
+        const stillReferenced = await _isMediaReferenced(ref, h.process?.originalProcessId || h.originalProcessId);
+        if (stillReferenced) {
+          kept.push(ref);
+          continue;
+        }
+        const ok = await _deleteMediaFromGitHub(ref, `deleted process cleanup after approval for ${country}`);
+        if (ok) {
+          deleted.push(ref);
+          console.log(`[media cleanup/approve-delete] deleted ${ref}`);
+        } else {
+          kept.push(ref);
+          errors.push(`${ref}: delete returned false`);
+        }
+      } catch (err) {
+        errors.push(`${ref}: ${err.message}`);
+        console.warn(`[media cleanup/approve-delete] error for ${ref}:`, err.message);
+      }
+    }
+  }
+
+  return { deleted, kept, errors };
+}
+
+/**
+ * POST /api/ops/media/upload
+ * Authenticated image upload endpoint.
+ *
+ * Form fields:
+ *   - image (file) — the image to upload
+ *   - country       — target country
+ *   - processId     — target process ID (stable draft ID from client)
+ *
+ * Returns: { success, mediaPath, displaySrc, width, height }
+ * mediaPath is the internal assets/process-media/ path stored in img src.
+ */
+app.post('/api/ops/media/upload', requireAuth, _mediaUpload.single('image'), async (req, res) => {
+  const country   = (req.body?.country  || '').trim().toLowerCase();
+  const processId = (req.body?.processId || '').trim();
+
+  if (!country || !validateCountry(country)) {
+    return res.status(400).json({ error: 'Valid country is required' });
+  }
+  if (!processId || !/^[a-zA-Z0-9_\-]+$/.test(processId) || processId.includes('..')) {
+    return res.status(400).json({ error: 'Valid processId is required (alphanumeric, _, -)' });
+  }
+
+  // Country-scope check
+  const scopeCheck = await _assertCountryAllowed(req.user, country);
+  if (!scopeCheck.ok) return res.status(scopeCheck.status).json({ error: scopeCheck.error });
+
+  if (!req.file) {
+    return res.status(400).json({ error: 'No image file uploaded' });
+  }
+
+  const { buffer: fileBuffer, mimetype, originalname } = req.file;
+
+  // MIME validation
+  if (!MEDIA_ALLOWED_MIME.has(mimetype)) {
+    return res.status(400).json({
+      error: `Unsupported image type: ${mimetype}. Allowed: PNG, JPG/JPEG, WebP.`
+    });
+  }
+
+  // Extension validation (secondary check)
+  const ext = (originalname || '').toLowerCase().match(/\.[a-z0-9]+$/)?.[0] || '';
+  if (!MEDIA_ALLOWED_EXT.has(ext)) {
+    return res.status(400).json({
+      error: `Unsupported file extension: ${ext}. Allowed: .png, .jpg, .jpeg, .webp`
+    });
+  }
+
+  // Size validation (1 MB)
+  if (fileBuffer.length > MEDIA_MAX_SIZE_BYTES) {
+    return res.status(400).json({
+      error: `Image too large: ${(fileBuffer.length / 1024 / 1024).toFixed(1)}MB. Maximum 1MB.`
+    });
+  }
+
+  // Count existing images for this process in the buffer
+  // (to enforce max 3 per process)
+  const buffer = await fetchGitHubJson('data/ops/buffer.json', {});
+  const countryBuf = buffer[country] || {};
+  let existingImageCount = 0;
+  outer: for (const userEntries of Object.values(countryBuf)) {
+    for (const entry of (userEntries || [])) {
+      if (entry.process?.id === processId || entry.process?.originalProcessId === processId) {
+        existingImageCount = _extractMediaRefs(entry.process?.process || '').size;
+        break outer;
+      }
+    }
+  }
+  if (existingImageCount >= MEDIA_MAX_IMAGES_PER_PROCESS) {
+    return res.status(400).json({
+      error: `Maximum ${MEDIA_MAX_IMAGES_PER_PROCESS} images allowed per process.`
+    });
+  }
+
+  try {
+    // Process image with sharp:
+    // - Convert to WebP
+    // - Resize to max MEDIA_MAX_STORED_WIDTH preserving aspect ratio
+    // - Strip metadata
+    const processed = await sharp(fileBuffer)
+      .resize(MEDIA_MAX_STORED_WIDTH, null, {
+        withoutEnlargement: true,
+        fit: 'inside'
+      })
+      .webp({ quality: 82 })
+      .withMetadata(false)
+      .toBuffer();
+
+    const imageId  = _generateImageId();
+    // ── Write to STAGED path (not final) ─────────────────────────────────────
+    // Staged images are promoted to final paths only after Admin PR approval.
+    // Buffer preview references staged paths. Public production never sees staged.
+    const mediaPath = `${MEDIA_STAGED_PREFIX}${country}/${processId}/${imageId}`;
+
+    // Upload to GitHub (staged path)
+    const base64Content = processed.toString('base64');
+    await _uploadMediaToGitHub(
+      mediaPath,
+      base64Content,
+      `ops: stage process image for ${country}/${processId}`
+    );
+
+    // Get dimensions for response
+    const meta = await sharp(processed).metadata();
+
+    console.log(`[media] staged ${mediaPath} (${processed.length} bytes, ${meta.width}x${meta.height})`);
+
+    // previewDataUri: base64 data URI of the processed WebP.
+    // Used by the Quill authoring preview only — never stored in HTML or JSON.
+    // The browser can render it immediately with no further network request and
+    // no auth token required (data: URIs are inline; img elements never send
+    // Authorization headers so the proxy auth gate cannot serve staged images).
+    const previewDataUri = `data:image/webp;base64,${base64Content}`;
+
+    res.json({
+      success:        true,
+      mediaPath,
+      displaySrc:     mediaPath,
+      previewDataUri,
+      staged:         true,
+      width:          meta.width  || MEDIA_MAX_STORED_WIDTH,
+      height:         meta.height || null,
+      defaultDisplayWidth: MEDIA_DEFAULT_DISPLAY_WIDTH
+    });
+
+  } catch (err) {
+    console.error('[media upload] error:', err.message);
+    res.status(500).json({ error: `Image processing failed: ${err.message}` });
+  }
+});
+
+/**
+ * POST /api/ops/media/cleanup
+ * Authenticated endpoint to safely delete staged media images.
+ * Called when a Buffer entry is cancelled/removed before final approval.
+ *
+ * Body: { country, processId, mediaPaths: string[], bufferEntryId? }
+ * Returns: { success, deleted: string[], kept: string[], errors: string[] }
+ */
+app.post('/api/ops/media/cleanup', requireAuth, async (req, res) => {
+  const { country, processId, mediaPaths, bufferEntryId } = req.body || {};
+
+  if (!country || !validateCountry(country)) {
+    return res.status(400).json({ error: 'Valid country is required' });
+  }
+  if (!Array.isArray(mediaPaths) || mediaPaths.length === 0) {
+    return res.status(400).json({ error: 'mediaPaths array is required' });
+  }
+
+  // Country-scope check
+  const scopeCheck = await _assertCountryAllowed(req.user, country);
+  if (!scopeCheck.ok) return res.status(scopeCheck.status).json({ error: scopeCheck.error });
+
+  const deleted = [];
+  const kept    = [];
+  const errors  = [];
+
+  for (const rawPath of mediaPaths) {
+    // Only valid staged paths may be deleted via this endpoint
+    // (final paths are managed by the approve/reject lifecycle only)
+    if (!_isValidStagedMediaPath(rawPath)) {
+      errors.push(`${rawPath}: invalid or non-staged path — only staged media may be cleaned up manually`);
+      continue;
+    }
+    // Safety: staged path must be under this country's staged folder
+    if (!rawPath.startsWith(`${MEDIA_STAGED_PREFIX}${country}/`)) {
+      errors.push(`${rawPath}: not in country staged media folder`);
+      continue;
+    }
+
+    try {
+      // Full reference check before deletion
+      const stillReferenced = await _isMediaReferenced(rawPath, null, bufferEntryId);
+      if (stillReferenced) {
+        kept.push(rawPath);
+        console.log(`[media cleanup] kept ${rawPath} — still referenced`);
+        continue;
+      }
+      const ok = await _deleteMediaFromGitHub(rawPath, `staged cleanup by ${req.user.email}`);
+      if (ok) {
+        deleted.push(rawPath);
+        console.log(`[media cleanup] deleted staged ${rawPath}`);
+      } else {
+        kept.push(rawPath);
+        errors.push(`${rawPath}: delete returned false`);
+      }
+    } catch (err) {
+      errors.push(`${rawPath}: ${err.message}`);
+    }
+  }
+
+  appendActivityLog({
+    event:     'media-cleanup',
+    by:        req.user.email,
+    country,
+    processId: processId || null,
+    deleted,
+    kept,
+    errors
+  }).catch(() => {});
+
+  res.json({ success: true, deleted, kept, errors });
+});
+
+/**
+ * POST /api/ops/media/copy
+ * Duplicates image files from a source country/process into a destination
+ * country/process staged folder. Used by copy-to-country.
+ *
+ * Source can be staged or final paths. Destination is always a new staged path.
+ * (The copied process goes through its own Buffer → PR → approve lifecycle.)
+ *
+ * Body: {
+ *   srcCountry, dstCountry,
+ *   srcProcessId, dstProcessId,
+ *   mediaPaths: string[]   // original src paths to copy
+ * }
+ * Returns: { success, pathMap: { [srcPath]: dstStagedPath }, errors: string[] }
+ */
+app.post('/api/ops/media/copy', requireAuth, async (req, res) => {
+  const { srcCountry, dstCountry, srcProcessId, dstProcessId, mediaPaths } = req.body || {};
+
+  if (!srcCountry || !validateCountry(srcCountry)) {
+    return res.status(400).json({ error: 'Valid srcCountry is required' });
+  }
+  if (!dstCountry || !validateCountry(dstCountry)) {
+    return res.status(400).json({ error: 'Valid dstCountry is required' });
+  }
+  if (!Array.isArray(mediaPaths) || mediaPaths.length === 0) {
+    return res.json({ success: true, pathMap: {}, errors: [] }); // no-op
+  }
+
+  // Scope: user must have access to destination country
+  const scopeCheck = await _assertCountryAllowed(req.user, dstCountry);
+  if (!scopeCheck.ok) return res.status(scopeCheck.status).json({ error: scopeCheck.error });
+
+  const pathMap = {};
+  const errors  = [];
+
+  for (const srcPath of mediaPaths) {
+    // Source must be a valid media path (staged or final)
+    if (!_isValidMediaPath(srcPath)) {
+      errors.push(`${srcPath}: invalid media path`);
+      continue;
+    }
+    // Source must belong to the source country (either staged or final)
+    const expectedStagedPrefix = `${MEDIA_STAGED_PREFIX}${srcCountry}/`;
+    const expectedFinalPrefix  = `${MEDIA_FINAL_PREFIX}${srcCountry}/`;
+    if (!srcPath.startsWith(expectedStagedPrefix) && !srcPath.startsWith(expectedFinalPrefix)) {
+      errors.push(`${srcPath}: not in source country media folder`);
+      continue;
+    }
+
+    try {
+      // Read source file content from GitHub
+      const fileInfo = await getGitHubFileContent(srcPath);
+      if (!fileInfo?.content) {
+        errors.push(`${srcPath}: source file not found`);
+        continue;
+      }
+
+      // Destination is always a new staged path — copied process follows its own lifecycle
+      const newImageId = _generateImageId();
+      const dstPath    = `${MEDIA_STAGED_PREFIX}${dstCountry}/${dstProcessId}/${newImageId}`;
+
+      await _uploadMediaToGitHub(
+        dstPath,
+        fileInfo.content, // already base64
+        `ops: copy media from ${srcCountry}/${srcProcessId} to staged ${dstCountry}/${dstProcessId}`
+      );
+
+      pathMap[srcPath] = dstPath;
+      console.log(`[media copy] ${srcPath} → ${dstPath} (staged)`);
+
+    } catch (err) {
+      errors.push(`${srcPath}: ${err.message}`);
+    }
+  }
+
+  res.json({ success: true, pathMap, errors });
+});
+
+// ─── Test exports (only when required as a module, not when run directly) ────
+// Allows test files to import pure functions without starting the HTTP server.
+if (require.main !== module) {
+  module.exports = {
+    sanitizeProcessHtml,
+    _safeMediaSrc,
+    _safeLinkHref,
+    _isValidMediaPath,
+    _isValidStagedMediaPath,
+    _isValidFinalMediaPath,
+    _isStagedPath,
+    _isFinalPath,
+    _stagedToFinalPath,
+    _extractMediaRefs,
+    _isAllowedPRPath,
+    validateProcessEntry,
+    // constants
+    MEDIA_MAX_IMAGES_PER_PROCESS: 3,
+    MEDIA_MAX_SIZE_BYTES:        1 * 1024 * 1024,
+    MEDIA_MAX_STORED_WIDTH:      1200,
+    MEDIA_MAX_DISPLAY_WIDTH:     800,
+    MEDIA_DEFAULT_DISPLAY_WIDTH: 600,
+    MEDIA_MIN_DISPLAY_WIDTH:     200,
+    MEDIA_STAGED_PREFIX:         'assets/process-media/_staged/',
+    MEDIA_FINAL_PREFIX:          'assets/process-media/'
+  };
+}
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-app.listen(port, () => {
+if (require.main === module) app.listen(port, () => {
   console.log(`Process Finder server listening on http://localhost:${port}`);
   console.log('[STORAGE] GitHub-only mode — no local filesystem used');
   console.log(GITHUB_TOKEN
@@ -5132,6 +6370,28 @@ app.listen(port, () => {
     : `[OPS] WARNING: GITHUB_TOKEN not configured — PR automation disabled`);
   if (GITHUB_TARGET_BRANCH !== 'main') {
     console.warn(`[OPS] WARNING: GITHUB_TARGET_BRANCH="${GITHUB_TARGET_BRANCH}", not "main". Set GITHUB_TARGET_BRANCH=main in Render for production — PRs are currently targeting the wrong branch.`);
+  }
+
+  // ── Startup GitHub connectivity self-test ────────────────────────────────
+  // Fires a single authenticated GET against config/users.json immediately on
+  // startup. The result appears in Render logs within the first few seconds and
+  // tells you exactly whether the token and repo config are correct, without
+  // waiting for a user to trigger a write.
+  if (GITHUB_TOKEN) {
+    setImmediate(async () => {
+      try {
+        const testFile = await getGitHubFileContent('config/users.json');
+        if (testFile && testFile.sha) {
+          console.log(`[STARTUP] GitHub connectivity OK — config/users.json sha=${testFile.sha} branch="${GITHUB_BRANCH}"`);
+        } else {
+          console.error(`[STARTUP] GitHub connectivity FAIL — config/users.json returned null. Check GITHUB_BRANCH="${GITHUB_BRANCH}", GITHUB_OWNER="${GITHUB_OWNER}", GITHUB_REPO="${GITHUB_REPO}".`);
+        }
+      } catch (err) {
+        console.error(`[STARTUP] GitHub connectivity ERROR — ${err.message}`);
+      }
+    });
+  } else {
+    console.error('[STARTUP] GITHUB_TOKEN is not set — all GitHub writes will be blocked. Set GITHUB_TOKEN in Render environment variables.');
   }
   if (DISABLE_PR_CREATION) {
     console.warn('[OPS] WARNING: DISABLE_PR_CREATION=true — all PR creation, branch creation, and buffer-to-history movements are disabled.');
