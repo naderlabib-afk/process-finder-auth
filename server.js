@@ -11,6 +11,7 @@ app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header("Access-Control-Allow-Credentials", "true");
 
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
@@ -72,8 +73,12 @@ app.get('/assets/process-media/*', async (req, res) => {
   // 2. Staged images require an authenticated OPS session
   if (_isStagedPath(filePath)) {
     const authHeader = req.headers.authorization || '';
-    const token      = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
-    const check      = token ? verifyJwt(token) : { ok: false };
+    const cookieToken = (req.headers.cookie || '').match(/(?:^|;\s*)ops_session=([^;]+)/)?.[1] || '';
+    const rawToken    = authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : (authHeader || cookieToken);
+    const token = rawToken ? decodeURIComponent(rawToken) : '';
+    const check = token ? verifyJwt(token) : { ok: false };
     if (!check.ok) {
       return res.status(401).json({ error: 'Authentication required for staged media' });
     }
@@ -1386,6 +1391,7 @@ app.post('/api/auth/session', async (req, res) => {
   const now = Math.floor(Date.now() / 1000);
   const token = signJwt({ email: user.email, role: user.role, iat: now, exp: now + TOKEN_TTL });
   console.log("[SESSION ISSUED]", user.email, user.role);
+  res.setHeader('Set-Cookie', `ops_session=${encodeURIComponent(token)}; Path=/; Max-Age=${TOKEN_TTL}; HttpOnly; SameSite=None; Secure`);
   res.json({ success: true, token, email: user.email, role: user.role });
 });
 
