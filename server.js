@@ -44,6 +44,59 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('he
 const TOKEN_TTL = 8 * 60 * 60;
 
 app.use(bodyParser.json({ limit: '10mb' }));
+
+// ─── Media proxy: serve process images from GitHub ────────────────────────────
+//
+// Intercepts GET /assets/process-media/* before express.static so the browser
+// can load images that live on GitHub (not on the server's local disk).
+//
+// Access tiers:
+//   _staged/…  — requires a valid OPS JWT (pre-approval images, OPS-only)
+//   final/…    — public, no auth (published production images)
+//
+// Path governance: validated by _isAllowedPRPath() — the same allowlist used
+// by PR scope verification. Invalid paths are rejected with 400.
+// Cache-Control:
+//   staged → no-store (images may be cleaned up at any time)
+//   final  → 1-year immutable (UUID-named, content-addressed)
+//
+app.get('/assets/process-media/*', async (req, res) => {
+  const suffix   = req.params[0] || '';
+  const filePath = `assets/process-media/${suffix}`;
+
+  // 1. Validate path via existing governance allowlist
+  if (!_isAllowedPRPath(filePath)) {
+    return res.status(400).json({ error: 'Invalid media path' });
+  }
+
+  // 2. Staged images require an authenticated OPS session
+  if (_isStagedPath(filePath)) {
+    const authHeader = req.headers.authorization || '';
+    const token      = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+    const check      = token ? verifyJwt(token) : { ok: false };
+    if (!check.ok) {
+      return res.status(401).json({ error: 'Authentication required for staged media' });
+    }
+  }
+
+  // 3. Fetch raw bytes from GitHub
+  try {
+    const fileInfo = await getGitHubFileContent(filePath);
+    if (!fileInfo?.content) {
+      return res.status(404).send('Not found');
+    }
+    const buf = Buffer.from(fileInfo.content, 'base64');
+    res.set('Content-Type', 'image/webp');
+    res.set('Cache-Control', _isStagedPath(filePath)
+      ? 'no-store'
+      : 'public, max-age=31536000, immutable');
+    return res.send(buf);
+  } catch (err) {
+    console.warn('[media proxy] fetch failed:', filePath, err.message);
+    return res.status(502).json({ error: 'Media fetch failed' });
+  }
+});
+
 app.use(express.static(__dirname));
 
 // ─── Media upload: memory storage, 2MB raw limit (we validate 1MB after read) ──
