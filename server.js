@@ -6088,13 +6088,21 @@ app.post('/api/ops/media/upload', requireAuth, _mediaUpload.single('image'), asy
 
     console.log(`[media] staged ${mediaPath} (${processed.length} bytes, ${meta.width}x${meta.height})`);
 
+    // previewDataUri: base64 data URI of the processed WebP.
+    // Used by the Quill authoring preview only — never stored in HTML or JSON.
+    // The browser can render it immediately with no further network request and
+    // no auth token required (data: URIs are inline; img elements never send
+    // Authorization headers so the proxy auth gate cannot serve staged images).
+    const previewDataUri = `data:image/webp;base64,${base64Content}`;
+
     res.json({
-      success:    true,
+      success:        true,
       mediaPath,
-      displaySrc: mediaPath,
-      staged:     true,
-      width:      meta.width  || MEDIA_MAX_STORED_WIDTH,
-      height:     meta.height || null,
+      displaySrc:     mediaPath,
+      previewDataUri,
+      staged:         true,
+      width:          meta.width  || MEDIA_MAX_STORED_WIDTH,
+      height:         meta.height || null,
       defaultDisplayWidth: MEDIA_DEFAULT_DISPLAY_WIDTH
     });
 
