@@ -2036,9 +2036,25 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
   }
 
   const liveBuffer = await fetchGitHubJson('data/ops/buffer.json', {});
+
+  // ── Pre-loop: fetch ancillary data needed for per-entry guards ─────────────
+  // Fetched once outside the loop to avoid repeated GitHub API calls.
+  const [_putSchedule, _putHistory, _putUsers] = await Promise.all([
+    fetchGitHubJson('data/ops/pr_schedule.json', {}),
+    fetchGitHubJson('data/ops/history.json',     {}),
+    fetchGitHubJson('config/users.json',          [])
+  ]);
+  const _norm = e => (e || '').toLowerCase().trim();
+
   for (const ck of Object.keys(newBuffer)) {
     const countryEntries = newBuffer[ck] || {};
     const liveEntries = liveBuffer[ck] || {};
+
+    // Set of entry ids frozen by a scheduled PR job for this country
+    const _schedJobIds = new Set(
+      Array.isArray(_putSchedule[ck]?.entry_ids) ? _putSchedule[ck].entry_ids : []
+    );
+
     for (const [owner, entries] of Object.entries(countryEntries)) {
       const liveUserEntries = liveEntries[owner] || [];
       for (let index = 0; index < (entries || []).length; index++) {
@@ -2047,6 +2063,81 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
         const isExistingWorkflow = entry?.type === 'update' || liveEntry?.type === 'update' || entry?.type === 'delete' || liveEntry?.type === 'delete';
         const originalProcessId = entry?.originalProcessId || entry?.process?.originalProcessId || liveEntry?.originalProcessId || liveEntry?.process?.originalProcessId || entry?.process?.id || liveEntry?.process?.id || null;
         if (!entry?.process) continue;
+
+        // ── Guard A — Per-entry ownership / role authorization ──────────────
+        // Only applies when the entry already exists server-side (liveEntry).
+        // New entries (no liveEntry) are additions to the caller's own slice —
+        // the server trusts the caller's JWT for those; POST /api/ops/buffer
+        // handles the authoritative creation path.
+        if (liveEntry) {
+          const entryOwner = _norm(liveEntry.user || owner);
+          const caller     = _norm(req.user.email);
+          if (entryOwner !== caller) {
+            if (req.user.role === 'OL') {
+              return res.status(403).json({
+                error: 'OL can only edit their own entries.',
+                code:  'OWNERSHIP_VIOLATION',
+                entryId: entry.id
+              });
+            }
+            if (req.user.role === 'Manager') {
+              const ownerRec  = _putUsers.find(u => _norm(u.email) === entryOwner);
+              const ownerRole = ownerRec?.role || 'OL';
+              if (ownerRole !== 'OL') {
+                return res.status(403).json({
+                  error: 'Manager can only edit own entries or OL entries.',
+                  code:  'OWNERSHIP_VIOLATION',
+                  entryId: entry.id
+                });
+              }
+            }
+            // Admin: unrestricted — no block
+          }
+        }
+
+        // ── Guard B — Validated-entry content-edit block ────────────────────
+        // The OPS UI enforces an unvalidate → edit → revalidate workflow:
+        // once an entry is validated, the Edit and Remove buttons disappear for
+        // ALL roles (frontend: `canEdit = !isValidated && ...`, ops.js line 2585).
+        // Only the "Unvalidate" button remains, which calls POST /api/ops/validate.
+        //
+        // PUT /api/ops/buffer is only ever called via saveBufferEdit(), which is
+        // guarded by !isValidated in the UI. Direct content-editing of a validated
+        // entry through PUT bypasses the required workflow and must be rejected.
+        //
+        // Applies to OL and Manager unconditionally — even the entry owner.
+        // Admin: same rule applies for consistency with the UI; Admin must also
+        // use the unvalidate → edit → revalidate path through POST /api/ops/validate.
+        // Guard C (below) handles scheduled/pending_merge locks for all roles.
+        if (liveEntry?.status === 'validated') {
+          return res.status(403).json({
+            error: 'This entry is validated. Use Unvalidate → Edit → Revalidate to make corrections.',
+            code:  'UNVALIDATE_REQUIRED',
+            entryId: entry.id
+          });
+        }
+
+        // ── Guard C — Pending-merge / scheduled-PR lock ─────────────────────
+        // Mirrors the open-PR lock guard in POST /api/ops/cancel (lines 2390–2408)
+        // and POST /api/ops/validate (lines 2501–2521).
+        if (_schedJobIds.has(entry.id)) {
+          return res.status(409).json({
+            error: 'This entry is locked by a scheduled Publish Request and cannot be modified.',
+            code:  'SCHEDULED_PR_LOCK',
+            entryId: entry.id
+          });
+        }
+        const _inOpenPR = (_putHistory[ck] || []).some(
+          h => h.pr_status === 'pending_merge' && h.id === entry.id
+        );
+        if (_inOpenPR) {
+          return res.status(409).json({
+            error: 'This entry is locked by an open Publish Request and cannot be modified.',
+            code:  'OPEN_PR_LOCK',
+            entryId: entry.id
+          });
+        }
+
         if (isExistingWorkflow && !originalProcessId) {
           return res.status(400).json({
             error: 'originalProcessId must be preserved for existing process workflows.',
