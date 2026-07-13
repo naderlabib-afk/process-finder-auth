@@ -6427,6 +6427,390 @@ app.post('/api/ops/media/copy', requireAuth, async (req, res) => {
   res.json({ success: true, pathMap, errors });
 });
 
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STANDBY SCHEDULES ROUTES
+// Branch: feat/standby-schedules
+// Zero-harm: all routes are new; no existing route modified.
+// ══════════════════════════════════════════════════════════════════════════════
+
+const STANDBY_DIR          = 'data/standby';
+const STANDBY_LOCKS_PATH   = 'data/standby/locks.json';
+const STANDBY_LOCK_TTL_MS  = 15 * 60 * 1000; // 15 min — same as process edit-lock TTL
+
+/**
+ * GET /api/standby/:key/:year
+ *
+ * Public (no auth). Returns the standby schedule JSON for the given country key
+ * and year, or { empty: true } when no file has been published yet.
+ *
+ * Callers: index.html public Standby panel (no auth), ops.html read-only previews.
+ */
+app.get('/api/standby/:key/:year', async (req, res) => {
+  const { key, year } = req.params;
+  if (!validateCountry(key)) {
+    return res.status(400).json({ error: 'Invalid country key' });
+  }
+  const yr = parseInt(year, 10);
+  if (!yr || yr < 2020 || yr > 2100) {
+    return res.status(400).json({ error: 'Invalid year' });
+  }
+
+  const filePath = `${STANDBY_DIR}/${key.toLowerCase()}_${yr}.json`;
+  const data     = await fetchGitHubJson(filePath, null);
+
+  if (!data) return res.json({ empty: true, countryKey: key.toLowerCase(), year: yr });
+  return res.json(data);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/standby/contact/:key
+ *
+ * Public (no auth). Returns the OL email(s) for a country from config/users.json.
+ * Used as the no-schedule fallback contact in the public Standby panel.
+ */
+app.get('/api/standby/contact/:key', async (req, res) => {
+  const { key } = req.params;
+  if (!validateCountry(key)) {
+    return res.status(400).json({ error: 'Invalid country key' });
+  }
+
+  const allUsers   = await fetchGitHubJson('config/users.json', []);
+  const ck         = key.toLowerCase();
+  const olContacts = allUsers
+    .filter(u => u.role === 'OL' && Array.isArray(u.countries) && u.countries.includes(ck))
+    .map(u => u.email)
+    .filter(Boolean);
+
+  return res.json({ countryKey: ck, contacts: olContacts });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/standby/parse
+ *
+ * requireAuth. Accepts a multipart CSV upload, validates and converts it to
+ * the canonical week schema. Does NOT commit anything — returns a preview
+ * payload for the OPS diff preview before Save & Submit.
+ *
+ * Body (multipart/form-data):
+ *   file    — CSV file
+ *   country — country key
+ *   year    — numeric year
+ *
+ * Response: { weeks, agents, errors, warnings, summary }
+ */
+app.post('/api/standby/parse', requireAuth, _mediaUpload.single('file'), async (req, res) => {
+  const { country, year } = req.body;
+
+  if (!country || !validateCountry(country)) {
+    return res.status(400).json({ error: 'Valid country is required' });
+  }
+  const yr = parseInt(year, 10);
+  if (!yr || yr < 2020 || yr > 2100) {
+    return res.status(400).json({ error: 'Valid year is required' });
+  }
+  if (!req.file) {
+    return res.status(400).json({ error: 'CSV file is required' });
+  }
+
+  const scopeCheck = await _assertCountryAllowed(req.user, country);
+  if (!scopeCheck.ok) return res.status(scopeCheck.status).json({ error: scopeCheck.error });
+
+  const raw    = req.file.buffer.toString('utf8').replace(/^\uFEFF/, ''); // strip BOM
+  const lines  = raw.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) {
+    return res.status(400).json({ error: 'CSV has no data rows' });
+  }
+
+  // ── Parse CSV ──────────────────────────────────────────────────────────────
+  function parseCsvLine(line) {
+    const fields = [];
+    let cur = '', inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (c === '"') { inQ = !inQ; }
+      else if (c === ',' && !inQ) { fields.push(cur); cur = ''; }
+      else { cur += c; }
+    }
+    fields.push(cur);
+    return fields.map(f => f.trim());
+  }
+
+  const header = parseCsvLine(lines[0]).map(h => h.trim());
+  function col(row, name) {
+    const idx = header.indexOf(name);
+    return idx >= 0 ? (row[idx] || '').trim() : '';
+  }
+
+  const rows    = lines.slice(1).map(l => parseCsvLine(l));
+  const errors  = [];
+  const warnings = [];
+
+  // Required columns
+  const REQUIRED = ['Date', 'Standby_Name', 'Phone', 'Shift_Start', 'Shift_End', 'Coverage_Type'];
+  const missing  = REQUIRED.filter(c => !header.includes(c));
+  if (missing.length) {
+    return res.status(400).json({ error: `CSV missing required columns: ${missing.join(', ')}` });
+  }
+
+  // ── Group into periods ─────────────────────────────────────────────────────
+  const periodMap = {};
+
+  for (let i = 0; i < rows.length; i++) {
+    const row      = rows[i];
+    const date     = col(row, 'Date');
+    const coverage = col(row, 'Coverage_Type').toLowerCase();
+    const name     = col(row, 'Standby_Name');
+    const phone    = col(row, 'Phone');
+    const phone2   = col(row, 'Phone2') || '';
+    const note     = col(row, 'Note')   || '';
+    const sStart   = col(row, 'Shift_Start').split(' ')[0];
+    const sEnd     = col(row, 'Shift_End').split(' ')[0];
+    const day      = col(row, 'Day').toLowerCase();
+
+    if (!date || !name || !sStart || !sEnd) {
+      errors.push(`Row ${i + 2}: missing required field (Date, Standby_Name, Shift_Start, or Shift_End)`);
+      continue;
+    }
+
+    const isSolo = coverage.includes('saturday') || coverage.includes('solo') || day === 'saturday';
+
+    if (isSolo) {
+      const satDate = new Date(date + 'T00:00:00Z');
+      const friDate = new Date(satDate.getTime() - 86400000);
+      const friStr  = friDate.toISOString().slice(0, 10);
+      const entry   = Object.values(periodMap).find(e => e.periodEnd === friStr);
+      if (entry) {
+        entry.solo = { date, name, phone, phone2, note };
+      } else {
+        warnings.push(`Row ${i + 2}: Saturday entry (${date}) has no matching period — stored as orphan`);
+        periodMap[date] = periodMap[date] || { periodStart: date, periodEnd: date, period: null, solo: null };
+        periodMap[date].solo = { date, name, phone, phone2, note };
+      }
+    } else {
+      if (!periodMap[sStart]) {
+        periodMap[sStart] = { periodStart: sStart, periodEnd: sEnd, period: null, solo: null };
+      }
+      if (!periodMap[sStart].period) {
+        periodMap[sStart].period = { name, phone, phone2, note, consecutiveWarning: false };
+      }
+      periodMap[sStart].periodEnd = sEnd;
+    }
+  }
+
+  // ── Consecutive-agent warning ──────────────────────────────────────────────
+  const sortedPeriods = Object.values(periodMap).filter(e => e.period).sort((a, b) => a.periodStart.localeCompare(b.periodStart));
+  let consec = 1;
+  for (let i = 1; i < sortedPeriods.length; i++) {
+    if (sortedPeriods[i].period?.name === sortedPeriods[i - 1].period?.name) {
+      consec++;
+      if (consec >= 6) {
+        sortedPeriods[i].period.consecutiveWarning = true;
+        warnings.push(`Consecutive-agent warning: ${sortedPeriods[i].period.name} assigned for ${consec} consecutive periods starting ${sortedPeriods[i - consec + 1]?.periodStart}`);
+      }
+    } else {
+      consec = 1;
+    }
+  }
+
+  const weeks = sortedPeriods.map(e => ({
+    periodStart: e.periodStart,
+    periodEnd:   e.periodEnd,
+    period:      e.period,
+    solo:        e.solo || null
+  }));
+
+  // ── Collect agents ─────────────────────────────────────────────────────────
+  const agentMap = {};
+  for (const w of weeks) {
+    if (w.period?.name) agentMap[w.period.name] = { name: w.period.name, phone: w.period.phone, phone2: w.period.phone2 || '' };
+    if (w.solo?.name)   agentMap[w.solo.name]   = { name: w.solo.name,   phone: w.solo.phone,   phone2: w.solo.phone2   || '' };
+  }
+  const agents = Object.values(agentMap).sort((a, b) => a.name.localeCompare(b.name));
+
+  return res.json({
+    weeks,
+    agents,
+    errors,
+    warnings,
+    summary: {
+      weekCount:   weeks.length,
+      agentCount:  agents.length,
+      errorCount:  errors.length,
+      warningCount: warnings.length
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/standby/save
+ *
+ * requireAuth + country-scope. Commits the provided schedule to
+ * data/standby/{key}_{year}.json on main. Also handles the calendar lock:
+ * acquires on first open, releases on save.
+ *
+ * Body: { country, year, schedule: { weeks, agents, weekStart?, soloDay? } }
+ *
+ * Response: { success, updatedAt, weekCount }
+ */
+app.post('/api/standby/save', requireAuth, async (req, res) => {
+  const { country, year, schedule } = req.body;
+
+  if (!country || !validateCountry(country)) {
+    return res.status(400).json({ error: 'Valid country is required' });
+  }
+  const yr = parseInt(year, 10);
+  if (!yr || yr < 2020 || yr > 2100) {
+    return res.status(400).json({ error: 'Valid year is required' });
+  }
+  if (!schedule || !Array.isArray(schedule.weeks)) {
+    return res.status(400).json({ error: 'schedule.weeks array is required' });
+  }
+
+  const scopeCheck = await _assertCountryAllowed(req.user, country);
+  if (!scopeCheck.ok) return res.status(scopeCheck.status).json({ error: scopeCheck.error });
+
+  const ck       = country.toLowerCase();
+  const filePath = `${STANDBY_DIR}/${ck}_${yr}.json`;
+  const now      = new Date();
+
+  // ── Fetch existing file for country/year display name ─────────────────────
+  const allCountries = await fetchGitHubJson('config/countries.json', {});
+  const countryName  = allCountries[ck]?.name || ck.toUpperCase();
+
+  const payload = {
+    country:    countryName,
+    countryKey: ck,
+    year:       yr,
+    weekStart:  schedule.weekStart  || 'sunday',
+    soloDay:    schedule.soloDay    || 'saturday',
+    updatedAt:  now.toISOString(),
+    updatedBy:  req.user.email,
+    agents:     schedule.agents     || [],
+    weeks:      schedule.weeks
+  };
+
+  await commitJsonToMainBranch(
+    filePath,
+    payload,
+    `standby: save ${ck} ${yr} schedule (${schedule.weeks.length} weeks) by ${req.user.email}`
+  );
+
+  // ── Release standby calendar lock (if held by this user) ──────────────────
+  try {
+    const locks = await fetchGitHubJson(STANDBY_LOCKS_PATH, {});
+    const lockKey = `${ck}_${yr}`;
+    const lock    = locks[lockKey];
+    if (lock && (lock.editingBy || '').toLowerCase() === req.user.email.toLowerCase()) {
+      delete locks[lockKey];
+      await commitJsonToMainBranch(STANDBY_LOCKS_PATH, locks,
+        `standby: release calendar lock ${lockKey} on save by ${req.user.email}`);
+    }
+  } catch (_) { /* lock release is best-effort — save already succeeded */ }
+
+  return res.json({
+    success:   true,
+    updatedAt: now.toISOString(),
+    weekCount: schedule.weeks.length
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * PATCH /api/standby/lock
+ *
+ * requireAuth + country-scope.
+ * Acquires, heartbeats, or releases the standby calendar edit lock for a
+ * given country+year combination. Prevents two OLs from simultaneously editing
+ * the same country's calendar (same pattern as process_edit_locks.json).
+ *
+ * Body: { country, year, action: "acquire" | "heartbeat" | "release" }
+ *
+ * Response (acquire/heartbeat): { success, action, lockKey, editingBy, lockExpiresAt }
+ * Response (release):           { success, action: "released", lockKey }
+ * Response (409 conflict):      { error, editingBy, lockExpiresAt }
+ */
+app.patch('/api/standby/lock', requireAuthBeacon, async (req, res) => {
+  const { country, year, action } = req.body;
+  const requester = req.user.email;
+
+  if (!country || !validateCountry(country)) {
+    return res.status(400).json({ error: 'Valid country is required' });
+  }
+  const yr = parseInt(year, 10);
+  if (!yr || yr < 2020 || yr > 2100) {
+    return res.status(400).json({ error: 'Valid year is required' });
+  }
+  if (!['acquire', 'heartbeat', 'release'].includes(action)) {
+    return res.status(400).json({ error: 'action must be acquire, heartbeat, or release' });
+  }
+
+  const scopeCheck = await _assertCountryAllowed(req.user, country);
+  if (!scopeCheck.ok) return res.status(scopeCheck.status).json({ error: scopeCheck.error });
+
+  const ck      = country.toLowerCase();
+  const lockKey = `${ck}_${yr}`;
+  const now     = new Date();
+  const locks   = await fetchGitHubJson(STANDBY_LOCKS_PATH, {});
+  const lock    = locks[lockKey] || {};
+
+  const { editingBy, editingLastActivityAt } = lock;
+  const lockAge = editingLastActivityAt
+    ? now.getTime() - new Date(editingLastActivityAt).getTime()
+    : Infinity;
+  const norm = e => (e || '').toLowerCase().trim();
+  const lockHeldByOther = editingBy &&
+    norm(editingBy) !== norm(requester) &&
+    lockAge < STANDBY_LOCK_TTL_MS;
+
+  if (action === 'release') {
+    if (editingBy && norm(editingBy) !== norm(requester) && req.user.role !== 'Admin') {
+      return res.status(403).json({ error: 'Only the lock holder or Admin can release this lock' });
+    }
+    delete locks[lockKey];
+    await commitJsonToMainBranch(STANDBY_LOCKS_PATH, locks,
+      `standby: release calendar lock ${lockKey} by ${requester}`);
+    return res.json({ success: true, action: 'released', lockKey });
+  }
+
+  if (action === 'acquire' && lockHeldByOther) {
+    return res.status(409).json({
+      error:        `This standby calendar is currently being edited by ${editingBy}`,
+      editingBy,
+      editingLastActivityAt,
+      lockExpiresAt: new Date(new Date(editingLastActivityAt).getTime() + STANDBY_LOCK_TTL_MS).toISOString()
+    });
+  }
+
+  // acquire or heartbeat — set / refresh the lock
+  locks[lockKey] = {
+    editingBy:             requester,
+    editingLastActivityAt: now.toISOString()
+  };
+
+  await commitJsonToMainBranch(STANDBY_LOCKS_PATH, locks,
+    `standby: ${action} calendar lock ${lockKey} by ${requester}`);
+
+  return res.json({
+    success:               true,
+    action,
+    lockKey,
+    editingBy:             requester,
+    editingLastActivityAt: now.toISOString(),
+    lockExpiresAt:         new Date(now.getTime() + STANDBY_LOCK_TTL_MS).toISOString()
+  });
+});
+
+// ── END STANDBY SCHEDULES ROUTES ──────────────────────────────────────────────
+
+
 // ─── Test exports (only when required as a module, not when run directly) ────
 // Allows test files to import pure functions without starting the HTTP server.
 if (require.main !== module) {
