@@ -1,0 +1,3 @@
+Date,Day,Country,Standby_Name,Phone,Phone2,Shift_Start,Shift_End,Coverage_Type,Note
+2026-01-04,Sunday,Italy,Agent Name,+XX XXXXXXXXXXX,,2026-01-04,2026-01-09,standby,
+2026-01-10,Saturday,Italy,Agent Name,+XX XXXXXXXXXXX,,2026-01-10,2026-01-10,solo,
