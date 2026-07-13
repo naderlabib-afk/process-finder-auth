@@ -6551,10 +6551,29 @@ app.post('/api/standby/parse', requireAuth, _mediaUpload.single('file'), async (
   const warnings = [];
 
   // Required columns
-  const REQUIRED = ['Date', 'Standby_Name', 'Phone', 'Shift_Start', 'Shift_End', 'Coverage_Type'];
+  const REQUIRED = ['Date', 'Standby_Name', 'Phone', 'Shift_Start', 'Shift_End'];
   const missing  = REQUIRED.filter(c => !header.includes(c));
   if (missing.length) {
     return res.status(400).json({ error: `CSV missing required columns: ${missing.join(', ')}` });
+  }
+
+  // ── Normalise a date string to YYYY-MM-DD ─────────────────────────────────
+  // Handles: YYYY-MM-DD (pass-through), DD-MM-YYYY, DD/MM/YYYY, DD-MM-YY
+  function normaliseDate(raw) {
+    if (!raw) return '';
+    const s = raw.trim();
+    // Already ISO: YYYY-MM-DD
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    // DD-MM-YYYY or DD/MM/YYYY
+    const dmy4 = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+    if (dmy4) return `${dmy4[3]}-${dmy4[2].padStart(2,'0')}-${dmy4[1].padStart(2,'0')}`;
+    // DD-MM-YY (2-digit year — assume 20xx)
+    const dmy2 = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2})$/);
+    if (dmy2) return `20${dmy2[3]}-${dmy2[2].padStart(2,'0')}-${dmy2[1].padStart(2,'0')}`;
+    // MM/DD/YYYY (US format)
+    const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (mdy) return `${mdy[3]}-${mdy[1].padStart(2,'0')}-${mdy[2].padStart(2,'0')}`;
+    return s; // return as-is; error will surface later via date validation
   }
 
   // ── Group into periods ─────────────────────────────────────────────────────
@@ -6562,22 +6581,28 @@ app.post('/api/standby/parse', requireAuth, _mediaUpload.single('file'), async (
 
   for (let i = 0; i < rows.length; i++) {
     const row      = rows[i];
-    const date     = col(row, 'Date');
+    const date     = normaliseDate(col(row, 'Date'));
     const coverage = col(row, 'Coverage_Type').toLowerCase();
     const name     = col(row, 'Standby_Name');
     const phone    = col(row, 'Phone');
     const phone2   = col(row, 'Phone2') || '';
     const note     = col(row, 'Note')   || '';
-    const sStart   = col(row, 'Shift_Start').split(' ')[0];
-    const sEnd     = col(row, 'Shift_End').split(' ')[0];
+    const sStart   = normaliseDate(col(row, 'Shift_Start').split(' ')[0]);
+    const sEnd     = normaliseDate(col(row, 'Shift_End').split(' ')[0]);
     const day      = col(row, 'Day').toLowerCase();
 
+    // Validate that date is YYYY-MM-DD after normalisation
+    if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      errors.push(`Row ${i + 2}: unrecognised date format "${col(row,'Date')}" — use YYYY-MM-DD, DD-MM-YYYY or DD/MM/YYYY`);
+      continue;
+    }
     if (!date || !name || !sStart || !sEnd) {
       errors.push(`Row ${i + 2}: missing required field (Date, Standby_Name, Shift_Start, or Shift_End)`);
       continue;
     }
 
-    const isSolo = coverage.includes('saturday') || coverage.includes('solo') || day === 'saturday';
+    // Determine solo day purely from the Day column — Coverage_Type removed from CSV format
+    const isSolo = day === 'saturday' || day === 'sunday' || coverage.includes('saturday') || coverage.includes('solo');
 
     if (isSolo) {
       const satDate = new Date(date + 'T00:00:00Z');
