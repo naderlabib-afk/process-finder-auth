@@ -6727,22 +6727,42 @@ app.post('/api/standby/save', requireAuth, async (req, res) => {
     `standby: save ${ck} ${yr} schedule (${schedule.weeks.length} weeks) by ${req.user.email}`
   );
 
-  // ── Release standby calendar lock (if held by this user) ──────────────────
+  // ── Lock check before save ────────────────────────────────────────────────
+  // Reject if the lock is actively held by a DIFFERENT user (gap 2 fix).
+  // If the lock is held by THIS user, or is expired, or doesn't exist → allow.
+  let lockFreed = false;
   try {
-    const locks = await fetchGitHubJson(STANDBY_LOCKS_PATH, {});
+    const locks   = await fetchGitHubJson(STANDBY_LOCKS_PATH, {});
     const lockKey = `${ck}_${yr}`;
     const lock    = locks[lockKey];
-    if (lock && (lock.editingBy || '').toLowerCase() === req.user.email.toLowerCase()) {
+    const norm    = e => (e || '').toLowerCase().trim();
+
+    if (lock?.editingBy) {
+      const lockAge = lock.editingLastActivityAt
+        ? Date.now() - new Date(lock.editingLastActivityAt).getTime()
+        : Infinity;
+      const heldByOther = norm(lock.editingBy) !== norm(req.user.email)
+                       && lockAge < STANDBY_LOCK_TTL_MS;
+      if (heldByOther) {
+        return res.status(409).json({
+          error:     `Cannot save — ${lock.editingBy} currently holds the edit lock for this calendar. Wait for them to finish or until the lock expires.`,
+          editingBy: lock.editingBy,
+          lockExpiresAt: new Date(new Date(lock.editingLastActivityAt).getTime() + STANDBY_LOCK_TTL_MS).toISOString()
+        });
+      }
+      // Lock is ours or expired — release it as part of this save
       delete locks[lockKey];
       await commitJsonToMainBranch(STANDBY_LOCKS_PATH, locks,
         `standby: release calendar lock ${lockKey} on save by ${req.user.email}`);
+      lockFreed = true;
     }
-  } catch (_) { /* lock release is best-effort — save already succeeded */ }
+  } catch (_) { /* lock check is best-effort — do not block the save on lock errors */ }
 
   return res.json({
     success:   true,
     updatedAt: now.toISOString(),
-    weekCount: schedule.weeks.length
+    weekCount: schedule.weeks.length,
+    lockFreed           // client uses this to know the lock was just released
   });
 });
 
