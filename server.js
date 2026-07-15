@@ -177,7 +177,7 @@ function requireAuth(req, res, next) {
   if (!result.ok) {
     return _rejectAuth(res, result);
   }
-  req.user = { email: result.payload.email, role: result.payload.role };
+  req.user = { email: result.payload.email, role: result.payload.role, globalWrite: result.payload.globalWrite || false };
   // Hybrid lazy trigger: any authenticated request wakes the PR executor.
   // Defined later in the file; safe to call here because Node hoists function
   // declarations — but _runScheduledPRExecutor is an async function expression,
@@ -209,6 +209,8 @@ function validateCountry(country) {
  */
 async function _assertCountryAllowed(user, country, allUsers = null) {
   if (user.role === 'Admin') return { ok: true };
+  // globalWrite users may act on the 'global' country
+  if (country === 'global' && user.globalWrite) return { ok: true };
   const users = allUsers || await fetchGitHubJson('config/users.json', []);
   const norm  = e => (e || '').toLowerCase().trim();
   const rec   = users.find(u => norm(u.email) === norm(user.email));
@@ -1423,10 +1425,10 @@ app.post('/api/auth/session', async (req, res) => {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const token = signJwt({ email: user.email, role: user.role, iat: now, exp: now + TOKEN_TTL });
-  console.log("[SESSION ISSUED]", user.email, user.role);
+  const token = signJwt({ email: user.email, role: user.role, globalWrite: user.globalWrite || false, iat: now, exp: now + TOKEN_TTL });
+  console.log("[SESSION ISSUED]", user.email, user.role, user.globalWrite ? '[globalWrite]' : '');
   res.setHeader('Set-Cookie', `ops_session=${encodeURIComponent(token)}; Path=/; Max-Age=${TOKEN_TTL}; HttpOnly; SameSite=None; Secure`);
-  res.json({ success: true, token, email: user.email, role: user.role });
+  res.json({ success: true, token, email: user.email, role: user.role, globalWrite: user.globalWrite || false });
 });
 
 // ─── Config (read-only, public) ───────────────────────────────────────────────
@@ -1437,9 +1439,9 @@ app.get('/api/config/countries', async (req, res) => {
 
 app.get('/api/config/users', async (req, res) => {
   // Phase 2: strip the `countries` array — public route must not expose country
-  // assignment details. Returns email + role only for each user.
+  // assignment details. Returns email, role, and globalWrite for feedback routing.
   const users = await fetchGitHubJson('config/users.json', []);
-  res.json(users.map(u => ({ email: u.email, role: u.role })));
+  res.json(users.map(u => ({ email: u.email, role: u.role, globalWrite: u.globalWrite || false })));
 });
 
 /**
@@ -2328,7 +2330,7 @@ function requireAuthBeacon(req, res, next) {
   if (!result.ok) {
     return _rejectAuth(res, result);
   }
-  req.user = { email: result.payload.email, role: result.payload.role };
+  req.user = { email: result.payload.email, role: result.payload.role, globalWrite: result.payload.globalWrite || false };
   if (typeof _runScheduledPRExecutor === 'function') {
     _runScheduledPRExecutor().catch(() => {});
   }
@@ -4446,7 +4448,10 @@ async function _adminPreflightCheck(user, country, prNumber, expectedGitHubState
   const norm = e => (e || '').toLowerCase().trim();
 
   // 1. Re-confirm Admin role live from JWT payload (not from stale session assumption)
-  if (user.role !== 'Admin') {
+  // globalWrite users may approve/reject Global PRs; Admins may approve/reject anything
+  const isGlobalPR = country === 'global';
+  const canAct = user.role === 'Admin' || (isGlobalPR && user.globalWrite);
+  if (!canAct) {
     return { ok: false, httpStatus: 403, error: 'Admin only', opsMessage: 'You do not have Admin permissions for this action.' };
   }
 
@@ -4634,7 +4639,8 @@ async function _adminPreflightCheck(user, country, prNumber, expectedGitHubState
  *          OR failure shape: { error, opsMessage, productionChanged, entriesLocked, availableActions }
  */
 app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
-  if (req.user.role !== 'Admin') {
+  const isGlobalPR = req.body?.country === 'global';
+  if (req.user.role !== 'Admin' && !(isGlobalPR && req.user.globalWrite)) {
     return res.status(403).json({ error: 'Admin only' });
   }
 
@@ -4855,7 +4861,8 @@ app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
  *          OR failure shape: { error, opsMessage, productionChanged, entriesLocked, availableActions }
  */
 app.post('/api/admin/pr/close', requireAuth, async (req, res) => {
-  if (req.user.role !== 'Admin') {
+  const isGlobalClosePR = req.body?.country === 'global';
+  if (req.user.role !== 'Admin' && !(isGlobalClosePR && req.user.globalWrite)) {
     return res.status(403).json({ error: 'Admin only' });
   }
   const { country, prNumber, reason } = req.body;
