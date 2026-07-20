@@ -236,24 +236,48 @@ function ghHeaders() {
 /**
  * Fetches a file from the configured GitHub repo/branch.
  * Returns the full API response object (including .content and .sha) or null.
+ *
+ * Hardened: retries on transient 502/503/504 with exponential backoff before
+ * returning null, so callers receive a reliable null (not a stale partial body)
+ * when GitHub infrastructure is degraded.
  */
-async function getGitHubFileContent(filePath) {
-  try {
-    const res = await fetch(
-      `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}?ref=${GITHUB_BRANCH}`,
-      { headers: ghHeaders() }
-    );
-    if (!res.ok) return null;
-    return res.json();
-  } catch (err) {
-    console.error('GitHub fetch error:', err);
-    return null;
+async function getGitHubFileContent(filePath, { retries = 3 } = {}) {
+  const url = `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}?ref=${GITHUB_BRANCH}`;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { headers: ghHeaders() });
+      if (res.ok) return res.json();
+      // Transient gateway errors — retry with backoff
+      if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < retries) {
+        console.warn(`[GitHub] getGitHubFileContent transient ${res.status} for "${filePath}" (attempt ${attempt}/${retries}) — retrying`);
+        await new Promise(r => setTimeout(r, 300 * attempt));
+        continue;
+      }
+      // 404 = file does not exist (normal); anything else = unexpected but non-retryable
+      if (res.status !== 404) {
+        console.warn(`[GitHub] getGitHubFileContent HTTP ${res.status} for "${filePath}"`);
+      }
+      return null;
+    } catch (err) {
+      if (attempt < retries) {
+        console.warn(`[GitHub] getGitHubFileContent threw for "${filePath}" (attempt ${attempt}/${retries}): ${err.message} — retrying`);
+        await new Promise(r => setTimeout(r, 300 * attempt));
+        continue;
+      }
+      console.error(`[GitHub] getGitHubFileContent fatal error for "${filePath}":`, err.message);
+      return null;
+    }
   }
+  return null;
 }
 
 /**
  * Fetches a JSON file from GitHub and returns its parsed content.
  * Returns fallback if the file does not exist or cannot be parsed.
+ *
+ * Use fetchGitHubJsonStrict() for critical OPS state files (history, buffer,
+ * pr_schedule) where a failed read must abort the operation rather than
+ * silently fall back to an empty object that could be written back as valid state.
  */
 async function fetchGitHubJson(filePath, fallback = null) {
   try {
@@ -266,6 +290,125 @@ async function fetchGitHubJson(filePath, fallback = null) {
     console.error(`[GitHub] fetchGitHubJson failed for "${filePath}":`, err.message);
     return fallback;
   }
+}
+
+/**
+ * Strict variant of fetchGitHubJson for critical OPS state files.
+ *
+ * Unlike fetchGitHubJson, this function:
+ *   - Never silently returns a fallback on a GitHub read failure.
+ *   - Throws a structured GitHubReadError if the file cannot be loaded after
+ *     retries, so the caller is forced to handle the failure explicitly.
+ *   - Still returns the fallback when the file genuinely does not exist on
+ *     GitHub (HTTP 404), because "file missing" is a real, safe state.
+ *
+ * Critical files that MUST use this helper:
+ *   data/ops/history.json
+ *   data/ops/buffer.json     (in _moveBufToHistoryAfterPR / _moveBufToHistoryAfterAppend)
+ *   data/ops/pr_schedule.json (schedule executor)
+ *
+ * @param {string} filePath     GitHub-relative path
+ * @param {*}      fallback     Value returned only on genuine 404 (file not yet created)
+ * @returns {Promise<*>}        Parsed JSON, or fallback on 404
+ * @throws  {Error}             If the read fails for any reason other than 404
+ */
+async function fetchGitHubJsonStrict(filePath, fallback = null) {
+  let lastStatus = null;
+  let lastErr    = null;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(
+        `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}?ref=${GITHUB_BRANCH}`,
+        { headers: ghHeaders() }
+      );
+
+      // File genuinely absent — return fallback (safe; not a transient error)
+      if (res.status === 404) return fallback;
+
+      if (res.ok) {
+        const fileInfo = await res.json();
+        if (!fileInfo || !fileInfo.content) {
+          // Unexpected: GitHub returned 200 but no content field
+          throw Object.assign(
+            new Error(`GitHub returned 200 but no content for "${filePath}"`),
+            { code: 'GITHUB_EMPTY_CONTENT', filePath }
+          );
+        }
+        const raw     = Buffer.from(fileInfo.content, 'base64').toString('utf8');
+        const cleaned = raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
+        return JSON.parse(cleaned);
+      }
+
+      lastStatus = res.status;
+
+      // Transient gateway errors — retry with backoff; on last attempt fall through to EXHAUSTED
+      if (res.status === 502 || res.status === 503 || res.status === 504) {
+        lastStatus = res.status;
+        if (attempt < 3) {
+          console.warn(`[GitHub] fetchGitHubJsonStrict transient ${res.status} for "${filePath}" (attempt ${attempt}/3) — retrying`);
+          await new Promise(r => setTimeout(r, 400 * attempt));
+          continue;
+        }
+        break; // last attempt — fall through to GITHUB_READ_EXHAUSTED below
+      }
+
+      // Non-transient, non-retryable HTTP failure
+      const body = await res.text().catch(() => '');
+      throw Object.assign(
+        new Error(`GitHub read failed for "${filePath}": HTTP ${res.status} — ${body.slice(0, 200)}`),
+        { code: 'GITHUB_READ_HTTP_ERROR', filePath, httpStatus: res.status }
+      );
+
+    } catch (err) {
+      if (err.code === 'GITHUB_READ_HTTP_ERROR' || err.code === 'GITHUB_EMPTY_CONTENT') throw err;
+      lastErr = err;
+      if (attempt < 3) {
+        console.warn(`[GitHub] fetchGitHubJsonStrict threw for "${filePath}" (attempt ${attempt}/3): ${err.message} — retrying`);
+        await new Promise(r => setTimeout(r, 400 * attempt));
+        continue;
+      }
+    }
+  }
+
+  // All retries exhausted
+  const msg = lastErr
+    ? `GitHub read failed for "${filePath}" after 3 attempts: ${lastErr.message}`
+    : `GitHub read failed for "${filePath}" after 3 attempts: HTTP ${lastStatus}`;
+  throw Object.assign(new Error(msg), { code: 'GITHUB_READ_EXHAUSTED', filePath, httpStatus: lastStatus });
+}
+
+/**
+ * Emits a structured CRITICAL log entry for GitHub read/write failures.
+ * Always writes to console so Render log captures it in a grep-friendly format.
+ * Never throws.
+ *
+ * @param {object} ctx
+ *   operation   - function/route name, e.g. '_moveBufToHistoryAfterPR'
+ *   filePath    - GitHub-relative path being read/written
+ *   country     - country key if applicable
+ *   user        - user email if available
+ *   prNumber    - PR number if applicable
+ *   httpStatus  - GitHub HTTP status if available
+ *   attempt     - retry attempt number if applicable
+ *   outcome     - 'aborted' | 'retrying' | 'failed'
+ *   detail      - free-form context string
+ */
+function _logGitHubCriticalFailure(ctx) {
+  const entry = {
+    level:      'CRITICAL',
+    timestamp:  new Date().toISOString(),
+    operation:  ctx.operation   || '(unknown)',
+    filePath:   ctx.filePath    || '(unknown)',
+    country:    ctx.country     || null,
+    user:       ctx.user        || null,
+    prNumber:   ctx.prNumber    || null,
+    httpStatus: ctx.httpStatus  || null,
+    attempt:    ctx.attempt     || null,
+    outcome:    ctx.outcome     || 'failed',
+    detail:     ctx.detail      || null
+  };
+  console.error('[GITHUB-CRITICAL]', JSON.stringify(entry));
 }
 
 /**
@@ -517,12 +660,78 @@ async function commitToGitHub(branchName, commits) {
  * Commits a single JSON value to the GITHUB_BRANCH (main data branch).
  * Uses PUT /contents — creates the file if it doesn't exist, updates with sha if it does.
  */
-async function commitJsonToMainBranch(filePath, data, message, _retries = 3) {
-  const isUsersFile  = filePath === 'config/users.json';
-  const isBufferFile = filePath === 'data/ops/buffer.json';
+/**
+ * History overwrite protection constants.
+ * A history write is blocked if it would drop more than this fraction of
+ * total entries OR reduce the number of country keys — unless the caller
+ * explicitly opts out via { allowCountryDrop: true } (archive route only).
+ */
+const _HISTORY_OVERWRITE_MAX_ENTRY_DROP_FRACTION = 0.20; // block if > 20 % entries lost
+const _HISTORY_FILE = 'data/ops/history.json';
+
+/**
+ * Commits a single JSON value to the GITHUB_BRANCH (main data branch).
+ * Uses PUT /contents — creates the file if it doesn't exist, updates with sha if it does.
+ *
+ * Hardened:
+ *   - Retries on 409/422 (SHA conflict) AND on 502/503/504 (transient gateway errors).
+ *   - Re-fetches SHA on every retry attempt.
+ *   - Returns false on all-retries-exhausted; NEVER throws.
+ *   - For history.json: checks that the proposed write would not reduce country
+ *     count or drop more than 20 % of entries (overwrite guard).
+ *
+ * @param {string}  filePath          GitHub-relative path
+ * @param {*}       data              Value to serialise and commit
+ * @param {string}  message           Git commit message
+ * @param {number}  _retries          Max attempts (default 3)
+ * @param {object}  [opts]
+ *   allowCountryDrop {boolean}       Bypass overwrite guard (archive route only)
+ *   country          {string}        Country context for structured logs
+ *   user             {string}        User email for structured logs
+ *   prNumber         {number}        PR number for structured logs
+ * @returns {Promise<boolean>}        true on success, false on all-retries failure
+ */
+async function commitJsonToMainBranch(filePath, data, message, _retries = 3, opts = {}) {
+  const isUsersFile   = filePath === 'config/users.json';
+  const isBufferFile  = filePath === 'data/ops/buffer.json';
+  const isHistoryFile = filePath === _HISTORY_FILE;
+
+  // ── History overwrite guard ────────────────────────────────────────────────
+  // Runs once before the retry loop — reading the current live state.
+  // If this check fails, abort immediately without touching GitHub.
+  if (isHistoryFile && !opts.allowCountryDrop) {
+    try {
+      const currentRaw = await fetchGitHubJson(_HISTORY_FILE, null);
+      if (currentRaw && typeof currentRaw === 'object' && !Array.isArray(currentRaw)) {
+        const currentKeys    = Object.keys(currentRaw);
+        const proposedKeys   = (typeof data === 'object' && !Array.isArray(data)) ? Object.keys(data) : [];
+        const currentTotal   = currentKeys.reduce((n, k) => n + (Array.isArray(currentRaw[k]) ? currentRaw[k].length : 0), 0);
+        const proposedTotal  = proposedKeys.reduce((n, k) => n + (Array.isArray(data[k]) ? data[k].length : 0), 0);
+        const droppedKeys    = currentKeys.filter(k => !proposedKeys.includes(k));
+        const entryDropFrac  = currentTotal > 0 ? (currentTotal - proposedTotal) / currentTotal : 0;
+
+        if (droppedKeys.length > 0 || entryDropFrac > _HISTORY_OVERWRITE_MAX_ENTRY_DROP_FRACTION) {
+          _logGitHubCriticalFailure({
+            operation:  'commitJsonToMainBranch/history-overwrite-guard',
+            filePath,
+            country:    opts.country   || null,
+            user:       opts.user      || null,
+            prNumber:   opts.prNumber  || null,
+            outcome:    'aborted',
+            detail:     `BLOCKED: would drop countries [${droppedKeys.join(',')}] and reduce entries ${currentTotal}→${proposedTotal} (${(entryDropFrac * 100).toFixed(1)}% drop). Message: "${message}"`
+          });
+          return false;
+        }
+      }
+    } catch (guardErr) {
+      // Guard read failure is non-fatal — log and proceed (the write itself may still be fine)
+      console.warn(`[GitHub] history overwrite guard read failed: ${guardErr.message} — proceeding with write`);
+    }
+  }
+
   for (let attempt = 1; attempt <= _retries; attempt++) {
     try {
-      const fileInfo = await getGitHubFileContent(filePath);
+      const fileInfo  = await getGitHubFileContent(filePath);
       const shaBefore = fileInfo?.sha || '(none)';
       if (isBufferFile) {
         const entryId = message.match(/entry ([^ ]+)/)?.[1] || 'n/a';
@@ -549,37 +758,55 @@ async function commitJsonToMainBranch(filePath, data, message, _retries = 3) {
       );
       if (res.ok) {
         if (isBufferFile) {
-          const okBody = await res.json().catch(() => null);
+          const okBody   = await res.json().catch(() => null);
           const shaAfter = okBody?.content?.sha || okBody?.commit?.sha || '(unknown)';
           console.log(`[SHA AFTER] ${shaAfter}`);
         }
         if (isUsersFile) {
-          const okBody = await res.json().catch(() => null);
+          const okBody   = await res.json().catch(() => null);
           const shaAfter = okBody?.content?.sha || okBody?.commit?.sha || '(unknown)';
           console.log(`[users.json] write OK — sha_after=${shaAfter}`);
         }
         return true;
       }
-      // 409/422 = SHA conflict — re-fetch and retry
-      if (res.status === 409 || res.status === 422) {
+      // 409/422 = SHA conflict — re-fetch SHA and retry
+      // 502/503/504 = transient GitHub gateway error — retry with backoff
+      const isConflict  = res.status === 409 || res.status === 422;
+      const isTransient = res.status === 502 || res.status === 503 || res.status === 504;
+      if ((isConflict || isTransient) && attempt < _retries) {
         const body = await res.text().catch(() => '');
-        if (isBufferFile) {
-          console.log(`[SHA AFTER] CONFLICT ${res.status} ${body}`);
-        }
-        console.warn(`[GitHub] commitJsonToMainBranch SHA conflict for "${filePath}" (attempt ${attempt}): ${res.status} ${body}`);
-        if (attempt < _retries) {
-          await new Promise(r => setTimeout(r, 300 * attempt)); // back-off
-          continue;
-        }
+        if (isBufferFile && isConflict) console.log(`[SHA AFTER] CONFLICT ${res.status} ${body}`);
+        console.warn(`[GitHub] commitJsonToMainBranch ${isConflict ? 'SHA conflict' : `transient ${res.status}`} for "${filePath}" (attempt ${attempt}/${_retries}) — retrying`);
+        await new Promise(r => setTimeout(r, 300 * attempt));
+        continue;
       }
       const errBody = await res.text().catch(() => '');
-      console.error(`[GitHub] commitJsonToMainBranch failed for "${filePath}": ${res.status} ${errBody}`);
+      _logGitHubCriticalFailure({
+        operation:  'commitJsonToMainBranch',
+        filePath,
+        country:    opts.country  || null,
+        user:       opts.user     || null,
+        prNumber:   opts.prNumber || null,
+        httpStatus: res.status,
+        attempt,
+        outcome:    'failed',
+        detail:     `message="${message}" errBody="${errBody.slice(0, 300)}"`
+      });
       if (isUsersFile) {
         console.error(`[users.json] WRITE FAILED — http=${res.status} branch="${GITHUB_BRANCH}" token_set=${!!GITHUB_TOKEN} body=${errBody}`);
       }
       return false;
     } catch (err) {
-      console.error(`[GitHub] commitJsonToMainBranch threw for "${filePath}" (attempt ${attempt}):`, err.message);
+      _logGitHubCriticalFailure({
+        operation:  'commitJsonToMainBranch',
+        filePath,
+        country:    opts.country  || null,
+        user:       opts.user     || null,
+        prNumber:   opts.prNumber || null,
+        attempt,
+        outcome:    attempt < _retries ? 'retrying' : 'failed',
+        detail:     err.message
+      });
       if (isUsersFile) {
         console.error(`[users.json] WRITE THREW — attempt=${attempt} error="${err.message}" token_set=${!!GITHUB_TOKEN}`);
       }
@@ -1490,10 +1717,42 @@ app.post('/api/ops/history/append', requireAuth, async (req, res) => {
   if (!validateCountry(country)) {
     return res.status(400).json({ error: 'Invalid country' });
   }
-  const history = await fetchGitHubJson('data/ops/history.json', {});
+
+  // Use strict fetch — a failed read must not silently produce {} which would
+  // then be written back as a single-country history, losing all other countries.
+  let history;
+  try {
+    history = await fetchGitHubJsonStrict('data/ops/history.json', {});
+  } catch (readErr) {
+    _logGitHubCriticalFailure({
+      operation: 'POST /api/ops/history/append', filePath: 'data/ops/history.json',
+      country, user: req.user?.email, httpStatus: readErr.httpStatus,
+      outcome: 'aborted', detail: readErr.message
+    });
+    return res.status(502).json({
+      error: 'GitHub read failed. History was not modified. Please retry.',
+      detail: readErr.message
+    });
+  }
+
   if (!history[country]) history[country] = [];
   history[country].push(entry);
-  await commitJsonToMainBranch('data/ops/history.json', history, `ops: append history entry for ${country}`);
+
+  const ok = await commitJsonToMainBranch(
+    'data/ops/history.json', history,
+    `ops: append history entry for ${country}`,
+    3, { country, user: req.user?.email }
+  );
+  if (!ok) {
+    _logGitHubCriticalFailure({
+      operation: 'POST /api/ops/history/append', filePath: 'data/ops/history.json',
+      country, user: req.user?.email, outcome: 'failed',
+      detail: 'commitJsonToMainBranch returned false'
+    });
+    return res.status(502).json({
+      error: 'GitHub write failed. History entry was not saved. Please retry.',
+    });
+  }
   res.json({ success: true });
 });
 
@@ -2686,10 +2945,21 @@ app.post('/api/ops/rollback', requireAuth, async (req, res) => {
     return res.status(403).json({ error: 'Only Admin can rollback entries' });
   }
 
-  // First fetch: read the entry to validate it exists and capture item metadata
-  const historyForRead = await fetchGitHubJson('data/ops/history.json', {});
-
-  if (!historyForRead[country] || !historyForRead[country][historyIndex]) {
+  // First fetch: read the entry to validate it exists and capture item metadata.
+  // Must use strict read — historyForRead drives the write-back copy; a {} fallback
+  // here would overwrite all history with a single-country stub.
+  let historyForRead;
+  try {
+    historyForRead = await fetchGitHubJsonStrict('data/ops/history.json', null);
+  } catch (err) {
+    _logGitHubCriticalFailure({ operation: 'rollback-read', filePath: 'data/ops/history.json', country, user: req.user?.email, errorCode: err.code, errorMessage: err.message });
+    return res.status(503).json({
+      error:      'GitHub read failure — history could not be safely loaded. The rollback was not applied.',
+      opsMessage: 'OPS could not read history.json from GitHub (possible 502 storm). No changes were made. Please retry in a moment.',
+      code:       err.code || 'GITHUB_READ_FAILURE'
+    });
+  }
+  if (!historyForRead || !historyForRead[country] || !historyForRead[country][historyIndex]) {
     return res.status(404).json({ error: 'History item not found' });
   }
 
@@ -2705,7 +2975,26 @@ app.post('/api/ops/rollback', requireAuth, async (req, res) => {
   // Process data is NOT reverted here — rollback takes effect only when the
   // corresponding PR (restoring the previous state) is merged into main.
   // Re-fetch history immediately before write to get the latest GitHub SHA.
-  const history = await fetchGitHubJson('data/ops/history.json', {});
+  // Must use strict read — this copy is the one we write back; {} fallback
+  // here would overwrite all existing history with a single-country stub.
+  let history;
+  try {
+    history = await fetchGitHubJsonStrict('data/ops/history.json', null);
+  } catch (err) {
+    _logGitHubCriticalFailure({ operation: 'rollback-write-prefetch', filePath: 'data/ops/history.json', country, user: req.user?.email, errorCode: err.code, errorMessage: err.message });
+    return res.status(503).json({
+      error:      'GitHub read failure before write — history could not be safely loaded. The rollback was not applied.',
+      opsMessage: 'OPS could not safely read history.json before writing. No changes were made. Please retry in a moment.',
+      code:       err.code || 'GITHUB_READ_FAILURE'
+    });
+  }
+  if (!history) {
+    return res.status(503).json({
+      error:      'history.json returned null — rollback aborted.',
+      opsMessage: 'OPS history file could not be loaded. No changes were made.',
+      code:       'GITHUB_READ_NULL'
+    });
+  }
 
   // Stamp the original entry in-place in the freshly fetched copy
   const item = history[country] && history[country][historyIndex];
@@ -2731,7 +3020,15 @@ app.post('/api/ops/rollback', requireAuth, async (req, res) => {
   if (!history[country]) history[country] = [];
   history[country].push(rollbackLogEntry);
 
-  await commitJsonToMainBranch('data/ops/history.json', history, `ops: rollback entry ${itemId || historyIndex} for ${country}`);
+  const writeOk = await commitJsonToMainBranch('data/ops/history.json', history, `ops: rollback entry ${itemId || historyIndex} for ${country}`);
+  if (!writeOk) {
+    _logGitHubCriticalFailure({ operation: 'rollback-write', filePath: 'data/ops/history.json', country, user: req.user?.email, errorMessage: 'commitJsonToMainBranch returned false' });
+    return res.status(502).json({
+      error:      'GitHub write failure — rollback metadata could not be committed.',
+      opsMessage: 'OPS could not commit the rollback record to GitHub. Please retry or contact your Admin if the issue persists.',
+      code:       'GITHUB_WRITE_FAILURE'
+    });
+  }
 
   appendActivityLog({
     event:       'rollback',
@@ -3409,12 +3706,14 @@ app.post('/api/admin/remove-country', requireAuth, async (req, res) => {
   }
 
   // ── 6. Commit everything to GitHub in parallel ────────────────────────────
+  const archiveOpts = { allowCountryDrop: true, user: req.user.email, country };
   await Promise.all([
     commitJsonToMainBranch('data/ops/archive/country_archive.json', countryArchive, `admin: archive processes for ${country}`),
     commitJsonToMainBranch('data/ops/archive/history_archive.json', histArchive,    `admin: archive history for ${country}`),
     commitJsonToMainBranch('data/ops/archive/logs_archive.json',    logsArchive,    `admin: archive logs for ${country}`),
-    commitJsonToMainBranch('data/ops/history.json',                 history,        `admin: remove country ${country} from history`),
-    commitJsonToMainBranch('data/ops/buffer.json',                  buffer,         `admin: clear buffer for ${country}`),
+    // allowCountryDrop: true — explicit archive; country key is intentionally deleted
+    commitJsonToMainBranch('data/ops/history.json', history, `admin: remove country ${country} from history`, 3, archiveOpts),
+    commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `admin: clear buffer for ${country}`),
     commitJsonToMainBranch('config/countries.json',                 updatedCountries, `admin: deregister country ${country}`),
     commitJsonToMainBranch('data/ops/settings.json',                settings,       `admin: remove ${country} from settings`),
     // Overwrite the process file with an archived marker rather than deleting it
@@ -3473,8 +3772,9 @@ app.post('/api/ops/archive/history', requireAuth, async (req, res) => {
   });
 
   await Promise.all([
-    commitJsonToMainBranch('data/ops/archive/history_archive.json', archive,  `admin: archive ${archived} history entries`),
-    commitJsonToMainBranch('data/ops/history.json',                 history,  'admin: clear history after archive')
+    commitJsonToMainBranch('data/ops/archive/history_archive.json', archive, `admin: archive ${archived} history entries`),
+    // allowCountryDrop: true — this is the explicit archive route; country keys go to [] intentionally
+    commitJsonToMainBranch('data/ops/history.json', history, 'admin: clear history after archive', 3, { allowCountryDrop: true, user: req.user.email })
   ]);
 
   appendAdminAudit({ action: 'history-archived', by: req.user.email, archived });
@@ -3517,7 +3817,8 @@ app.post('/api/ops/archive/logs', requireAuth, async (req, res) => {
 
   await Promise.all([
     commitJsonToMainBranch('data/ops/archive/logs_archive.json', archive, `admin: archive ${archived} log entries`),
-    commitJsonToMainBranch('data/ops/history.json',              history, 'admin: remove archived logs from history')
+    // allowCountryDrop: true — this operation reduces entries by design (archived logs removed)
+    commitJsonToMainBranch('data/ops/history.json', history, 'admin: remove archived logs from history', 3, { allowCountryDrop: true, user: req.user.email })
   ]);
 
   appendAdminAudit({ action: 'logs-archived', by: req.user.email, archived });
@@ -3567,12 +3868,35 @@ async function appendActivityLog(entry) {
 async function _moveBufToHistoryAfterPR(country, validatedEntries, prResult, triggeredBy) {
   const entryIds = new Set(validatedEntries.map(e => e.id));
   const now      = new Date().toISOString();
+  const logCtx   = { operation: '_moveBufToHistoryAfterPR', country, user: triggeredBy, prNumber: prResult.prNumber };
 
-  // Re-fetch both files fresh — the PR creation round-trips took time
-  const [buffer, history] = await Promise.all([
-    fetchGitHubJson('data/ops/buffer.json',  {}),
-    fetchGitHubJson('data/ops/history.json', {})
-  ]);
+  // ── Strict fetch — a transient GitHub read failure must abort, not fall back to {}
+  // If we write {"it":[...]} over a 135-entry multi-country history, all other
+  // countries are permanently lost.  fetchGitHubJsonStrict throws on any failure
+  // other than a genuine 404 (file not yet created).
+  let buffer, history;
+  try {
+    [buffer, history] = await Promise.all([
+      fetchGitHubJsonStrict('data/ops/buffer.json',  {}),
+      fetchGitHubJsonStrict('data/ops/history.json', {})
+    ]);
+  } catch (readErr) {
+    _logGitHubCriticalFailure({
+      ...logCtx, filePath: readErr.filePath || 'data/ops/history.json|buffer.json',
+      httpStatus: readErr.httpStatus, outcome: 'aborted',
+      detail: `fetchGitHubJsonStrict failed — buffer/history write ABORTED to prevent overwrite: ${readErr.message}`
+    });
+    throw readErr;  // propagates to executor — PR is created but workflow error is surfaced
+  }
+
+  // Sanity-check: history must be a plain country-keyed object
+  if (typeof history !== 'object' || Array.isArray(history)) {
+    _logGitHubCriticalFailure({
+      ...logCtx, filePath: 'data/ops/history.json', outcome: 'aborted',
+      detail: `history.json fetch returned ${Array.isArray(history) ? 'array' : typeof history} — write ABORTED`
+    });
+    throw new Error('_moveBufToHistoryAfterPR: history.json did not return a valid country-keyed object');
+  }
 
   // Remove matched entries from buffer
   if (buffer[country]) {
@@ -3594,14 +3918,38 @@ async function _moveBufToHistoryAfterPR(country, validatedEntries, prResult, tri
       branchName:  prResult.branchName,
       prCreatedAt: now,
       prCreatedBy: triggeredBy,
-      submittedAt: now,   // fix: was missing — now always populated on PR creation
+      submittedAt: now,
       submittedBy: triggeredBy
     });
   }
 
-  // Sequential writes to avoid SHA conflicts on the same branch
-  await commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `ops: clear ${country} buffer after PR #${prResult.prNumber}`);
-  await commitJsonToMainBranch('data/ops/history.json', history, `ops: add ${country} entries as pending_merge for PR #${prResult.prNumber}`);
+  const writeOpts = { country, user: triggeredBy, prNumber: prResult.prNumber };
+
+  // Sequential writes — buffer first, then history
+  const bufferOk = await commitJsonToMainBranch(
+    'data/ops/buffer.json', buffer,
+    `ops: clear ${country} buffer after PR #${prResult.prNumber}`,
+    3, writeOpts
+  );
+  if (!bufferOk) {
+    _logGitHubCriticalFailure({
+      ...logCtx, filePath: 'data/ops/buffer.json', outcome: 'failed',
+      detail: 'Buffer clear after PR creation failed — history write continues; buffer may need Admin recovery'
+    });
+  }
+
+  const historyOk = await commitJsonToMainBranch(
+    'data/ops/history.json', history,
+    `ops: add ${country} entries as pending_merge for PR #${prResult.prNumber}`,
+    3, writeOpts
+  );
+  if (!historyOk) {
+    _logGitHubCriticalFailure({
+      ...logCtx, filePath: 'data/ops/history.json', outcome: 'failed',
+      detail: 'History write after PR creation failed — PR was created but history is not updated; Admin must use sync-published to recover'
+    });
+    throw new Error(`_moveBufToHistoryAfterPR: history.json write failed for PR #${prResult.prNumber}`);
+  }
 }
 
 // ─── PR Schedule helpers ──────────────────────────────────────────────────────
@@ -3922,11 +4270,31 @@ async function _appendToActivePR(country, newEntries, triggeredBy, activePR, bat
 async function _moveBufToHistoryAfterAppend(country, appendedEntries, activePR, triggeredBy, batchId) {
   const entryIds = new Set(appendedEntries.map(e => e.id));
   const now      = new Date().toISOString();
+  const logCtx   = { operation: '_moveBufToHistoryAfterAppend', country, user: triggeredBy, prNumber: activePR.prNumber };
 
-  const [buffer, history] = await Promise.all([
-    fetchGitHubJson('data/ops/buffer.json',  {}),
-    fetchGitHubJson('data/ops/history.json', {})
-  ]);
+  // Strict fetch — abort rather than fall back to {} on a transient GitHub read failure
+  let buffer, history;
+  try {
+    [buffer, history] = await Promise.all([
+      fetchGitHubJsonStrict('data/ops/buffer.json',  {}),
+      fetchGitHubJsonStrict('data/ops/history.json', {})
+    ]);
+  } catch (readErr) {
+    _logGitHubCriticalFailure({
+      ...logCtx, filePath: readErr.filePath || 'data/ops/history.json|buffer.json',
+      httpStatus: readErr.httpStatus, outcome: 'aborted',
+      detail: `fetchGitHubJsonStrict failed — append write ABORTED to prevent overwrite: ${readErr.message}`
+    });
+    throw readErr;
+  }
+
+  if (typeof history !== 'object' || Array.isArray(history)) {
+    _logGitHubCriticalFailure({
+      ...logCtx, filePath: 'data/ops/history.json', outcome: 'aborted',
+      detail: `history.json returned ${Array.isArray(history) ? 'array' : typeof history} — append write ABORTED`
+    });
+    throw new Error('_moveBufToHistoryAfterAppend: history.json did not return a valid country-keyed object');
+  }
 
   // Remove matched entries from buffer
   if (buffer[country]) {
@@ -3954,8 +4322,32 @@ async function _moveBufToHistoryAfterAppend(country, appendedEntries, activePR, 
     });
   }
 
-  await commitJsonToMainBranch('data/ops/buffer.json',  buffer,  `ops: clear ${country} buffer after append to PR #${activePR.prNumber} (batch ${batchId})`);
-  await commitJsonToMainBranch('data/ops/history.json', history, `ops: add ${country} batch ${batchId} as pending_merge for PR #${activePR.prNumber}`);
+  const writeOpts = { country, user: triggeredBy, prNumber: activePR.prNumber };
+
+  const bufferOk = await commitJsonToMainBranch(
+    'data/ops/buffer.json', buffer,
+    `ops: clear ${country} buffer after append to PR #${activePR.prNumber} (batch ${batchId})`,
+    3, writeOpts
+  );
+  if (!bufferOk) {
+    _logGitHubCriticalFailure({
+      ...logCtx, filePath: 'data/ops/buffer.json', outcome: 'failed',
+      detail: `Buffer clear after append failed for batch ${batchId}`
+    });
+  }
+
+  const historyOk = await commitJsonToMainBranch(
+    'data/ops/history.json', history,
+    `ops: add ${country} batch ${batchId} as pending_merge for PR #${activePR.prNumber}`,
+    3, writeOpts
+  );
+  if (!historyOk) {
+    _logGitHubCriticalFailure({
+      ...logCtx, filePath: 'data/ops/history.json', outcome: 'failed',
+      detail: `History write after append failed for batch ${batchId}`
+    });
+    throw new Error(`_moveBufToHistoryAfterAppend: history.json write failed for batch ${batchId}`);
+  }
 }
 
 // ─── PR Schedule routes ───────────────────────────────────────────────────────
@@ -4467,8 +4859,32 @@ async function _adminPreflightCheck(user, country, prNumber, expectedGitHubState
     };
   }
 
-  // 3. History pre-flight — re-fetch fresh to catch stale Admin state
-  const historyPre = await fetchGitHubJson('data/ops/history.json', {});
+  // 3. History pre-flight — re-fetch fresh to catch stale Admin state.
+  // Must use strict read: historyPre is the source of truth for entry validation
+  // and is passed to approve/reject which writes it back. A {} fallback here would
+  // cause the caller to write a single-country stub, losing all other countries.
+  let historyPre;
+  try {
+    historyPre = await fetchGitHubJsonStrict('data/ops/history.json', null);
+  } catch (err) {
+    _logGitHubCriticalFailure({ operation: '_adminPreflightCheck', filePath: 'data/ops/history.json', country, user: user?.email, prNumber, errorCode: err.code, errorMessage: err.message });
+    return {
+      ok: false, httpStatus: 503,
+      error: `history.json could not be safely loaded from GitHub (${err.code || 'GITHUB_READ_FAILURE'}). Approve/reject aborted — no changes were made.`,
+      opsMessage: 'OPS could not read history.json from GitHub (possible 502 storm). No changes were made. Please retry in a moment.',
+      productionChanged: false,
+      entriesLocked: true
+    };
+  }
+  if (!historyPre) {
+    return {
+      ok: false, httpStatus: 503,
+      error: 'history.json returned null from GitHub. Approve/reject aborted — no changes were made.',
+      opsMessage: 'OPS history file could not be loaded. No changes were made.',
+      productionChanged: false,
+      entriesLocked: true
+    };
+  }
   const matchingEntries = (historyPre[country] || []).filter(
     h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
   );
@@ -4744,10 +5160,29 @@ app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
       mergedCount++;
     });
 
-    await commitJsonToMainBranch(
+    const historyMergeOk = await commitJsonToMainBranch(
       'data/ops/history.json', historyPre,
-      `ops: mark ${country} PR #${prNumber} as merged — approved by ${approver}`
+      `ops: mark ${country} PR #${prNumber} as merged — approved by ${approver}`,
+      3, { country, user: approver, prNumber }
     );
+    if (!historyMergeOk) {
+      _logGitHubCriticalFailure({
+        operation: 'POST /api/admin/pr/approve — history write', filePath: 'data/ops/history.json',
+        country, user: approver, prNumber, outcome: 'failed',
+        detail: 'Production was MERGED but history.json update failed. Use sync-published or manual recovery.'
+      });
+      // Production merge succeeded — we cannot un-merge. Return a partial-success warning.
+      return res.status(207).json({
+        success:         false,
+        partialSuccess:  true,
+        country,
+        prNumber,
+        mergedCount,
+        sha:             mergeSha,
+        opsMessage:      `Publish Request #${prNumber} was merged to production successfully, but the OPS History record could not be updated (GitHub write failed). Production is correct. Please use Admin → Refresh Status or Sync-Published to recover the history record.`,
+        availableActions: ['syncAsPublished', 'refreshStatus', 'viewErrorDetails']
+      });
+    }
 
     // ── J2/J3: Media lifecycle hooks (fire-and-forget after successful merge) ────
     // These run asynchronously and never block or fail the approve response.
@@ -4971,10 +5406,28 @@ app.post('/api/admin/pr/close', requireAuth, async (req, res) => {
       refusedCount++;
     });
 
-    await commitJsonToMainBranch(
+    const historyRejectOk = await commitJsonToMainBranch(
       'data/ops/history.json', historyPre,
-      `ops: mark ${country} PR #${prNumber} as refused — rejected by ${rejecter}`
+      `ops: mark ${country} PR #${prNumber} as refused — rejected by ${rejecter}`,
+      3, { country, user: rejecter, prNumber }
     );
+    if (!historyRejectOk) {
+      _logGitHubCriticalFailure({
+        operation: 'POST /api/admin/pr/close — history write', filePath: 'data/ops/history.json',
+        country, user: rejecter, prNumber, outcome: 'failed',
+        detail: 'PR was CLOSED on GitHub but history.json update failed. Use sync-refused or Refresh Status to recover.'
+      });
+      return res.status(207).json({
+        success:         false,
+        partialSuccess:  true,
+        country,
+        prNumber,
+        state:           pr.state,
+        refusedCount,
+        opsMessage:      `Publish Request #${prNumber} was closed on GitHub, but the OPS History record could not be updated (GitHub write failed). Use Admin → Refresh Status or Sync-Refused to recover.`,
+        availableActions: ['syncAsRefused', 'refreshStatus', 'viewErrorDetails']
+      });
+    }
 
     // ── J1: Cleanup staged media after PR rejection (fire-and-forget) ────────
     setImmediate(async () => {
