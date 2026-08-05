@@ -2260,11 +2260,35 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'buffer object required' });
   }
 
-  // Phase 3: country-scope enforcement — check every country key in the incoming buffer
-  for (const ck of Object.keys(newBuffer)) {
-    if (!validateCountry(ck)) continue; // malformed keys rejected downstream
-    const _putScope = await _assertCountryAllowed(req.user, ck);
-    if (!_putScope.ok) return res.status(_putScope.status).json({ error: _putScope.error });
+  // Phase 3: country-scope enforcement.
+  // When editEntryId is present this is a single-entry edit — only the country
+  // that owns that specific entry needs to be checked.  Checking every country
+  // key in the full buffer payload (which the client always sends in its
+  // entirety) incorrectly blocked OLs/Managers from editing their own entries
+  // when other countries' entries were also present in the buffer.
+  if (editEntryId) {
+    // Find the country key that contains this entry in the incoming buffer.
+    let editEntryCountry = null;
+    outer: for (const ck of Object.keys(newBuffer)) {
+      if (!validateCountry(ck)) continue;
+      for (const userEntries of Object.values(newBuffer[ck] || {})) {
+        if ((userEntries || []).some(e => e.id === editEntryId)) {
+          editEntryCountry = ck;
+          break outer;
+        }
+      }
+    }
+    if (editEntryCountry) {
+      const _putScope = await _assertCountryAllowed(req.user, editEntryCountry);
+      if (!_putScope.ok) return res.status(_putScope.status).json({ error: _putScope.error });
+    }
+  } else {
+    // Legacy / bulk path: check every country key present in the payload.
+    for (const ck of Object.keys(newBuffer)) {
+      if (!validateCountry(ck)) continue;
+      const _putScope = await _assertCountryAllowed(req.user, ck);
+      if (!_putScope.ok) return res.status(_putScope.status).json({ error: _putScope.error });
+    }
   }
 
   // ── Edit-lock check ──────────────────────────────────────────────────────────
@@ -2446,8 +2470,17 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
     }
   }
 
-  await commitJsonToMainBranch('data/ops/buffer.json', newBuffer, 'ops: replace buffer');
-  res.json({ success: true, buffer: newBuffer });
+  // ── Merge incoming country slices into the live buffer ───────────────────────
+  // Only country keys present in newBuffer are updated — all other countries'
+  // entries in the live buffer are preserved unchanged.  This prevents a
+  // full-overwrite race where a concurrent save by another user (or in another
+  // country) would be silently dropped.
+  for (const ck of Object.keys(newBuffer)) {
+    liveBuffer[ck] = newBuffer[ck];
+  }
+
+  await commitJsonToMainBranch('data/ops/buffer.json', liveBuffer, 'ops: update buffer');
+  res.json({ success: true, buffer: liveBuffer });
 });
 
 // ─── Edit-lock heartbeat ──────────────────────────────────────────────────────
