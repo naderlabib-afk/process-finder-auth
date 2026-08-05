@@ -2805,7 +2805,7 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
  * POST /api/ops/validate
  * Toggles a buffer entry between status="pending" and status="validated".
  * The entry STAYS IN THE BUFFER — no history write, no PR trigger.
- * Entries only move to history after the 10-minute scheduled PR executor fires.
+ * Entries only move to history after the 30-second scheduled PR executor fires.
  *
  * "validated" is a Buffer READINESS state, not an approval state.
  * It means the entry has passed operational/readiness checks and is eligible
@@ -3173,7 +3173,7 @@ app.post('/api/ops/settings', requireAuth, async (req, res) => {
 /**
  * POST /api/ops/approve-and-merge
  * ⚠️  EMERGENCY OVERRIDE — Admin only.
- * Bypasses the normal 10-minute scheduled PR flow and immediately creates a PR
+ * Bypasses the normal 30-second scheduled PR flow and immediately creates a PR
  * from all currently validated buffer entries for the given country.
  * Use only when the scheduled executor has failed or been skipped.
  */
