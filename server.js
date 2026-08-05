@@ -2470,8 +2470,17 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
     }
   }
 
-  await commitJsonToMainBranch('data/ops/buffer.json', newBuffer, 'ops: replace buffer');
-  res.json({ success: true, buffer: newBuffer });
+  // ── Merge incoming country slices into the live buffer ───────────────────────
+  // Only country keys present in newBuffer are updated — all other countries'
+  // entries in the live buffer are preserved unchanged.  This prevents a
+  // full-overwrite race where a concurrent save by another user (or in another
+  // country) would be silently dropped.
+  for (const ck of Object.keys(newBuffer)) {
+    liveBuffer[ck] = newBuffer[ck];
+  }
+
+  await commitJsonToMainBranch('data/ops/buffer.json', liveBuffer, 'ops: update buffer');
+  res.json({ success: true, buffer: liveBuffer });
 });
 
 // ─── Edit-lock heartbeat ──────────────────────────────────────────────────────
