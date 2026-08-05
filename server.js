@@ -7198,9 +7198,12 @@ app.post('/api/standby/save', requireAuth, async (req, res) => {
   const filePath = `${STANDBY_DIR}/${ck}_${yr}.json`;
   const now      = new Date();
 
-  // ── Fetch existing file for country/year display name ─────────────────────
-  const allCountries = await fetchGitHubJson('config/countries.json', {});
-  const countryName  = allCountries[ck]?.name || ck.toUpperCase();
+  // ── Resolve display name from countries.json ──────────────────────────────
+  // countries.json is an array — must use .find(), not object-key lookup.
+  const allCountries = await fetchGitHubJson('config/countries.json', []);
+  const countryName  = (Array.isArray(allCountries)
+    ? allCountries.find(c => c.key === ck)?.name
+    : null) || ck.toUpperCase();
 
   const payload = {
     country:    countryName,
