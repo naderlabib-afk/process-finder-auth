@@ -1409,6 +1409,8 @@ app.post("/send-otp", async (req, res) => {
     if (!registeredUser) {
       // Return a generic 400 — do not reveal whether the email is registered.
       console.warn("[OTP BLOCKED] unregistered email:", normalized);
+      appendActivityLog({ event: 'otp-send-blocked', reason: 'unregistered-email', email: normalized })
+        .catch(e => console.warn('[auth log] otp-send-blocked write failed:', e.message));
       return res.status(400).json({ error: "Email not authorized" });
     }
 
@@ -1419,6 +1421,8 @@ app.post("/send-otp", async (req, res) => {
     const cooldownRemainS = Math.ceil((sendLog.lastSentAt + OTP_COOLDOWN_S * 1000 - now) / 1000);
     if (cooldownRemainS > 0) {
       console.warn("[OTP THROTTLED] cooldown:", normalized, `${cooldownRemainS}s remaining`);
+      appendActivityLog({ event: 'otp-send-blocked', reason: 'cooldown', email: normalized, retryAfterSeconds: cooldownRemainS })
+        .catch(e => console.warn('[auth log] otp-send-blocked write failed:', e.message));
       return res.status(429).json({
         error: "Please wait before requesting another code.",
         retryAfterSeconds: cooldownRemainS
@@ -1430,6 +1434,8 @@ app.post("/send-otp", async (req, res) => {
     const recentSends = sendLog.hourlySends.filter(t => t > oneHourAgo);
     if (recentSends.length >= OTP_HOURLY_CAP) {
       console.warn("[OTP THROTTLED] hourly cap:", normalized, `${recentSends.length}/${OTP_HOURLY_CAP}`);
+      appendActivityLog({ event: 'otp-send-blocked', reason: 'hourly-cap', email: normalized })
+        .catch(e => console.warn('[auth log] otp-send-blocked write failed:', e.message));
       return res.status(429).json({
         error: "Too many OTP requests. Please try again later.",
         retryAfterSeconds: 3600
@@ -1443,6 +1449,8 @@ app.post("/send-otp", async (req, res) => {
     }
     if (_otpGlobalSendLog.length >= OTP_GLOBAL_HOURLY_CAP) {
       console.warn("[OTP THROTTLED] global hourly cap:", _otpGlobalSendLog.length, "sends in last hour");
+      appendActivityLog({ event: 'otp-send-blocked', reason: 'global-hourly-cap', email: normalized })
+        .catch(e => console.warn('[auth log] otp-send-blocked write failed:', e.message));
       return res.status(429).json({
         error: "OTP service temporarily at capacity. Please try again later.",
         retryAfterSeconds: 3600
@@ -1499,6 +1507,8 @@ app.post("/send-otp", async (req, res) => {
           "message:", result.error.message,
           "statusCode:", result.error.statusCode
         );
+        appendActivityLog({ event: 'otp-send-failed', email: normalized, error: result.error.message, statusCode: result.error.statusCode })
+          .catch(e => console.warn('[auth log] otp-send-failed write failed:', e.message));
         return res.status(502).json({ error: "Failed to deliver OTP email. Please try again." });
       }
 
@@ -1548,11 +1558,15 @@ app.post("/verify-otp", (req, res) => {
 
   if (Date.now() > challenge.expiry) {
     _otpChallenges.delete(normalized);
+    appendActivityLog({ event: 'otp-failed', reason: 'expired', email: normalized })
+      .catch(e => console.warn('[auth log] otp-failed write failed:', e.message));
     return res.status(400).json({ error: 'OTP_EXPIRED', message: 'The OTP code has expired. Please request a new code.' });
   }
 
   if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
     _otpChallenges.delete(normalized);
+    appendActivityLog({ event: 'otp-failed', reason: 'max-attempts-locked', email: normalized })
+      .catch(e => console.warn('[auth log] otp-failed write failed:', e.message));
     return res.status(429).json({ error: 'TOO_MANY_ATTEMPTS', message: 'Too many incorrect attempts. Please request a new code.' });
   }
 
@@ -1560,6 +1574,8 @@ app.post("/verify-otp", (req, res) => {
   if (submitted !== challenge.code) {
     challenge.attempts += 1;
     const remaining = OTP_MAX_ATTEMPTS - challenge.attempts;
+    appendActivityLog({ event: 'otp-failed', reason: 'invalid-code', email: normalized, attemptsRemaining: remaining })
+      .catch(e => console.warn('[auth log] otp-failed write failed:', e.message));
     return res.status(400).json({
       error: 'INVALID_OTP',
       // remainingAttempts is a typed numeric field for frontend rendering.
@@ -1588,6 +1604,8 @@ app.post("/verify-otp", (req, res) => {
   });
 
   console.log("[OTP VERIFIED]", normalized);
+  appendActivityLog({ event: 'otp-verified', email: normalized })
+    .catch(e => console.warn('[auth log] otp-verified write failed:', e.message));
   res.json({ success: true, otpToken });
 });
 
@@ -1622,22 +1640,30 @@ app.post('/api/auth/session', async (req, res) => {
     const msg = otpResult.expired
       ? 'OTP verification has expired. Please request a new code.'
       : 'Invalid OTP verification token.';
+    appendActivityLog({ event: 'session-rejected', reason: otpResult.expired ? 'otp-token-expired' : 'invalid-otp-token', email: email.trim().toLowerCase() })
+      .catch(e => console.warn('[auth log] session-rejected write failed:', e.message));
     return res.status(401).json({ error: 'INVALID_OTP_TOKEN', message: msg });
   }
 
   const otpPayload = otpResult.payload;
 
   if (otpPayload.type !== 'otp-verified') {
+    appendActivityLog({ event: 'session-rejected', reason: 'invalid-otp-token-type', email: email.trim().toLowerCase() })
+      .catch(e => console.warn('[auth log] session-rejected write failed:', e.message));
     return res.status(401).json({ error: 'INVALID_OTP_TOKEN', message: 'Invalid OTP verification token.' });
   }
 
   const normalizedEmail = email.trim().toLowerCase();
   if (otpPayload.email !== normalizedEmail) {
+    appendActivityLog({ event: 'session-rejected', reason: 'otp-email-mismatch', email: normalizedEmail })
+      .catch(e => console.warn('[auth log] session-rejected write failed:', e.message));
     return res.status(401).json({ error: 'OTP_EMAIL_MISMATCH', message: 'OTP token does not match the requested email.' });
   }
 
   // Enforce single-use: reject if this jti has already been consumed
   if (_usedOtpJtis.has(otpPayload.jti)) {
+    appendActivityLog({ event: 'session-rejected', reason: 'otp-token-reused', email: normalizedEmail, jti: otpPayload.jti })
+      .catch(e => console.warn('[auth log] session-rejected write failed:', e.message));
     return res.status(401).json({ error: 'OTP_TOKEN_REUSED', message: 'OTP verification token has already been used.' });
   }
 
@@ -1648,12 +1674,16 @@ app.post('/api/auth/session', async (req, res) => {
   const users = await fetchGitHubJson('config/users.json', []);
   const user = users.find(u => u.email.trim().toLowerCase() === normalizedEmail);
   if (!user || !['OL', 'Manager', 'Admin'].includes(user.role)) {
+    appendActivityLog({ event: 'session-rejected', reason: 'unauthorized-role', email: normalizedEmail })
+      .catch(e => console.warn('[auth log] session-rejected write failed:', e.message));
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
   const now = Math.floor(Date.now() / 1000);
   const token = signJwt({ email: user.email, role: user.role, globalWrite: user.globalWrite || false, iat: now, exp: now + TOKEN_TTL });
   console.log("[SESSION ISSUED]", user.email, user.role, user.globalWrite ? '[globalWrite]' : '');
+  appendActivityLog({ event: 'session-issued', email: user.email, role: user.role })
+    .catch(e => console.warn('[auth log] session-issued write failed:', e.message));
   res.setHeader('Set-Cookie', `ops_session=${encodeURIComponent(token)}; Path=/; Max-Age=${TOKEN_TTL}; HttpOnly; SameSite=None; Secure`);
   res.json({ success: true, token, email: user.email, role: user.role, globalWrite: user.globalWrite || false });
 });
@@ -2950,7 +2980,7 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
         entryId: entry.id,
         type:    entry.type,
         issue:   entry.process?.issue || entry.process?.id || '?'
-      });
+      }).catch(e => console.error('[activity log] validation write failed:', e.message));
     }
 
     console.log(`[OPS validate] Entry "${entry.id}" → ${entry.status} by ${validator} for "${country}"`);
@@ -3072,7 +3102,7 @@ app.post('/api/ops/rollback', requireAuth, async (req, res) => {
     type:        itemType,
     before:      afterSnap,
     after:       beforeSnap
-  });
+  }).catch(e => console.error('[activity log] rollback write failed:', e.message));
 
   res.json({ success: true, item: item || itemSnapshot });
 });
@@ -3240,7 +3270,7 @@ app.post('/api/ops/approve-and-merge', requireAuth, async (req, res) => {
       prUrl:      prResult.prUrl,
       entryCount: validatedEntries.length,
       trigger:    'emergency-override'
-    });
+    }).catch(e => console.error('[activity log] pr-created write failed:', e.message));
 
     res.json({
       success:    true,
@@ -3568,23 +3598,40 @@ app.post('/api/admin/users', requireAuth, async (req, res) => {
     return res.status(503).json({ error: 'GitHub write failed — user change not persisted. Please retry.' });
   }
 
-  appendAdminAudit({
-    action:  'users-updated',
-    by:      req.user.email,
-    before,
-    after:   working,
-    opCount: users.length
-  });
+  // Await admin audit — capture failure so we can include a logWarning in the
+  // response. The users.json write already succeeded; we must NOT roll back.
+  let auditLogWarning = null;
+  try {
+    await appendAdminAudit({
+      action:  'users-updated',
+      by:      req.user.email,
+      before,
+      after:   working,
+      opCount: users.length
+    });
+  } catch (auditErr) {
+    console.error('[audit] admin-audit write failed after users-updated:', auditErr.message);
+    auditLogWarning = 'Admin audit write failed — user change was applied. Please check activity logs.';
+  }
 
-  // Fire-and-forget: assignment history and inheritance transfers
+  // Fire-and-forget: assignment history and inheritance transfers.
+  // On assignment history failure, include a logWarning in the response.
   if (assignmentEvents.length > 0) {
-    appendAssignmentHistory(assignmentEvents).catch(() => {});
+    appendAssignmentHistory(assignmentEvents).catch(aErr => {
+      console.error('[audit] assignment-history write failed:', aErr.message);
+      // Note: auditLogWarning may already be set above; append rather than overwrite.
+      auditLogWarning = auditLogWarning
+        ? auditLogWarning + ' Assignment history write also failed.'
+        : 'Assignment history write failed — user change was applied. Please check activity logs.';
+    });
   }
   for (const t of pendingInheritance) {
     _transferOrphanedBufferEntries(t.departedEmail, t.inheritedBy, t.country, t.changedBy).catch(() => {});
   }
 
-  res.json({ success: true, count: working.length, assignmentEvents: assignmentEvents.length });
+  const usersResponse = { success: true, count: working.length, assignmentEvents: assignmentEvents.length };
+  if (auditLogWarning) usersResponse.logWarning = auditLogWarning;
+  res.json(usersResponse);
 });
 
 /**
@@ -3758,22 +3805,32 @@ app.post('/api/admin/remove-country', requireAuth, async (req, res) => {
       : Promise.resolve()
   ]);
 
-  appendAdminAudit({
-    action:       'country-removed',
-    by:           req.user.email,
-    country,
-    processCount: processes.length,
-    historyCount: historyEntries.length,
-    logsCount:    logsEntries.length,
-    archivedAt
-  });
+  // Await admin audit — capture failure for logWarning in the response.
+  // The country removal has already been committed; we must NOT roll back.
+  let removeCountryLogWarning = null;
+  try {
+    await appendAdminAudit({
+      action:       'country-removed',
+      by:           req.user.email,
+      country,
+      processCount: processes.length,
+      historyCount: historyEntries.length,
+      logsCount:    logsEntries.length,
+      archivedAt
+    });
+  } catch (auditErr) {
+    console.error('[audit] admin-audit write failed after country-removed:', auditErr.message);
+    removeCountryLogWarning = 'Admin audit write failed — country removal was applied. Please check activity logs.';
+  }
 
-  res.json({
+  const removeCountryResponse = {
     success:      true,
     processCount: processes.length,
     historyCount: historyEntries.length,
     logsCount:    logsEntries.length
-  });
+  };
+  if (removeCountryLogWarning) removeCountryResponse.logWarning = removeCountryLogWarning;
+  res.json(removeCountryResponse);
 });
 
 // ─── Archive endpoints (Admin only) ──────────────────────────────────────────
@@ -4553,7 +4610,7 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
     entryCount:  validatedCount,
     batchId,
     ...(isAppendMode ? { activePRNumber: activePR.prNumber } : {})
-  });
+  }).catch(e => console.error('[activity log] pr-scheduled write failed:', e.message));
 
   console.log(`[PR schedule] Scheduled ${isAppendMode ? `append (batch ${batchId}) to PR #${activePR.prNumber}` : 'PR'} for "${country}" to execute after ${job.execute_after}`);
   res.json({ success: true, job });
@@ -4605,7 +4662,7 @@ app.delete('/api/ops/pr/schedule/:country', requireAuth, async (req, res) => {
       activePRNumber: job.active_pr?.prNumber || null,
       activePRUrl:    job.active_pr?.prUrl    || null
     } : {})
-  });
+  }).catch(e => console.error('[activity log] pr-schedule-cancelled write failed:', e.message));
 
   console.log(`[PR schedule] PR for "${country}" cancelled by ${req.user.email}`);
   res.json({ success: true, job });
@@ -5293,7 +5350,7 @@ app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
       mergedCount,
       mergeCommitSha: mergeSha,
       approvedAt:  now
-    });
+    }).catch(e => console.error('[activity log] request-approved write failed:', e.message));
 
     console.log(`[Admin approve] PR #${prNumber} merged for "${country}" by ${approver} — ${mergedCount} history entries updated`);
     res.json({ success: true, country, prNumber, mergedCount, sha: mergeSha });
@@ -5494,7 +5551,7 @@ app.post('/api/admin/pr/close', requireAuth, async (req, res) => {
       refusedCount,
       rejectionReason:  reason ? reason.trim() : null,
       rejectedAt:       now
-    });
+    }).catch(e => console.error('[activity log] request-rejected write failed:', e.message));
 
     console.log(`[Admin reject] PR #${prNumber} closed for "${country}" by ${rejecter} — ${refusedCount} history entries updated`);
     res.json({ success: true, country, prNumber, state: pr.state, refusedCount });
@@ -5648,7 +5705,7 @@ app.post('/api/admin/pr/sync-published', requireAuth, async (req, res) => {
       mergedAt:          pr.merged_at,
       syncedCount:       matching.length,
       syncedAt:          now
-    });
+    }).catch(e => console.error('[activity log] sync-as-published write failed:', e.message));
 
     console.log(`[Admin sync] PR #${prNumber} synced as Published for "${country}" by ${actor}`);
     res.json({ success: true, country, prNumber, syncedCount: matching.length });
@@ -5732,7 +5789,7 @@ app.post('/api/admin/pr/sync-refused', requireAuth, async (req, res) => {
       rejectionReason:   reason ? reason.trim() : null,
       syncedCount:       matching.length,
       syncedAt:          now
-    });
+    }).catch(e => console.error('[activity log] sync-as-refused write failed:', e.message));
 
     console.log(`[Admin sync] PR #${prNumber} synced as Refused for "${country}" by ${actor}`);
     res.json({ success: true, country, prNumber, syncedCount: matching.length });
@@ -5872,12 +5929,14 @@ app.post('/api/admin/pr/retry-create', requireAuth, async (req, res) => {
       });
     }
 
-    appendActivityLog({ event: 'pr-create-retry', by: actor, country, entryCount: validatedEntries.length, attemptedAt: now });
+    appendActivityLog({ event: 'pr-create-retry', by: actor, country, entryCount: validatedEntries.length, attemptedAt: now })
+      .catch(e => console.error('[activity log] pr-create-retry write failed:', e.message));
 
     const prResult = await _createPRForCountry(country, validatedEntries, actor);
 
     if (!prResult.success) {
-      appendActivityLog({ event: 'pr-create-failed', by: actor, country, error: prResult.error, attemptedAt: now });
+      appendActivityLog({ event: 'pr-create-failed', by: actor, country, error: prResult.error, attemptedAt: now })
+        .catch(e => console.error('[activity log] pr-create-failed write failed:', e.message));
       return res.status(500).json({
         error:             `Retry failed: ${prResult.error}`,
         opsMessage:        `Retry Create failed again. No production changes were made. Entries remain in Buffer. Retry again later or cancel the attempt.`,
@@ -5898,7 +5957,7 @@ app.post('/api/admin/pr/retry-create', requireAuth, async (req, res) => {
       prUrl:      prResult.prUrl,
       entryCount: validatedEntries.length,
       trigger:    'retry-create'
-    });
+    }).catch(e => console.error('[activity log] pr-created write failed:', e.message));
 
     res.json({ success: true, country, prUrl: prResult.prUrl, prNumber: prResult.prNumber, branchName: prResult.branchName });
 
@@ -5945,6 +6004,8 @@ app.delete('/api/admin/branch', requireAuth, async (req, res) => {
       return res.status(r.status).json({ error: `GitHub returned ${r.status}: ${errBody}` });
     }
     console.log(`[Admin] Branch "${branch}" deleted by ${req.user.email}`);
+    appendAdminAudit({ action: 'branch-deleted', by: req.user.email, branch })
+      .catch(e => console.warn('[audit] branch-deleted audit write failed:', e.message));
     res.json({ success: true, branch, deleted: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -6025,12 +6086,14 @@ async function _runScheduledPRExecutor() {
           const activePR = job.active_pr;
           if (!activePR || !activePR.prNumber || !activePR.branchName) {
             console.error(`[PR executor] Append job for "${country}" missing active_pr metadata — skipping`);
-            appendActivityLog({ event: 'pr-append-failed', country, error: 'Missing active_pr metadata in job', by: 'system@executor' });
+            appendActivityLog({ event: 'pr-append-failed', country, error: 'Missing active_pr metadata in job', by: 'system@executor' })
+              .catch(e => console.error('[activity log] pr-append-failed write failed:', e.message));
             continue;
           }
           if (!validated.length) {
             console.warn(`[PR executor] Append job for "${country}" has no validated entries — skipping`);
-            appendActivityLog({ event: 'pr-append-failed', country, error: 'No validated entries at execution time', by: 'system@executor', batchId: job.batch_id });
+            appendActivityLog({ event: 'pr-append-failed', country, error: 'No validated entries at execution time', by: 'system@executor', batchId: job.batch_id })
+              .catch(e => console.error('[activity log] pr-append-failed write failed:', e.message));
             continue;
           }
 
@@ -6088,7 +6151,7 @@ async function _runScheduledPRExecutor() {
               country,
               error:   preflight.error,
               by:      'system@executor'
-            });
+            }).catch(e => console.error('[activity log] pr-preflight-failed write failed:', e.message));
             continue;
           }
 
@@ -6109,7 +6172,7 @@ async function _runScheduledPRExecutor() {
               prUrl:      prResult.prUrl,
               entryCount: validated.length,
               trigger:    'scheduled'
-            });
+            }).catch(e => console.error('[activity log] pr-created write failed:', e.message));
           } else {
             // Do NOT move buffer entries to history on failure or scope violation.
             const isScopeViolation = !!prResult.scopeViolation;
@@ -6122,7 +6185,7 @@ async function _runScheduledPRExecutor() {
               prNumber:      prResult.prNumber,
               blockedFiles:  prResult.blockedFiles,
               by:            'system@executor'
-            });
+            }).catch(e => console.error('[activity log] pr-create-failed write failed:', e.message));
           }
         }
 
