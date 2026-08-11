@@ -39,6 +39,14 @@ const GITHUB_API_BASE = process.env.GITHUB_API_BASE || 'https://api.github.ibm.c
 // validate/cancel, history reads, and PR schedule undo are unaffected.
 const DISABLE_PR_CREATION = process.env.DISABLE_PR_CREATION === 'true';
 
+// ─── Approval notification env constants ─────────────────────────────────────
+// Set PROCESS_NOTIFY_ENABLED=true in Render to activate Slack-channel email
+// notifications after a Publish Request is approved and published.
+// RESEND_API_KEY is consumed at send time — never logged.
+const PROCESS_NOTIFY_ENABLED    = process.env.PROCESS_NOTIFY_ENABLED === 'true';
+const PROCESS_NOTIFY_EMAIL_TO   = process.env.PROCESS_NOTIFY_EMAIL_TO   || '';
+const PROCESS_NOTIFY_PUBLIC_URL = (process.env.PROCESS_NOTIFY_PUBLIC_URL || '').replace(/\/$/, '');
+
 // JWT secret — set via environment variable in production
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 // Token TTL: 8 hours in seconds
@@ -1220,6 +1228,152 @@ function _createdAtFromId(id) {
   if (!m) return null;
   const d = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00.000Z`);
   return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+// ─── Approval Notification V1 ─────────────────────────────────────────────────
+
+/**
+ * Slugifies a process title to match the public index ?issue= deep-link format.
+ * Must stay in sync with frontend slugify() in index.html.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function _slugify(text) {
+  return String(text || '').toLowerCase()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/**
+ * Sends a single plain-text email via Resend. Non-throwing — returns { ok, messageId?, error? }.
+ * In mock mode (EMAIL_SEND_MODE !== 'real') logs to console and skips the Resend API call.
+ * RESEND_API_KEY is never logged.
+ *
+ * @param {{ to: string, subject: string, text: string }} opts
+ * @returns {Promise<{ ok: boolean, mock?: boolean, messageId?: string, error?: string }>}
+ */
+async function _sendResendEmail({ to, subject, text }) {
+  if (EMAIL_SEND_MODE !== 'real') {
+    console.log(`[NOTIFY MOCK] to:${to} | subject:${subject}`);
+    return { ok: true, mock: true };
+  }
+  try {
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    const result = await resend.emails.send({
+      from:    OTP_FROM_ADDRESS,   // verified sender — noreply@processfinder.xyz
+      to,
+      subject,
+      text                         // plain text — Slack channel renders correctly
+    });
+    if (result.error) {
+      return { ok: false, error: result.error.message || String(result.error) };
+    }
+    return { ok: true, messageId: result.data?.id };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Builds the subject line and plain-text body for an approval notification email.
+ *
+ * @param {{ country: string, prNumber: number, approver: string, matchingEntries: Array, now: string }} opts
+ * @returns {{ subject: string, body: string }}
+ */
+function _buildApprovalNotification({ country, prNumber, approver, matchingEntries, now }) {
+  const countryDisplay = country === 'global' ? 'Global Hot Topics' : country.toUpperCase();
+
+  const created = matchingEntries.filter(h => h.type === 'create');
+  const updated = matchingEntries.filter(h => h.type === 'update');
+  const deleted = matchingEntries.filter(h => h.type === 'delete');
+
+  // ── Subject ─────────────────────────────────────────────────────────────────
+  const parts = [];
+  if (created.length) parts.push(`${created.length} new`);
+  if (updated.length) parts.push(`${updated.length} updated`);
+  if (deleted.length) parts.push(`${deleted.length} deleted`);
+  const summary = parts.join(', ');
+  const subject = `[Process Finder] ${countryDisplay}: ${summary} ${
+    matchingEntries.length === 1 ? 'process' : 'processes'
+  } published`;
+
+  // ── Body ────────────────────────────────────────────────────────────────────
+  const lines = [];
+  lines.push(`@here Process Finder update — ${countryDisplay} · PR #${prNumber} approved by ${approver}`);
+  lines.push('');
+
+  function renderEntry(h, includeLink) {
+    const title    = h.process?.issue    || '(untitled)';
+    const category = h.process?.category || '(no category)';
+    const entryLines = [
+      `• ${title}`,
+      `  ${countryDisplay} · ${category}`
+    ];
+    if (includeLink && PROCESS_NOTIFY_PUBLIC_URL) {
+      entryLines.push(`  ${PROCESS_NOTIFY_PUBLIC_URL}/?issue=${_slugify(title)}`);
+    }
+    return entryLines.join('\n');
+  }
+
+  if (created.length) {
+    lines.push(`🆕 New (${created.length})`);
+    created.forEach(h => lines.push(renderEntry(h, true)));
+    lines.push('');
+  }
+  if (updated.length) {
+    lines.push(`✏️ Updated (${updated.length})`);
+    updated.forEach(h => lines.push(renderEntry(h, true)));
+    lines.push('');
+  }
+  if (deleted.length) {
+    lines.push(`🗑️ Deleted (${deleted.length})`);
+    deleted.forEach(h => lines.push(renderEntry(h, false)));  // no link for deleted
+    lines.push('');
+  }
+
+  lines.push('—');
+  lines.push(`Approved at: ${now}`);
+  lines.push('Process Finder OPS');
+
+  return { subject, body: lines.join('\n') };
+}
+
+/**
+ * Orchestrates building and sending the approval notification email.
+ * Guards on PROCESS_NOTIFY_ENABLED and PROCESS_NOTIFY_EMAIL_TO.
+ * Non-throwing — all errors are caught and logged as warnings.
+ * Approval response is never affected by notification outcome.
+ *
+ * @param {{ country: string, prNumber: number, approver: string, matchingEntries: Array, now: string }} opts
+ * @returns {Promise<void>}
+ */
+async function _sendApprovalNotification({ country, prNumber, approver, matchingEntries, now }) {
+  if (!PROCESS_NOTIFY_ENABLED) return;
+  if (!PROCESS_NOTIFY_EMAIL_TO) {
+    console.warn('[notify] PROCESS_NOTIFY_EMAIL_TO is not configured — notification skipped');
+    return;
+  }
+
+  const { subject, body } = _buildApprovalNotification({ country, prNumber, approver, matchingEntries, now });
+
+  const result = await _sendResendEmail({ to: PROCESS_NOTIFY_EMAIL_TO, subject, text: body });
+
+  if (result.ok && !result.mock) {
+    console.log(`[notify] approval notification sent for PR #${prNumber} — messageId: ${result.messageId}`);
+    appendActivityLog({
+      event: 'notification-sent', by: approver, country, prNumber, messageId: result.messageId
+    }).catch(() => {});
+  } else if (result.mock) {
+    // mock mode — no real send, logged by _sendResendEmail
+  } else {
+    console.warn(`[notify] approval notification failed for PR #${prNumber}: ${result.error}`);
+    appendActivityLog({
+      event: 'notification-failed', by: approver, country, prNumber, error: result.error
+    }).catch(() => {});
+  }
 }
 
 /**
@@ -5393,6 +5547,10 @@ app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
         }).catch(() => {});
       }
     });
+
+    // ── Approval notification (fire-and-forget — must not block approval) ─────
+    _sendApprovalNotification({ country, prNumber, approver, matchingEntries, now })
+      .catch(e => console.warn('[notify] approval notification failed (non-blocking):', e.message));
 
     // ── Write Logs audit record ───────────────────────────────────────────────
     appendActivityLog({
