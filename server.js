@@ -1205,6 +1205,23 @@ function _filterEntriesByPRScope(entries, allUsers, triggeredBy) {
   return entries.filter(e => norm(e.user) === norm(triggeredBy));
 }
 
+// ─── Recent Activity V2: timestamp helpers ────────────────────────────────────
+
+/**
+ * Parses the creation date from an id in {country}_{YYYYMMDD}_{HHMM}_{seq} format.
+ * Returns an ISO 8601 string if the date is valid, null otherwise.
+ * This mirrors the frontend parseDateFromId() — both must stay in sync.
+ *
+ * @param {string|undefined} id
+ * @returns {string|null}
+ */
+function _createdAtFromId(id) {
+  const m = (id || '').match(/_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})_/);
+  if (!m) return null;
+  const d = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00.000Z`);
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
 /**
  * Creates a clean, data-only automated OPS PR for one country.
  *
@@ -1256,16 +1273,36 @@ async function _createPRForCountry(country, validatedEntries, triggeredBy) {
     const processesData = await readProcessData(country);
     if (!processesData) throw new Error(`No process data found for country "${country}"`);
 
+    // Recent Activity V2: stamp createdAt / updatedAt at publish time.
+    const publishedAt = new Date().toISOString();
+
     const arr = processesData.data.map(p => ({ ...p }));
     for (const h of validatedEntries) {
       const targetIdx = arr.findIndex(
         p => p.id === h.process?.id || p.issue === h.process?.issue
       );
       if (h.type === 'create') {
-        if (targetIdx === -1) arr.push({ ...h.process });
+        if (targetIdx === -1) arr.push({
+          ...h.process,
+          createdAt: publishedAt,
+          updatedAt: publishedAt
+        });
       } else if (h.type === 'update') {
-        if (targetIdx !== -1) arr[targetIdx] = { ...h.process };
-        else arr.push({ ...h.process });
+        if (targetIdx !== -1) {
+          arr[targetIdx] = {
+            ...h.process,
+            createdAt: arr[targetIdx].createdAt
+              || _createdAtFromId(h.process?.id)
+              || publishedAt,
+            updatedAt: publishedAt
+          };
+        } else {
+          arr.push({
+            ...h.process,
+            createdAt: _createdAtFromId(h.process?.id) || publishedAt,
+            updatedAt: publishedAt
+          });
+        }
       } else if (h.type === 'delete') {
         if (targetIdx !== -1) arr.splice(targetIdx, 1);
       }
@@ -4282,16 +4319,36 @@ async function _appendToActivePR(country, newEntries, triggeredBy, activePR, bat
     console.log(`[OPS PR append] Read ${processesData.data.length} processes from branch "${branchName}"`);
 
     // ── Step 2: Apply new entries on top of the PR branch content ─────────────
+    // Recent Activity V2: stamp createdAt / updatedAt at publish time.
+    const publishedAt = new Date().toISOString();
+
     const arr = processesData.data.map(p => ({ ...p }));
     for (const h of newEntries) {
       const targetIdx = arr.findIndex(
         p => p.id === h.process?.id || p.issue === h.process?.issue
       );
       if (h.type === 'create') {
-        if (targetIdx === -1) arr.push({ ...h.process });
+        if (targetIdx === -1) arr.push({
+          ...h.process,
+          createdAt: publishedAt,
+          updatedAt: publishedAt
+        });
       } else if (h.type === 'update') {
-        if (targetIdx !== -1) arr[targetIdx] = { ...h.process };
-        else arr.push({ ...h.process });
+        if (targetIdx !== -1) {
+          arr[targetIdx] = {
+            ...h.process,
+            createdAt: arr[targetIdx].createdAt
+              || _createdAtFromId(h.process?.id)
+              || publishedAt,
+            updatedAt: publishedAt
+          };
+        } else {
+          arr.push({
+            ...h.process,
+            createdAt: _createdAtFromId(h.process?.id) || publishedAt,
+            updatedAt: publishedAt
+          });
+        }
       } else if (h.type === 'delete') {
         if (targetIdx !== -1) arr.splice(targetIdx, 1);
       }
@@ -4317,7 +4374,6 @@ async function _appendToActivePR(country, newEntries, triggeredBy, activePR, bat
     console.log(`[OPS PR append] Committed batch ${batchId} to branch ${branchName}`);
 
     // ── Step 4: Post a comment to the PR with batch summary ───────────────────
-    const now = new Date();
     const changeLines = newEntries
       .map(h => `- ${h.type.toUpperCase()}: ${h.process?.issue || h.process?.id || '?'}`)
       .join('\n');
@@ -4325,7 +4381,7 @@ async function _appendToActivePR(country, newEntries, triggeredBy, activePR, bat
       `**[OPS Append — Batch ${batchId}]**\n\n` +
       `Country: ${country.toUpperCase()}\n` +
       `Added by: ${triggeredBy}\n` +
-      `Added at: ${now.toISOString()}\n` +
+      `Added at: ${publishedAt}\n` +
       `Entries: ${newEntries.length}\n\n` +
       `Changes:\n${changeLines}`;
 
