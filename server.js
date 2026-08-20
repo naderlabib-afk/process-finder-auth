@@ -387,6 +387,100 @@ async function fetchGitHubJsonStrict(filePath, fallback = null) {
 }
 
 /**
+ * Strict, deterministically-classified reader for config/users.json.
+ *
+ * Every route that makes an authorization decision from the users config
+ * (OTP allowlist, session issuance, and the two users-config read routes)
+ * MUST use this helper instead of the lenient fetchGitHubJson(). A GitHub
+ * or upstream failure must never be silently reinterpreted as "no matching
+ * user" / "unauthorized" — that was the root cause of the 2026-08-20 incident.
+ *
+ * Returns { ok: true, users: Array } only on a structurally valid read.
+ * Returns { ok: false, status, code, message } on any failure. The caller
+ * sends `status`/`code`/`message` directly as the HTTP response — no
+ * further mapping needed at call sites.
+ *
+ * Fixed contract (do not change without updating all four call sites):
+ *   GitHub 401/403 (or any other non-retryable HTTP error)  -> 502 AUTH_CONFIG_UNAVAILABLE
+ *   GitHub timeout / 5xx, retries exhausted                 -> 503 AUTH_CONFIG_UNAVAILABLE
+ *   config/users.json missing (GitHub 404)                  -> 500 CONFIG_MISSING
+ *   empty content / invalid JSON / non-array JSON            -> 500 CONFIG_INVALID
+ *   successful, structurally valid array                    -> ok:true
+ *
+ * Only the ok:true branch may lead to a genuine "unauthorized" determination
+ * by the caller (i.e. a successful read with no matching email/role).
+ */
+async function _readUsersConfigStrict() {
+  const FILE_PATH = 'config/users.json';
+  const _unavailable = (status, httpStatus) => ({
+    ok: false,
+    status,
+    code: 'AUTH_CONFIG_UNAVAILABLE',
+    message: 'OPS authorization service is temporarily unavailable. Your access has not been changed. Please try again or contact an administrator.',
+    _httpStatus: httpStatus || null
+  });
+  const _invalid = () => ({
+    ok: false,
+    status: 500,
+    code: 'CONFIG_INVALID',
+    message: 'The authorization configuration is invalid. Please contact an administrator.'
+  });
+
+  let raw;
+  try {
+    // No fallback passed — fetchGitHubJsonStrict defaults fallback to `null`
+    // and returns that fallback ONLY on a genuine GitHub 404 for this path.
+    raw = await fetchGitHubJsonStrict(FILE_PATH);
+  } catch (err) {
+    let result;
+    if (err.code === 'GITHUB_READ_HTTP_ERROR') {
+      // Non-retryable HTTP failure (401/403/etc.) — thrown immediately, no retry.
+      result = _unavailable(502, err.httpStatus);
+    } else if (err.code === 'GITHUB_EMPTY_CONTENT') {
+      // GitHub returned 200 but no content field — malformed upstream response.
+      result = _invalid();
+    } else if (err.code === 'GITHUB_READ_EXHAUSTED') {
+      // Retries exhausted. httpStatus is set only when the exhaustion was
+      // caused by real transient 502/503/504 responses; it stays null when
+      // the failure was a JSON.parse error on an otherwise-200 response
+      // (see fetchGitHubJsonStrict — lastStatus is never assigned inside
+      // the res.ok branch), so we can reliably tell the two cases apart.
+      result = err.httpStatus ? _unavailable(503, err.httpStatus) : _invalid();
+    } else {
+      // Unknown/unexpected error shape — fail safe as "unavailable", never
+      // as a silent "unauthorized".
+      result = _unavailable(502, null);
+    }
+    _logGitHubCriticalFailure({
+      operation:  '_readUsersConfigStrict',
+      filePath:   FILE_PATH,
+      httpStatus: result._httpStatus,
+      outcome:    'failed',
+      detail:     `code=${result.code} err="${err.message}"`
+    });
+    return result;
+  }
+
+  // Genuine 404 — fetchGitHubJsonStrict returns the fallback (default null).
+  if (raw === null) {
+    _logGitHubCriticalFailure({
+      operation: '_readUsersConfigStrict', filePath: FILE_PATH,
+      outcome: 'failed', detail: 'CONFIG_MISSING (404)'
+    });
+    return { ok: false, status: 500, code: 'CONFIG_MISSING',
+      message: 'The authorization configuration could not be found. Please contact an administrator.' };
+  }
+  if (!Array.isArray(raw)) {
+    _logGitHubCriticalFailure({
+      operation: '_readUsersConfigStrict', filePath: FILE_PATH,
+      outcome: 'failed', detail: 'CONFIG_INVALID (not an array)'
+    });
+    return _invalid();
+  }
+  return { ok: true, users: raw };
+}
+
+/**
  * Emits a structured CRITICAL log entry for GitHub read/write failures.
  * Always writes to console so Render log captures it in a grep-friendly format.
  * Never throws.
@@ -1593,7 +1687,14 @@ app.post("/send-otp", async (req, res) => {
     // ── 1. Allowlist: recipient must be a registered user in config/users.json ──
     // This is the primary abuse-prevention guard. Only registered process-finder
     // users may receive OTP emails. Arbitrary email addresses are rejected.
-    const allUsers = await fetchGitHubJson('config/users.json', []);
+    //
+    // Strict read: a GitHub/upstream failure must never be silently treated as
+    // "no matching user" (see 2026-08-20 incident — 403 masked as unauthorized).
+    const _usersResult = await _readUsersConfigStrict();
+    if (!_usersResult.ok) {
+      return res.status(_usersResult.status).json({ error: _usersResult.code, message: _usersResult.message });
+    }
+    const allUsers = _usersResult.users;
     const registeredUser = allUsers.find(
       u => (u.email || '').trim().toLowerCase() === normalized
     );
@@ -1861,8 +1962,14 @@ app.post('/api/auth/session', async (req, res) => {
   // Mark this jti as consumed before issuing the session
   _usedOtpJtis.add(otpPayload.jti);
 
-  // Role is always derived from the trusted server-side users config
-  const users = await fetchGitHubJson('config/users.json', []);
+  // Role is always derived from the trusted server-side users config.
+  // Strict read: a GitHub/upstream failure must never be silently treated as
+  // "no matching user" (see 2026-08-20 incident — 403 masked as unauthorized).
+  const _usersResult = await _readUsersConfigStrict();
+  if (!_usersResult.ok) {
+    return res.status(_usersResult.status).json({ error: _usersResult.code, message: _usersResult.message });
+  }
+  const users = _usersResult.users;
   const user = users.find(u => u.email.trim().toLowerCase() === normalizedEmail);
   if (!user || !['OL', 'Manager', 'Admin'].includes(user.role)) {
     appendActivityLog({ event: 'session-rejected', reason: 'unauthorized-role', email: normalizedEmail })
@@ -1888,7 +1995,17 @@ app.get('/api/config/countries', async (req, res) => {
 app.get('/api/config/users', async (req, res) => {
   // Phase 2: strip the `countries` array — public route must not expose country
   // assignment details. Returns email, role, and globalWrite for feedback routing.
-  const users = await fetchGitHubJson('config/users.json', []);
+  //
+  // Strict read: this response feeds handleOpsEmailSubmit() client-side, which
+  // decides whether to show "Unauthorized email" before ever calling /send-otp.
+  // A GitHub/upstream failure must never be returned as an empty array, or the
+  // frontend misreads "upstream failure" as "no authorized users exist"
+  // (see 2026-08-20 incident).
+  const _usersResult = await _readUsersConfigStrict();
+  if (!_usersResult.ok) {
+    return res.status(_usersResult.status).json({ error: _usersResult.code, message: _usersResult.message });
+  }
+  const users = _usersResult.users;
   res.json(users.map(u => ({ email: u.email, role: u.role, globalWrite: u.globalWrite || false })));
 });
 
@@ -1897,9 +2014,17 @@ app.get('/api/config/users', async (req, res) => {
  * Returns full user objects (email, role, countries) for authenticated OPS UI use.
  * Phase 2: new authenticated endpoint. Replaces the unguarded /api/config/users
  * for internal OPS calls that need the full user record.
+ *
+ * Strict read: an upstream failure must not be returned as an empty array,
+ * which would make the Admin Users interface falsely appear to have no
+ * configured users.
  */
 app.get('/api/ops/users', requireAuth, async (req, res) => {
-  res.json(await fetchGitHubJson('config/users.json', []));
+  const _usersResult = await _readUsersConfigStrict();
+  if (!_usersResult.ok) {
+    return res.status(_usersResult.status).json({ error: _usersResult.code, message: _usersResult.message });
+  }
+  res.json(_usersResult.users);
 });
 
 // ─── Processes (read-only, public) ───────────────────────────────────────────
@@ -2466,7 +2591,10 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
   };
 
   buffer[country][user].push(entry);
-  await commitJsonToMainBranch('data/ops/buffer.json', buffer, `ops: add buffer entry for ${country} by ${user}`);
+  const _bufAddOk = await commitJsonToMainBranch('data/ops/buffer.json', buffer, `ops: add buffer entry for ${country} by ${user}`);
+  if (!_bufAddOk) {
+    return res.status(502).json({ error: 'GITHUB_WRITE_FAILED', message: 'GitHub write failed. The change was not saved. Please retry.' });
+  }
   res.json({ success: true, entry });
 });
 
@@ -2700,7 +2828,10 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
     liveBuffer[ck] = newBuffer[ck];
   }
 
-  await commitJsonToMainBranch('data/ops/buffer.json', liveBuffer, 'ops: update buffer');
+  const _putBufOk = await commitJsonToMainBranch('data/ops/buffer.json', liveBuffer, 'ops: update buffer');
+  if (!_putBufOk) {
+    return res.status(502).json({ error: 'GITHUB_WRITE_FAILED', message: 'GitHub write failed. The change was not saved. Please retry.' });
+  }
   res.json({ success: true, buffer: liveBuffer });
 });
 
@@ -2764,8 +2895,11 @@ app.patch('/api/ops/buffer/edit-lock', requireAuth, async (req, res) => {
     }
     delete entry.editingBy;
     delete entry.editingLastActivityAt;
-    await commitJsonToMainBranch('data/ops/buffer.json', buffer,
+    const _bufLockReleaseOk = await commitJsonToMainBranch('data/ops/buffer.json', buffer,
       `ops: release edit lock on entry ${entry.id} by ${requester}`);
+    if (!_bufLockReleaseOk) {
+      return res.status(502).json({ error: 'GITHUB_WRITE_FAILED', message: 'GitHub write failed. The lock release was not saved. Please retry.' });
+    }
     return res.json({ success: true, action: 'released', entryId: entry.id });
   }
 
@@ -2782,8 +2916,11 @@ app.patch('/api/ops/buffer/edit-lock', requireAuth, async (req, res) => {
   entry.editingBy             = requester;
   entry.editingLastActivityAt = now.toISOString();
 
-  await commitJsonToMainBranch('data/ops/buffer.json', buffer,
+  const _bufLockWriteOk = await commitJsonToMainBranch('data/ops/buffer.json', buffer,
     `ops: ${action} edit lock on entry ${entry.id} by ${requester}`);
+  if (!_bufLockWriteOk) {
+    return res.status(502).json({ error: 'GITHUB_WRITE_FAILED', message: 'GitHub write failed. The lock was not saved. Please retry.' });
+  }
 
   res.json({
     success:              true,
@@ -2889,8 +3026,11 @@ app.patch('/api/ops/process/edit-lock', requireAuthBeacon, async (req, res) => {
     delete locks[country][processId];
     // Clean up empty country key
     if (!Object.keys(locks[country]).length) delete locks[country];
-    await commitJsonToMainBranch(PROCESS_EDIT_LOCKS_PATH, locks,
+    const _procLockReleaseOk = await commitJsonToMainBranch(PROCESS_EDIT_LOCKS_PATH, locks,
       `ops: release process edit lock on ${processId} by ${requester}`);
+    if (!_procLockReleaseOk) {
+      return res.status(502).json({ error: 'GITHUB_WRITE_FAILED', message: 'GitHub write failed. The lock release was not saved. Please retry.' });
+    }
     return res.json({ success: true, action: 'released', processId });
   }
 
@@ -2909,8 +3049,11 @@ app.patch('/api/ops/process/edit-lock', requireAuthBeacon, async (req, res) => {
     editingLastActivityAt: now.toISOString()
   };
 
-  await commitJsonToMainBranch(PROCESS_EDIT_LOCKS_PATH, locks,
+  const _procLockWriteOk = await commitJsonToMainBranch(PROCESS_EDIT_LOCKS_PATH, locks,
     `ops: ${action} process edit lock on ${processId} by ${requester}`);
+  if (!_procLockWriteOk) {
+    return res.status(502).json({ error: 'GITHUB_WRITE_FAILED', message: 'GitHub write failed. The lock was not saved. Please retry.' });
+  }
 
   res.json({
     success:               true,
@@ -3017,7 +3160,10 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
   // Pre-PR Buffer cleanup is not a production lifecycle event (see JSDoc above).
   entries.splice(index, 1);
 
-  await commitJsonToMainBranch('data/ops/buffer.json', buffer, `ops: remove buffer entry ${entry.id} for ${country}`);
+  const _cancelOk = await commitJsonToMainBranch('data/ops/buffer.json', buffer, `ops: remove buffer entry ${entry.id} for ${country}`);
+  if (!_cancelOk) {
+    return res.status(502).json({ error: 'GITHUB_WRITE_FAILED', message: 'GitHub write failed. The entry was not removed. Please retry.' });
+  }
 
   res.json({ success: true, entry });
 });
