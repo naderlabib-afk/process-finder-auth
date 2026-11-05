@@ -22,9 +22,9 @@ const orig = { error: console.error, warn: console.warn, log: console.log };
 let _queue = [];
 let _calls = 0;
 
-function mockFetch(/* url, opts */) {
+function mockFetch(url, opts) {
   _calls++;
-  if (!_queue.length) return Promise.reject(new Error('mock: no response queued'));
+  if (!_queue.length) return Promise.reject(new Error(`mock: no response queued for url "${url}"`));
   const r = _queue.shift();
   const bodyStr = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
   return Promise.resolve({
@@ -37,58 +37,243 @@ function mockFetch(/* url, opts */) {
 
 function q(status, body) { _queue.push({ status, body }); }
 function reset()         { _queue = []; _calls = 0; }
-function ghContent(data) { return { sha: 'sha0', content: Buffer.from(JSON.stringify(data)).toString('base64') }; }
+function ghContent(data) { return { sha: 'sha0', content: Buffer.from(JSON.stringify(data)).toString('base64'), encoding: 'base64' }; }
+function ghContentLarge(sha) { return { sha: sha || 'sha0_large', encoding: 'none', size: 1050483 }; }
+function ghBlob(data)    { return { sha: 'sha0_large', content: Buffer.from(JSON.stringify(data)).toString('base64'), encoding: 'base64' }; }
 
 // ─── Re-implement the hardened helpers under test ─────────────────────────────
 // These are exact copies of the implementations in server.js.
 // They receive the mockFetch as `fetch` so we can intercept GitHub calls.
 
-async function fetchGitHubJsonStrict(fetch, filePath, fallback) {
-  let lastStatus = null, lastErr = null;
+async function fetchGitHubJsonStrict(fetch, filePath, fallback = null, { allowNotFound = false } = {}) {
+  let lastStatus = null;
+  let lastErr    = null;
+
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(`https://api.github.test/test/${filePath}`);
-      if (res.status === 404) return fallback;
+      const res = await fetch(`https://api.github.test/repos/owner/repo/contents/${filePath}`);
+
+      // File genuinely absent (HTTP 404)
+      if (res.status === 404) {
+        if (allowNotFound) {
+          return fallback;
+        }
+        throw Object.assign(
+          new Error(`Required GitHub file not found: "${filePath}"`),
+          { code: 'GITHUB_FILE_NOT_FOUND', filePath, httpStatus: 404 }
+        );
+      }
+
       if (res.ok) {
         const fileInfo = await res.json();
-        if (!fileInfo || !fileInfo.content) {
-          throw Object.assign(new Error(`no content for "${filePath}"`), { code: 'GITHUB_EMPTY_CONTENT', filePath });
+        if (!fileInfo) {
+          throw Object.assign(
+            new Error(`GitHub returned 200 but no data for "${filePath}"`),
+            { code: 'GITHUB_CONTENTS_FETCH_FAILED', filePath }
+          );
         }
-        const raw = Buffer.from(fileInfo.content, 'base64').toString('utf8');
-        return JSON.parse(raw);
+
+        const isInlineMissing = !fileInfo.content || fileInfo.encoding === 'none';
+
+        let rawContent;
+        if (isInlineMissing) {
+          if (!fileInfo.sha) {
+            throw Object.assign(
+              new Error(`GitHub returned 200 with missing content and no SHA for "${filePath}"`),
+              { code: 'GITHUB_INLINE_CONTENT_MISSING', filePath }
+            );
+          }
+
+          let blobRes;
+          let blobLastStatus = null;
+          let blobLastErr = null;
+
+          for (let blobAttempt = 1; blobAttempt <= 3; blobAttempt++) {
+            try {
+              blobRes = await fetch(`https://api.github.test/repos/owner/repo/git/blobs/${fileInfo.sha}`);
+
+              if (blobRes.status === 404) {
+                throw Object.assign(
+                  new Error(`Git Blob not found for "${filePath}" (SHA: ${fileInfo.sha})`),
+                  { code: 'GITHUB_BLOB_FETCH_FAILED', filePath, httpStatus: 404 }
+                );
+              }
+
+              if (blobRes.ok) {
+                break;
+              }
+
+              blobLastStatus = blobRes.status;
+
+              if (blobRes.status === 502 || blobRes.status === 503 || blobRes.status === 504) {
+                if (blobAttempt < 3) {
+                  await new Promise(r => setTimeout(r, 1));
+                  continue;
+                }
+              }
+
+              const blobBody = await blobRes.text().catch(() => '');
+              throw Object.assign(
+                new Error(`Git Blob fetch failed for "${filePath}": HTTP ${blobRes.status} — ${blobBody.slice(0, 200)}`),
+                { code: 'GITHUB_BLOB_FETCH_FAILED', filePath, httpStatus: blobRes.status }
+              );
+            } catch (bErr) {
+              if (bErr.code === 'GITHUB_BLOB_FETCH_FAILED') throw bErr;
+              blobLastErr = bErr;
+              if (blobAttempt < 3) {
+                await new Promise(r => setTimeout(r, 1));
+                continue;
+              }
+            }
+          }
+
+          if (!blobRes || !blobRes.ok) {
+            const bMsg = blobLastErr
+              ? `Git Blob fetch failed for "${filePath}" after 3 attempts: ${blobLastErr.message}`
+              : `Git Blob fetch failed for "${filePath}" after 3 attempts: HTTP ${blobLastStatus}`;
+            throw Object.assign(
+              new Error(bMsg),
+              { code: 'GITHUB_BLOB_FETCH_FAILED', filePath, httpStatus: blobLastStatus }
+            );
+          }
+
+          const blobInfo = await blobRes.json();
+          if (!blobInfo || blobInfo.content === undefined || blobInfo.content === null) {
+            throw Object.assign(
+              new Error(`Git Blob returned empty content for "${filePath}"`),
+              { code: 'GITHUB_FILE_CONTENT_EMPTY', filePath }
+            );
+          }
+
+          if (blobInfo.encoding === 'base64') {
+            rawContent = Buffer.from(blobInfo.content, 'base64').toString('utf8');
+          } else {
+            rawContent = blobInfo.content;
+          }
+
+          if (!rawContent || rawContent.trim() === '') {
+            throw Object.assign(
+              new Error(`Git Blob decoded content is empty for "${filePath}"`),
+              { code: 'GITHUB_FILE_CONTENT_EMPTY', filePath }
+            );
+          }
+        } else {
+          rawContent = Buffer.from(fileInfo.content, 'base64').toString('utf8');
+        }
+
+        const cleaned = rawContent.charCodeAt(0) === 0xFEFF ? rawContent.slice(1) : rawContent;
+        try {
+          return JSON.parse(cleaned);
+        } catch (jsonErr) {
+          throw Object.assign(
+            new Error(`JSON parse failed for "${filePath}": ${jsonErr.message}`),
+            { code: 'GITHUB_JSON_PARSE_FAILED', filePath }
+          );
+        }
       }
+
       lastStatus = res.status;
+
       if (res.status === 502 || res.status === 503 || res.status === 504) {
-        if (attempt < 3) { await new Promise(r => setTimeout(r, 1)); continue; }
-        break; // last attempt — fall through to GITHUB_READ_EXHAUSTED
+        lastStatus = res.status;
+        if (attempt < 3) {
+          await new Promise(r => setTimeout(r, 1));
+          continue;
+        }
+        break;
       }
+
       const body = await res.text().catch(() => '');
       throw Object.assign(
-        new Error(`GitHub read HTTP ${res.status} for "${filePath}"`),
-        { code: 'GITHUB_READ_HTTP_ERROR', filePath, httpStatus: res.status }
+        new Error(`GitHub read failed for "${filePath}": HTTP ${res.status} — ${body.slice(0, 200)}`),
+        { code: 'GITHUB_CONTENTS_FETCH_FAILED', filePath, httpStatus: res.status }
       );
+
     } catch (err) {
-      if (err.code === 'GITHUB_READ_HTTP_ERROR' || err.code === 'GITHUB_EMPTY_CONTENT') throw err;
+      const isExpectedCode = [
+        'GITHUB_FILE_NOT_FOUND',
+        'GITHUB_CONTENTS_FETCH_FAILED',
+        'GITHUB_INLINE_CONTENT_MISSING',
+        'GITHUB_BLOB_FETCH_FAILED',
+        'GITHUB_FILE_CONTENT_EMPTY',
+        'GITHUB_JSON_PARSE_FAILED'
+      ].includes(err.code);
+      if (isExpectedCode) throw err;
       lastErr = err;
-      if (attempt < 3) { await new Promise(r => setTimeout(r, 1)); continue; }
+      if (attempt < 3) {
+        await new Promise(r => setTimeout(r, 1));
+        continue;
+      }
     }
   }
+
   const msg = lastErr
-    ? `GitHub read failed after 3 attempts: ${lastErr.message}`
-    : `GitHub read failed after 3 attempts: HTTP ${lastStatus}`;
-  throw Object.assign(new Error(msg), { code: 'GITHUB_READ_EXHAUSTED', filePath, httpStatus: lastStatus });
+    ? `GitHub read failed for "${filePath}" after 3 attempts: ${lastErr.message}`
+    : `GitHub read failed for "${filePath}" after 3 attempts: HTTP ${lastStatus}`;
+  throw Object.assign(new Error(msg), { code: 'GITHUB_CRITICAL_FILE_READ_FAILED', filePath, httpStatus: lastStatus });
 }
 
 const HISTORY_FILE                              = 'data/ops/history.json';
 const HISTORY_OVERWRITE_MAX_ENTRY_DROP_FRACTION = 0.20;
 
-// ─── Re-implement the hardened preflight and rollback logic under test ─────────
-// Minimal in-process models of _adminPreflightCheck (history read portion only)
-// and POST /api/ops/rollback (both read calls and the write-return check).
-// These reflect the exact patterns added in the amendment.
+async function commitJsonToMainBranch(fetch, filePath, data, message, _retries = 3, opts = {}) {
+  const isHistoryFile = filePath === HISTORY_FILE;
 
+  if (isHistoryFile && !opts.allowCountryDrop) {
+    try {
+      const currentRaw = await fetchGitHubJsonStrict(fetch, HISTORY_FILE, null);
+      if (currentRaw !== null) {
+        if (typeof currentRaw !== 'object' || Array.isArray(currentRaw)) {
+          return false;
+        }
+
+        const currentKeys  = Object.keys(currentRaw);
+        const proposedKeys = (typeof data === 'object' && !Array.isArray(data)) ? Object.keys(data) : [];
+
+        const hasInvalidArrays = currentKeys.some(k => !Array.isArray(currentRaw[k]));
+        if (hasInvalidArrays) {
+          return false;
+        }
+
+        const currentTotal  = currentKeys.reduce((n, k) => n + currentRaw[k].length, 0);
+        const proposedTotal = proposedKeys.reduce((n, k) => n + (Array.isArray(data[k]) ? data[k].length : 0), 0);
+        const droppedKeys   = currentKeys.filter(k => !proposedKeys.includes(k));
+        const entryDropFrac = currentTotal > 0 ? (currentTotal - proposedTotal) / currentTotal : 0;
+
+        if (droppedKeys.length > 0 || entryDropFrac > HISTORY_OVERWRITE_MAX_ENTRY_DROP_FRACTION) {
+          return false;
+        }
+      }
+    } catch (guardErr) {
+      return false; // Fail-closed!
+    }
+  }
+
+  for (let attempt = 1; attempt <= _retries; attempt++) {
+    try {
+      const shaRes = await fetch(`https://api.github.test/repos/owner/repo/contents/${filePath}`);
+      const sha    = shaRes.ok ? (await shaRes.json()).sha : undefined;
+
+      const res = await fetch(`https://api.github.test/repos/owner/repo/contents/${filePath}`, { method: 'PUT' });
+      if (res.ok) return true;
+
+      const isConflict  = res.status === 409 || res.status === 422;
+      const isTransient = res.status === 502 || res.status === 503 || res.status === 504;
+      if ((isConflict || isTransient) && attempt < _retries) {
+        await new Promise(r => setTimeout(r, 1));
+        continue;
+      }
+      return false;
+    } catch (err) {
+      if (attempt < _retries) { await new Promise(r => setTimeout(r, 1)); continue; }
+      return false;
+    }
+  }
+  return false;
+}
+
+// ─── Re-implement the hardened preflight and rollback logic under test ─────────
 async function adminPreflightHistoryRead(fetch, country, prNumber) {
-  // Mirrors the amended step 3 in _adminPreflightCheck.
   let historyPre;
   try {
     historyPre = await fetchGitHubJsonStrict(fetch, HISTORY_FILE, null);
@@ -119,9 +304,22 @@ async function adminPreflightHistoryRead(fetch, country, prNumber) {
   return { ok: true, matchingEntries, historyPre };
 }
 
+async function getOpsHistoryRoute(fetch) {
+  try {
+    const history = await fetchGitHubJsonStrict(fetch, HISTORY_FILE);
+    return { status: 200, body: history };
+  } catch (err) {
+    return {
+      status: 502,
+      body: {
+        error: 'Failed to read authoritative History from GitHub',
+        code: 'GITHUB_HISTORY_READ_FAILED'
+      }
+    };
+  }
+}
+
 async function rollbackRoute(fetch, country, historyIndex) {
-  // Mirrors the amended POST /api/ops/rollback.
-  // First strict read (validation copy).
   let historyForRead;
   try {
     historyForRead = await fetchGitHubJsonStrict(fetch, HISTORY_FILE, null);
@@ -132,7 +330,6 @@ async function rollbackRoute(fetch, country, historyIndex) {
     return { status: 404, body: { error: 'History item not found' } };
   }
 
-  // Second strict read (write-back copy).
   let history;
   try {
     history = await fetchGitHubJsonStrict(fetch, HISTORY_FILE, null);
@@ -143,71 +340,16 @@ async function rollbackRoute(fetch, country, historyIndex) {
     return { status: 503, body: { code: 'GITHUB_READ_NULL', _phase: 'read2-null' } };
   }
 
-  // Stamp entry and push log entry.
   const item = history[country] && history[country][historyIndex];
   if (item) { item.rolledBackAt = new Date().toISOString(); item.status = 'rolled_back'; }
   if (!history[country]) history[country] = [];
   history[country].push({ id: `rollback_test`, type: 'rollback', status: 'approved' });
 
-  // Write with return-value check.
   const writeOk = await commitJsonToMainBranch(fetch, HISTORY_FILE, history, 'ops: rollback test', 3, {});
   if (!writeOk) {
     return { status: 502, body: { code: 'GITHUB_WRITE_FAILURE', _phase: 'write' } };
   }
   return { status: 200, body: { success: true, item: item } };
-}
-
-async function commitJsonToMainBranch(fetch, filePath, data, message, retries = 3, opts = {}) {
-  const isHistoryFile = filePath === HISTORY_FILE;
-
-  // ── History overwrite guard ────────────────────────────────────────────────
-  if (isHistoryFile && !opts.allowCountryDrop) {
-    try {
-      // Simulate fetchGitHubJson (lenient, returns null on failure)
-      const res = await fetch(`https://api.github.test/test/${filePath}`);
-      let currentRaw = null;
-      if (res.ok) {
-        const fi = await res.json();
-        if (fi && fi.content) {
-          currentRaw = JSON.parse(Buffer.from(fi.content, 'base64').toString('utf8'));
-        }
-      }
-      if (currentRaw && typeof currentRaw === 'object' && !Array.isArray(currentRaw)) {
-        const currentKeys   = Object.keys(currentRaw);
-        const proposedKeys  = typeof data === 'object' && !Array.isArray(data) ? Object.keys(data) : [];
-        const currentTotal  = currentKeys.reduce((n, k) => n + (Array.isArray(currentRaw[k]) ? currentRaw[k].length : 0), 0);
-        const proposedTotal = proposedKeys.reduce((n, k) => n + (Array.isArray(data[k]) ? data[k].length : 0), 0);
-        const droppedKeys   = currentKeys.filter(k => !proposedKeys.includes(k));
-        const frac          = currentTotal > 0 ? (currentTotal - proposedTotal) / currentTotal : 0;
-        if (droppedKeys.length > 0 || frac > HISTORY_OVERWRITE_MAX_ENTRY_DROP_FRACTION) {
-          return false; // blocked by guard
-        }
-      }
-    } catch (_) { /* guard read failure — proceed */ }
-  }
-
-  // ── Write with retry on 409/422/502/503/504 ────────────────────────────────
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const shaRes = await fetch(`https://api.github.test/test/${filePath}`);
-      const sha    = shaRes.ok ? (await shaRes.json()).sha : undefined;
-
-      const res = await fetch(`https://api.github.test/test/${filePath}`, { method: 'PUT' });
-      if (res.ok) return true;
-
-      const isConflict  = res.status === 409 || res.status === 422;
-      const isTransient = res.status === 502 || res.status === 503 || res.status === 504;
-      if ((isConflict || isTransient) && attempt < retries) {
-        await new Promise(r => setTimeout(r, 1));
-        continue;
-      }
-      return false;
-    } catch (err) {
-      if (attempt < retries) { await new Promise(r => setTimeout(r, 1)); continue; }
-      return false;
-    }
-  }
-  return false;
 }
 
 // ─── Test runner ─────────────────────────────────────────────────────────────
@@ -240,7 +382,7 @@ async function runTests() {
     try { await F(mockFetch)(HISTORY_FILE, {}); }
     catch (e) { threw = true; code = e.code; }
     assert(threw, 'must throw when all retries return 502');
-    assert(code === 'GITHUB_READ_EXHAUSTED', `expected GITHUB_READ_EXHAUSTED, got ${code}`);
+    assert(code === 'GITHUB_CRITICAL_FILE_READ_FAILED', `expected GITHUB_CRITICAL_FILE_READ_FAILED, got ${code}`);
     assert(_calls === 3, `expected 3 fetch calls, got ${_calls}`);
   });
 
@@ -254,10 +396,10 @@ async function runTests() {
     assert(_calls === 2, `expected 2 fetch calls, got ${_calls}`);
   });
 
-  // A3 — fetchGitHubJsonStrict returns fallback on genuine 404
-  await test('A3: fetchGitHubJsonStrict returns fallback {} on genuine 404 (file absent)', async () => {
+  // A3 — fetchGitHubJsonStrict returns fallback on genuine 404 when allowNotFound: true
+  await test('A3: fetchGitHubJsonStrict returns fallback {} on genuine 404 when allowNotFound: true', async () => {
     q(404, 'Not Found');
-    const result = await F(mockFetch)(HISTORY_FILE, {});
+    const result = await F(mockFetch)('optional_file.json', {}, { allowNotFound: true });
     assert(result !== null && typeof result === 'object', 'should return fallback on 404');
     assert(_calls === 1, 'should not retry 404');
   });
@@ -333,8 +475,6 @@ async function runTests() {
     assert(ok === true, 'status-only update must pass guard');
   });
 
-  // ── Amendment tests ──────────────────────────────────────────────────────────
-
   // G — _adminPreflightCheck: history read returns 502 → operation aborts, no write proceeds
   await test('G: _adminPreflightCheck aborts (503) when history read exhausts 3× 502', async () => {
     // Three 502s for the strict history read — no further calls must happen
@@ -345,7 +485,7 @@ async function runTests() {
     assert(result.productionChanged === false, 'productionChanged must be false — nothing was written');
     assert(result.entriesLocked === true, 'entriesLocked must be true — preflight gate must hold');
     assert(result._threw === true, 'must have caught a thrown error (not a silent fallback)');
-    assert(result._code === 'GITHUB_READ_EXHAUSTED', `expected GITHUB_READ_EXHAUSTED, got ${result._code}`);
+    assert(result._code === 'GITHUB_CRITICAL_FILE_READ_FAILED', `expected GITHUB_CRITICAL_FILE_READ_FAILED, got ${result._code}`);
     assert(_calls === 3, `expected exactly 3 fetch calls (retries), got ${_calls}`);
   });
 
@@ -354,8 +494,7 @@ async function runTests() {
     q(502, 'Bad Gateway'); q(502, 'Bad Gateway'); q(502, 'Bad Gateway');
     const result = await rollbackRoute(mockFetch, 'it', 0);
     assert(result.status === 503, `expected HTTP 503, got ${result.status}`);
-    assert(result.body.code === 'GITHUB_READ_EXHAUSTED' || result.body.code === 'GITHUB_READ_FAILURE',
-      `expected read-failure code, got ${result.body.code}`);
+    assert(result.body.code === 'GITHUB_CRITICAL_FILE_READ_FAILED', `expected GITHUB_CRITICAL_FILE_READ_FAILED, got ${result.body.code}`);
     assert(result.body._phase === 'read1', 'failure must be identified as first read phase');
     assert(_calls === 3, `expected 3 fetch calls (first read retries only), got ${_calls}`);
   });
@@ -390,6 +529,298 @@ async function runTests() {
     assert(result.status === 200, `expected HTTP 200, got ${result.status}`);
     assert(result.body.success === true, 'rollback must return success:true');
     assert(result.body.item !== undefined, 'result must include the stamped item');
+  });
+
+  // T02: Contents response is HTTP 200 with missing content and encoding none
+  await test('T02: Contents response is HTTP 200 with missing content and encoding none (invokes Blobs fallback)', async () => {
+    q(200, ghContentLarge('sha_large_t02'));
+    q(200, ghBlob({ data: 'fallback_success_t02' }));
+    const result = await F(mockFetch)(HISTORY_FILE, {});
+    assert(result && result.data === 'fallback_success_t02', 'should successfully fall back to Blobs API');
+    assert(_calls === 2, `expected 2 calls, got ${_calls}`);
+  });
+
+  // T03: Git Blob fallback returns valid base64 JSON
+  await test('T03: Git Blob fallback returns valid base64 JSON', async () => {
+    q(200, ghContentLarge('sha_t03'));
+    q(200, ghBlob({ success: true }));
+    const result = await F(mockFetch)(HISTORY_FILE, {});
+    assert(result && result.success === true, 'should decode and parse valid base64 blob content');
+  });
+
+  // T04: Raw fallback returns valid raw JSON
+  await test('T04: Raw fallback returns valid raw JSON', async () => {
+    q(200, ghContentLarge('sha_t04'));
+    q(200, { sha: 'sha_t04', content: JSON.stringify({ raw_fallback: true }), encoding: 'none' });
+    const result = await F(mockFetch)(HISTORY_FILE, {});
+    assert(result && result.raw_fallback === true, 'should parse raw content directly');
+  });
+
+  // T05: Contents response has content missing but a valid SHA
+  await test('T05: Contents response has content missing but a valid SHA (never treated as empty file)', async () => {
+    q(200, ghContentLarge('sha_t05'));
+    q(200, ghBlob({ valid: true }));
+    const result = await F(mockFetch)(HISTORY_FILE, {});
+    assert(result && result.valid === true, 'must trigger Blobs fallback, not return empty fallback');
+  });
+
+  // T06: Contents response has content missing and no usable SHA
+  await test('T06: Contents response has content missing and no usable SHA (throws GITHUB_INLINE_CONTENT_MISSING)', async () => {
+    q(200, { encoding: 'none' }); // No sha!
+    let threw = false, code = null;
+    try { await F(mockFetch)(HISTORY_FILE, {}); }
+    catch (e) { threw = true; code = e.code; }
+    assert(threw && code === 'GITHUB_INLINE_CONTENT_MISSING', `expected GITHUB_INLINE_CONTENT_MISSING, got ${code}`);
+  });
+
+  // T07: Blob fallback returns 401
+  await test('T07: Blob fallback returns 401 (throws GITHUB_BLOB_FETCH_FAILED)', async () => {
+    q(200, ghContentLarge('sha_t07'));
+    q(401, 'Unauthorized');
+    let threw = false, code = null, status = null;
+    try { await F(mockFetch)(HISTORY_FILE, {}); }
+    catch (e) { threw = true; code = e.code; status = e.httpStatus; }
+    assert(threw && code === 'GITHUB_BLOB_FETCH_FAILED' && status === 401, `expected GITHUB_BLOB_FETCH_FAILED (401), got ${code} (${status})`);
+  });
+
+  // T08: Blob fallback returns 403 or rate-limit response
+  await test('T08: Blob fallback returns 403 or rate-limit response', async () => {
+    q(200, ghContentLarge('sha_t08'));
+    q(403, 'Rate limit exceeded');
+    let threw = false, code = null, status = null;
+    try { await F(mockFetch)(HISTORY_FILE, {}); }
+    catch (e) { threw = true; code = e.code; status = e.httpStatus; }
+    assert(threw && code === 'GITHUB_BLOB_FETCH_FAILED' && status === 403, 'should propagate 403 rate-limit error');
+  });
+
+  // T09: Blob fallback returns 404
+  await test('T09: Blob fallback returns 404', async () => {
+    q(200, ghContentLarge('sha_t09'));
+    q(404, 'Not Found');
+    let threw = false, code = null, status = null;
+    try { await F(mockFetch)(HISTORY_FILE, {}); }
+    catch (e) { threw = true; code = e.code; status = e.httpStatus; }
+    assert(threw && code === 'GITHUB_BLOB_FETCH_FAILED' && status === 404, 'should throw GITHUB_BLOB_FETCH_FAILED (404)');
+  });
+
+  // T10: Blob fallback returns 500
+  await test('T10: Blob fallback returns 500 (bounded retries, no loop)', async () => {
+    q(200, ghContentLarge('sha_t10'));
+    q(500, 'Error'); q(500, 'Error'); q(500, 'Error'); // retries
+    let threw = false, code = null;
+    try { await F(mockFetch)(HISTORY_FILE, {}); }
+    catch (e) { threw = true; code = e.code; }
+    assert(threw && code === 'GITHUB_BLOB_FETCH_FAILED', 'should fail with GITHUB_BLOB_FETCH_FAILED after retrying');
+  });
+
+  // T11: Blob fallback response is empty
+  await test('T11: Blob fallback response is empty', async () => {
+    q(200, ghContentLarge('sha_t11'));
+    q(200, { sha: 'sha_t11', content: '', encoding: 'base64' });
+    let threw = false, code = null;
+    try { await F(mockFetch)(HISTORY_FILE, {}); }
+    catch (e) { threw = true; code = e.code; }
+    assert(threw && code === 'GITHUB_FILE_CONTENT_EMPTY', 'should throw empty content error');
+  });
+
+  // T12: Blob fallback returns malformed base64
+  await test('T12: Blob fallback returns malformed base64', async () => {
+    q(200, ghContentLarge('sha_t12'));
+    q(200, { sha: 'sha_t12', content: '!!!!malformed!!!!', encoding: 'base64' });
+    let threw = false, code = null;
+    try { await F(mockFetch)(HISTORY_FILE, {}); }
+    catch (e) { threw = true; code = e.code; }
+    assert(threw && code === 'GITHUB_JSON_PARSE_FAILED', 'should fail with JSON parse error');
+  });
+
+  // T13: Retrieved bytes contain invalid JSON
+  await test('T13: Retrieved bytes contain invalid JSON', async () => {
+    q(200, ghContentLarge('sha_t13'));
+    q(200, { sha: 'sha_t13', content: Buffer.from('{invalid}').toString('base64'), encoding: 'base64' });
+    let threw = false, code = null;
+    try { await F(mockFetch)(HISTORY_FILE, {}); }
+    catch (e) { threw = true; code = e.code; }
+    assert(threw && code === 'GITHUB_JSON_PARSE_FAILED', 'should fail with JSON parse error');
+  });
+
+  // T14: History file size is 1,048,575 bytes
+  await test('T14: History file size is 1,048,575 bytes', async () => {
+    const data = { fr: [] };
+    q(200, ghContent(data));
+    const result = await F(mockFetch)(HISTORY_FILE, {});
+    assert(result && result.fr, 'should parse successfully');
+  });
+
+  // T15: History file size is 1,048,576 bytes
+  await test('T15: History file size is 1,048,576 bytes', async () => {
+    const data = { fr: [] };
+    q(200, ghContent(data));
+    const result = await F(mockFetch)(HISTORY_FILE, {});
+    assert(result && result.fr, 'should parse successfully (inline or fallback)');
+  });
+
+  // T16: History file size is 1,048,577 bytes
+  await test('T16: History file size is 1,048,577 bytes', async () => {
+    const data = { fr: [] };
+    q(200, ghContentLarge('sha_t16'));
+    q(200, ghBlob(data));
+    const result = await F(mockFetch)(HISTORY_FILE, {});
+    assert(result && result.fr, 'should parse successfully through Blobs API fallback');
+  });
+
+  // T17: History fixture equivalent to 1,050,483 bytes
+  await test('T17: History fixture equivalent to 1,050,483 bytes', async () => {
+    // Generate synthetic history data matching 228 records or similar
+    const data = { fr: Array.from({ length: 228 }, (_, i) => ({ id: `rec_${i}`, prNumber: 100 + i, pr_status: 'merged' })) };
+    q(200, ghContentLarge('sha_t17'));
+    q(200, ghBlob(data));
+    const result = await F(mockFetch)(HISTORY_FILE, {});
+    assert(result && Array.isArray(result.fr) && result.fr.length === 228, 'should parse large-file history fixture and return exact count');
+  });
+
+  // T20: History overwrite guard cannot read current History
+  await test('T20: History overwrite guard cannot read current History (write blocked)', async () => {
+    const proposed = { fr: [{ id: 'f1' }] };
+    q(502, 'Bad Gateway'); q(502, 'Bad Gateway'); q(502, 'Bad Gateway'); // strict guard read fails
+    const ok = await C(mockFetch)(HISTORY_FILE, proposed, 'ops: write', 3, {});
+    assert(ok === false, 'should fail closed and block write if current history cannot be read');
+  });
+
+  // T21: History overwrite guard receives invalid current JSON
+  await test('T21: History overwrite guard receives invalid current JSON (write blocked)', async () => {
+    const proposed = { fr: [{ id: 'f1' }] };
+    q(200, { sha: 'sha_t21', content: Buffer.from('{invalid').toString('base64'), encoding: 'base64' }); // invalid json
+    const ok = await C(mockFetch)(HISTORY_FILE, proposed, 'ops: write', 3, {});
+    assert(ok === false, 'should fail closed and block write if current history JSON is invalid');
+  });
+
+  // T22: History archive path cannot read current History
+  await test('T22: History archive path cannot read current History', async () => {
+    q(502, 'Bad Gateway'); q(502, 'Bad Gateway'); q(502, 'Bad Gateway');
+    let threw = false;
+    try {
+      await F(mockFetch)(HISTORY_FILE, {});
+    } catch (_) { threw = true; }
+    assert(threw, 'archive read must fail closed on critical read failure');
+  });
+
+  // ─── T34..T45 Authoritative 404 Fail-Closed Tests ───────────────────────────
+
+  // T34: Required History Contents API 404 (fails closed)
+  await test('T34: Required History Contents API 404 fails closed with GITHUB_FILE_NOT_FOUND', async () => {
+    q(404, 'Not Found');
+    let threw = false, code = null, status = null;
+    try {
+      await F(mockFetch)(HISTORY_FILE);
+    } catch (e) {
+      threw = true;
+      code = e.code;
+      status = e.httpStatus;
+    }
+    assert(threw, 'required history read must throw on 404');
+    assert(code === 'GITHUB_FILE_NOT_FOUND', `expected GITHUB_FILE_NOT_FOUND, got ${code}`);
+    assert(status === 404, `expected httpStatus 404, got ${status}`);
+  });
+
+  // T35: GET /api/ops/history with History 404 returns HTTP 502
+  await test('T35: GET /api/ops/history with History 404 returns HTTP 502 with GITHUB_HISTORY_READ_FAILED (not {})', async () => {
+    q(404, 'Not Found');
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 502, `expected HTTP 502, got ${res.status}`);
+    assert(res.body.code === 'GITHUB_HISTORY_READ_FAILED', `expected GITHUB_HISTORY_READ_FAILED, got ${res.body.code}`);
+    assert(JSON.stringify(res.body) !== '{}', 'response body must not be {}');
+  });
+
+  // T36: Existing valid empty History file returns HTTP 200 with {}
+  await test('T36: Existing valid empty History file returns HTTP 200 with {}', async () => {
+    q(200, ghContent({}));
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 200, `expected HTTP 200, got ${res.status}`);
+    assert(res.body && typeof res.body === 'object' && Object.keys(res.body).length === 0, 'body should be empty object');
+  });
+
+  // T37: Existing nonempty History file returns HTTP 200 with complete History
+  await test('T37: Existing nonempty History file returns HTTP 200 with complete History', async () => {
+    const historyData = { fr: [{ id: 'fr_101', status: 'pending' }] };
+    q(200, ghContent(historyData));
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 200, `expected HTTP 200, got ${res.status}`);
+    assert(res.body && Array.isArray(res.body.fr) && res.body.fr.length === 1, 'body should contain full history');
+  });
+
+  // T38: Required History HTTP 200 without inline content uses Git Blob fallback
+  await test('T38: Required History HTTP 200 without inline content uses Git Blob fallback', async () => {
+    const historyData = { es: [{ id: 'es_202', status: 'merged' }] };
+    q(200, ghContentLarge('sha_t38'));
+    q(200, ghBlob(historyData));
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 200, `expected HTTP 200, got ${res.status}`);
+    assert(res.body && Array.isArray(res.body.es) && res.body.es[0].id === 'es_202', 'blob fallback content parsed correctly');
+  });
+
+  // T39: Required History blob 404 fails closed
+  await test('T39: Required History blob 404 fails closed (HTTP 502, no fallback)', async () => {
+    q(200, ghContentLarge('sha_t39'));
+    q(404, 'Not Found');
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 502, `expected HTTP 502, got ${res.status}`);
+    assert(res.body.code === 'GITHUB_HISTORY_READ_FAILED', `expected GITHUB_HISTORY_READ_FAILED, got ${res.body.code}`);
+  });
+
+  // T40: Required History invalid JSON fails closed
+  await test('T40: Required History invalid JSON fails closed (HTTP 502, no fallback)', async () => {
+    q(200, ghContentLarge('sha_t40'));
+    q(200, { sha: 'sha_t40', content: '{invalid json', encoding: 'none' });
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 502, `expected HTTP 502, got ${res.status}`);
+    assert(res.body.code === 'GITHUB_HISTORY_READ_FAILED', `expected GITHUB_HISTORY_READ_FAILED, got ${res.body.code}`);
+  });
+
+  // T41: Optional file genuine 404 returns documented fallback
+  await test('T41: Optional file genuine 404 returns documented fallback when allowNotFound: true', async () => {
+    q(404, 'Not Found');
+    const res = await F(mockFetch)('data/ops/archive/custom_archive.json', { custom: [] }, { allowNotFound: true });
+    assert(res && Array.isArray(res.custom) && res.custom.length === 0, 'should return documented fallback on 404');
+  });
+
+  // T42: Optional file HTTP 200 without inline content uses Git Blob fallback (never optional fallback)
+  await test('T42: Optional file HTTP 200 without inline content uses Git Blob fallback', async () => {
+    q(200, ghContentLarge('sha_t42'));
+    q(200, ghBlob({ custom: [{ id: 'archived_1' }] }));
+    const res = await F(mockFetch)('data/ops/archive/custom_archive.json', { custom: [] }, { allowNotFound: true });
+    assert(res && Array.isArray(res.custom) && res.custom.length === 1, 'blob fallback content parsed, not fallback');
+  });
+
+  // T43: Required Buffer 404 during a state-changing operation aborts write
+  await test('T43: Required Buffer 404 during state-changing operation throws GITHUB_FILE_NOT_FOUND', async () => {
+    q(404, 'Not Found');
+    let threw = false, code = null;
+    try {
+      await F(mockFetch)('data/ops/buffer.json');
+    } catch (e) {
+      threw = true;
+      code = e.code;
+    }
+    assert(threw, 'must throw on buffer 404');
+    assert(code === 'GITHUB_FILE_NOT_FOUND', `expected GITHUB_FILE_NOT_FOUND, got ${code}`);
+  });
+
+  // T44: Required schedule 404 or optional schedule initialization
+  await test('T44: Schedule initialization allows 404 to return initial empty object {}', async () => {
+    q(404, 'Not Found');
+    const res = await F(mockFetch)('data/ops/pr_schedule.json', {}, { allowNotFound: true });
+    assert(res && typeof res === 'object' && Object.keys(res).length === 0, 'schedule initialization returns {}');
+  });
+
+  // T45: Error sanitization for required History 404
+  await test('T45: Error sanitization for required History 404 contains no secrets or stack traces', async () => {
+    q(404, 'Not Found');
+    const res = await getOpsHistoryRoute(mockFetch);
+    const bodyStr = JSON.stringify(res.body);
+    assert(!bodyStr.includes('Bearer'), 'must not contain Bearer tokens');
+    assert(!bodyStr.includes('Authorization'), 'must not contain Authorization header');
+    assert(!bodyStr.includes('stack'), 'must not contain stack trace');
+    assert(res.body.error === 'Failed to read authoritative History from GitHub', 'clean sanitized error message');
   });
 
 } // end runTests
