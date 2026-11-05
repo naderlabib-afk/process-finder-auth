@@ -287,13 +287,16 @@ async function getGitHubFileContent(filePath, { retries = 3 } = {}) {
  * pr_schedule) where a failed read must abort the operation rather than
  * silently fall back to an empty object that could be written back as valid state.
  */
+/**
+ * Fetches a JSON file from GitHub and returns its parsed content.
+ * Returns fallback if the file does not exist or cannot be parsed.
+ *
+ * Transparently wraps fetchGitHubJsonStrict so that large files (>1 MiB)
+ * are safely read using the Git Blobs API fallback.
+ */
 async function fetchGitHubJson(filePath, fallback = null) {
   try {
-    const fileInfo = await getGitHubFileContent(filePath);
-    if (!fileInfo || !fileInfo.content) return fallback;
-    const raw = Buffer.from(fileInfo.content, 'base64').toString('utf8');
-    const content = raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
-    return JSON.parse(content);
+    return await fetchGitHubJsonStrict(filePath, fallback);
   } catch (err) {
     console.error(`[GitHub] fetchGitHubJson failed for "${filePath}":`, err.message);
     return fallback;
@@ -305,20 +308,13 @@ async function fetchGitHubJson(filePath, fallback = null) {
  *
  * Unlike fetchGitHubJson, this function:
  *   - Never silently returns a fallback on a GitHub read failure.
- *   - Throws a structured GitHubReadError if the file cannot be loaded after
+ *   - Throws a structured error if the file cannot be loaded after
  *     retries, so the caller is forced to handle the failure explicitly.
  *   - Still returns the fallback when the file genuinely does not exist on
  *     GitHub (HTTP 404), because "file missing" is a real, safe state.
- *
- * Critical files that MUST use this helper:
- *   data/ops/history.json
- *   data/ops/buffer.json     (in _moveBufToHistoryAfterPR / _moveBufToHistoryAfterAppend)
- *   data/ops/pr_schedule.json (schedule executor)
- *
- * @param {string} filePath     GitHub-relative path
- * @param {*}      fallback     Value returned only on genuine 404 (file not yet created)
- * @returns {Promise<*>}        Parsed JSON, or fallback on 404
- * @throws  {Error}             If the read fails for any reason other than 404
+ *   - Correctly handles large files (>1 MiB) where the Contents API
+ *     returns metadata and a file SHA but no inline content, by falling
+ *     back to the Git Blobs API.
  */
 async function fetchGitHubJsonStrict(filePath, fallback = null) {
   let lastStatus = null;
@@ -336,21 +332,123 @@ async function fetchGitHubJsonStrict(filePath, fallback = null) {
 
       if (res.ok) {
         const fileInfo = await res.json();
-        if (!fileInfo || !fileInfo.content) {
-          // Unexpected: GitHub returned 200 but no content field
+        if (!fileInfo) {
           throw Object.assign(
-            new Error(`GitHub returned 200 but no content for "${filePath}"`),
-            { code: 'GITHUB_EMPTY_CONTENT', filePath }
+            new Error(`GitHub returned 200 but no data for "${filePath}"`),
+            { code: 'GITHUB_CONTENTS_FETCH_FAILED', filePath }
           );
         }
-        const raw     = Buffer.from(fileInfo.content, 'base64').toString('utf8');
-        const cleaned = raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
-        return JSON.parse(cleaned);
+
+        const isInlineMissing = !fileInfo.content || fileInfo.encoding === 'none';
+
+        let rawContent;
+        if (isInlineMissing) {
+          if (!fileInfo.sha) {
+            throw Object.assign(
+              new Error(`GitHub returned 200 with missing content and no SHA for "${filePath}"`),
+              { code: 'GITHUB_INLINE_CONTENT_MISSING', filePath }
+            );
+          }
+
+          // Large file condition - fallback to Git Blobs API
+          console.warn(`[GitHub] Large file detected for "${filePath}" (SHA: ${fileInfo.sha}) — fetching via Git Blobs API`);
+
+          let blobRes;
+          let blobLastStatus = null;
+          let blobLastErr = null;
+
+          for (let blobAttempt = 1; blobAttempt <= 3; blobAttempt++) {
+            try {
+              blobRes = await fetch(
+                `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/blobs/${fileInfo.sha}`,
+                { headers: ghHeaders() }
+              );
+
+              if (blobRes.status === 404) {
+                throw Object.assign(
+                  new Error(`Git Blob not found for "${filePath}" (SHA: ${fileInfo.sha})`),
+                  { code: 'GITHUB_BLOB_FETCH_FAILED', filePath, httpStatus: 404 }
+                );
+              }
+
+              if (blobRes.ok) {
+                break;
+              }
+
+              blobLastStatus = blobRes.status;
+
+              if (blobRes.status === 502 || blobRes.status === 503 || blobRes.status === 504) {
+                if (blobAttempt < 3) {
+                  console.warn(`[GitHub] fetch Blob transient ${blobRes.status} for "${filePath}" (attempt ${blobAttempt}/3) — retrying`);
+                  await new Promise(r => setTimeout(r, 400 * blobAttempt));
+                  continue;
+                }
+              }
+
+              const blobBody = await blobRes.text().catch(() => '');
+              throw Object.assign(
+                new Error(`Git Blob fetch failed for "${filePath}": HTTP ${blobRes.status} — ${blobBody.slice(0, 200)}`),
+                { code: 'GITHUB_BLOB_FETCH_FAILED', filePath, httpStatus: blobRes.status }
+              );
+            } catch (bErr) {
+              if (bErr.code === 'GITHUB_BLOB_FETCH_FAILED') throw bErr;
+              blobLastErr = bErr;
+              if (blobAttempt < 3) {
+                console.warn(`[GitHub] fetch Blob threw for "${filePath}" (attempt ${blobAttempt}/3): ${bErr.message} — retrying`);
+                await new Promise(r => setTimeout(r, 400 * blobAttempt));
+                continue;
+              }
+            }
+          }
+
+          if (!blobRes || !blobRes.ok) {
+            const bMsg = blobLastErr
+              ? `Git Blob fetch failed for "${filePath}" after 3 attempts: ${blobLastErr.message}`
+              : `Git Blob fetch failed for "${filePath}" after 3 attempts: HTTP ${blobLastStatus}`;
+            throw Object.assign(
+              new Error(bMsg),
+              { code: 'GITHUB_BLOB_FETCH_FAILED', filePath, httpStatus: blobLastStatus }
+            );
+          }
+
+          const blobInfo = await blobRes.json();
+          if (!blobInfo || blobInfo.content === undefined || blobInfo.content === null) {
+            throw Object.assign(
+              new Error(`Git Blob returned empty content for "${filePath}"`),
+              { code: 'GITHUB_FILE_CONTENT_EMPTY', filePath }
+            );
+          }
+
+          if (blobInfo.encoding === 'base64') {
+            rawContent = Buffer.from(blobInfo.content, 'base64').toString('utf8');
+          } else {
+            rawContent = blobInfo.content;
+          }
+
+          if (!rawContent || rawContent.trim() === '') {
+            throw Object.assign(
+              new Error(`Git Blob decoded content is empty for "${filePath}"`),
+              { code: 'GITHUB_FILE_CONTENT_EMPTY', filePath }
+            );
+          }
+        } else {
+          // Standard inline content
+          rawContent = Buffer.from(fileInfo.content, 'base64').toString('utf8');
+        }
+
+        const cleaned = rawContent.charCodeAt(0) === 0xFEFF ? rawContent.slice(1) : rawContent;
+        try {
+          return JSON.parse(cleaned);
+        } catch (jsonErr) {
+          throw Object.assign(
+            new Error(`JSON parse failed for "${filePath}": ${jsonErr.message}`),
+            { code: 'GITHUB_JSON_PARSE_FAILED', filePath }
+          );
+        }
       }
 
       lastStatus = res.status;
 
-      // Transient gateway errors — retry with backoff; on last attempt fall through to EXHAUSTED
       if (res.status === 502 || res.status === 503 || res.status === 504) {
         lastStatus = res.status;
         if (attempt < 3) {
@@ -358,18 +456,24 @@ async function fetchGitHubJsonStrict(filePath, fallback = null) {
           await new Promise(r => setTimeout(r, 400 * attempt));
           continue;
         }
-        break; // last attempt — fall through to GITHUB_READ_EXHAUSTED below
+        break;
       }
 
-      // Non-transient, non-retryable HTTP failure
       const body = await res.text().catch(() => '');
       throw Object.assign(
         new Error(`GitHub read failed for "${filePath}": HTTP ${res.status} — ${body.slice(0, 200)}`),
-        { code: 'GITHUB_READ_HTTP_ERROR', filePath, httpStatus: res.status }
+        { code: 'GITHUB_CONTENTS_FETCH_FAILED', filePath, httpStatus: res.status }
       );
 
     } catch (err) {
-      if (err.code === 'GITHUB_READ_HTTP_ERROR' || err.code === 'GITHUB_EMPTY_CONTENT') throw err;
+      const isExpectedCode = [
+        'GITHUB_CONTENTS_FETCH_FAILED',
+        'GITHUB_INLINE_CONTENT_MISSING',
+        'GITHUB_BLOB_FETCH_FAILED',
+        'GITHUB_FILE_CONTENT_EMPTY',
+        'GITHUB_JSON_PARSE_FAILED'
+      ].includes(err.code);
+      if (isExpectedCode) throw err;
       lastErr = err;
       if (attempt < 3) {
         console.warn(`[GitHub] fetchGitHubJsonStrict threw for "${filePath}" (attempt ${attempt}/3): ${err.message} — retrying`);
@@ -379,11 +483,10 @@ async function fetchGitHubJsonStrict(filePath, fallback = null) {
     }
   }
 
-  // All retries exhausted
   const msg = lastErr
     ? `GitHub read failed for "${filePath}" after 3 attempts: ${lastErr.message}`
     : `GitHub read failed for "${filePath}" after 3 attempts: HTTP ${lastStatus}`;
-  throw Object.assign(new Error(msg), { code: 'GITHUB_READ_EXHAUSTED', filePath, httpStatus: lastStatus });
+  throw Object.assign(new Error(msg), { code: 'GITHUB_CRITICAL_FILE_READ_FAILED', filePath, httpStatus: lastStatus });
 }
 
 /**
@@ -433,18 +536,14 @@ async function _readUsersConfigStrict() {
     raw = await fetchGitHubJsonStrict(FILE_PATH);
   } catch (err) {
     let result;
-    if (err.code === 'GITHUB_READ_HTTP_ERROR') {
+    if (err.code === 'GITHUB_READ_HTTP_ERROR' || err.code === 'GITHUB_CONTENTS_FETCH_FAILED') {
       // Non-retryable HTTP failure (401/403/etc.) — thrown immediately, no retry.
       result = _unavailable(502, err.httpStatus);
-    } else if (err.code === 'GITHUB_EMPTY_CONTENT') {
+    } else if (err.code === 'GITHUB_EMPTY_CONTENT' || err.code === 'GITHUB_INLINE_CONTENT_MISSING' || err.code === 'GITHUB_FILE_CONTENT_EMPTY' || err.code === 'GITHUB_JSON_PARSE_FAILED') {
       // GitHub returned 200 but no content field — malformed upstream response.
       result = _invalid();
-    } else if (err.code === 'GITHUB_READ_EXHAUSTED') {
-      // Retries exhausted. httpStatus is set only when the exhaustion was
-      // caused by real transient 502/503/504 responses; it stays null when
-      // the failure was a JSON.parse error on an otherwise-200 response
-      // (see fetchGitHubJsonStrict — lastStatus is never assigned inside
-      // the res.ok branch), so we can reliably tell the two cases apart.
+    } else if (err.code === 'GITHUB_READ_EXHAUSTED' || err.code === 'GITHUB_CRITICAL_FILE_READ_FAILED' || err.code === 'GITHUB_BLOB_FETCH_FAILED') {
+      // Retries exhausted.
       result = err.httpStatus ? _unavailable(503, err.httpStatus) : _invalid();
     } else {
       // Unknown/unexpected error shape — fail safe as "unavailable", never
@@ -803,14 +902,44 @@ async function commitJsonToMainBranch(filePath, data, message, _retries = 3, opt
   // If this check fails, abort immediately without touching GitHub.
   if (isHistoryFile && !opts.allowCountryDrop) {
     try {
-      const currentRaw = await fetchGitHubJson(_HISTORY_FILE, null);
-      if (currentRaw && typeof currentRaw === 'object' && !Array.isArray(currentRaw)) {
-        const currentKeys    = Object.keys(currentRaw);
-        const proposedKeys   = (typeof data === 'object' && !Array.isArray(data)) ? Object.keys(data) : [];
-        const currentTotal   = currentKeys.reduce((n, k) => n + (Array.isArray(currentRaw[k]) ? currentRaw[k].length : 0), 0);
-        const proposedTotal  = proposedKeys.reduce((n, k) => n + (Array.isArray(data[k]) ? data[k].length : 0), 0);
-        const droppedKeys    = currentKeys.filter(k => !proposedKeys.includes(k));
-        const entryDropFrac  = currentTotal > 0 ? (currentTotal - proposedTotal) / currentTotal : 0;
+      // Load current History through the robust strict path; if retrieval/JSON parsing fails, it throws
+      const currentRaw = await fetchGitHubJsonStrict(_HISTORY_FILE, null);
+      if (currentRaw !== null) {
+        if (typeof currentRaw !== 'object' || Array.isArray(currentRaw)) {
+          _logGitHubCriticalFailure({
+            operation:  'commitJsonToMainBranch/history-overwrite-guard',
+            filePath,
+            country:    opts.country   || null,
+            user:       opts.user      || null,
+            prNumber:   opts.prNumber  || null,
+            outcome:    'aborted',
+            detail:     `BLOCKED: Current History is structurally invalid (not an object). Cannot establish record count.`
+          });
+          return false;
+        }
+
+        const currentKeys  = Object.keys(currentRaw);
+        const proposedKeys = (typeof data === 'object' && !Array.isArray(data)) ? Object.keys(data) : [];
+
+        // Check if the current record count cannot be established
+        const hasInvalidArrays = currentKeys.some(k => !Array.isArray(currentRaw[k]));
+        if (hasInvalidArrays) {
+          _logGitHubCriticalFailure({
+            operation:  'commitJsonToMainBranch/history-overwrite-guard',
+            filePath,
+            country:    opts.country   || null,
+            user:       opts.user      || null,
+            prNumber:   opts.prNumber  || null,
+            outcome:    'aborted',
+            detail:     `BLOCKED: Current History has invalid non-array entries for some countries. Cannot establish record count.`
+          });
+          return false;
+        }
+
+        const currentTotal  = currentKeys.reduce((n, k) => n + currentRaw[k].length, 0);
+        const proposedTotal = proposedKeys.reduce((n, k) => n + (Array.isArray(data[k]) ? data[k].length : 0), 0);
+        const droppedKeys   = currentKeys.filter(k => !proposedKeys.includes(k));
+        const entryDropFrac = currentTotal > 0 ? (currentTotal - proposedTotal) / currentTotal : 0;
 
         if (droppedKeys.length > 0 || entryDropFrac > _HISTORY_OVERWRITE_MAX_ENTRY_DROP_FRACTION) {
           _logGitHubCriticalFailure({
@@ -826,8 +955,17 @@ async function commitJsonToMainBranch(filePath, data, message, _retries = 3, opt
         }
       }
     } catch (guardErr) {
-      // Guard read failure is non-fatal — log and proceed (the write itself may still be fine)
-      console.warn(`[GitHub] history overwrite guard read failed: ${guardErr.message} — proceeding with write`);
+      // Guard read failure (retrieval or parse) is fatal — block the write and fail closed
+      _logGitHubCriticalFailure({
+        operation:  'commitJsonToMainBranch/history-overwrite-guard',
+        filePath,
+        country:    opts.country   || null,
+        user:       opts.user      || null,
+        prNumber:   opts.prNumber  || null,
+        outcome:    'failed-closed',
+        detail:     `BLOCKED: Overwrite guard check failed to read/parse current History: ${guardErr.message}`
+      });
+      return false;
     }
   }
 
@@ -2048,7 +2186,19 @@ app.get('/api/ops/buffer', requireAuth, async (req, res) => {
 });
 
 app.get('/api/ops/history', requireAuth, async (req, res) => {
-  res.json(await fetchGitHubJson('data/ops/history.json', {}));
+  try {
+    const history = await fetchGitHubJsonStrict('data/ops/history.json', null);
+    if (history === null) {
+      return res.json({});
+    }
+    res.json(history);
+  } catch (err) {
+    console.error('[API] GET /api/ops/history read failure:', err.message);
+    res.status(502).json({
+      error: 'Failed to read authoritative History from GitHub',
+      code: 'GITHUB_HISTORY_READ_FAILED'
+    });
+  }
 });
 
 /**
@@ -2469,7 +2619,7 @@ app.post('/api/ops/buffer', requireAuth, async (req, res) => {
     }
   }
 
-  const buffer = await fetchGitHubJson('data/ops/buffer.json', {});
+  const buffer = await fetchGitHubJsonStrict('data/ops/buffer.json', {});
   if (!buffer[country]) buffer[country] = {};
   if (!buffer[country][user]) buffer[country][user] = [];
 
@@ -2644,7 +2794,7 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
   // If the caller passes the entry id they are saving, check whether another user
   // holds a valid (non-expired) edit lock on that entry.
   if (editEntryId) {
-    const liveBuffer = await fetchGitHubJson('data/ops/buffer.json', {});
+    const liveBuffer = await fetchGitHubJsonStrict('data/ops/buffer.json', {});
     const EDIT_LOCK_TTL_MS = 15 * 60 * 1000; // 15 minutes
     const now = Date.now();
     outer: for (const ck of Object.keys(liveBuffer)) {
@@ -2669,13 +2819,13 @@ app.put('/api/ops/buffer', requireAuth, async (req, res) => {
     }
   }
 
-  const liveBuffer = await fetchGitHubJson('data/ops/buffer.json', {});
+  const liveBuffer = await fetchGitHubJsonStrict('data/ops/buffer.json', {});
 
   // ── Pre-loop: fetch ancillary data needed for per-entry guards ─────────────
   // Fetched once outside the loop to avoid repeated GitHub API calls.
   const [_putSchedule, _putHistory, _putUsers] = await Promise.all([
-    fetchGitHubJson('data/ops/pr_schedule.json', {}),
-    fetchGitHubJson('data/ops/history.json',     {}),
+    fetchGitHubJsonStrict('data/ops/pr_schedule.json', {}),
+    fetchGitHubJsonStrict('data/ops/history.json',     {}),
     fetchGitHubJson('config/users.json',          [])
   ]);
   const _norm = e => (e || '').toLowerCase().trim();
@@ -2873,7 +3023,7 @@ app.patch('/api/ops/buffer/edit-lock', requireAuth, async (req, res) => {
   const EDIT_LOCK_TTL_MS = 15 * 60 * 1000;
   const now = new Date();
 
-  const buffer  = await fetchGitHubJson('data/ops/buffer.json', {});
+  const buffer  = await fetchGitHubJsonStrict('data/ops/buffer.json', {});
   const entries = (buffer[country] && buffer[country][targetUser]) || [];
   const entry   = entries[index];
 
@@ -3096,7 +3246,7 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
   const _cancelScope = await _assertCountryAllowed(req.user, country);
   if (!_cancelScope.ok) return res.status(_cancelScope.status).json({ error: _cancelScope.error });
 
-  const buffer  = await fetchGitHubJson('data/ops/buffer.json', {});
+  const buffer  = await fetchGitHubJsonStrict('data/ops/buffer.json', {});
   const entries = (buffer[country] && buffer[country][targetUser]) || [];
 
   if (!entries[index]) {
@@ -3137,7 +3287,7 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
   }
 
   // ── Scheduled-PR lock guard ──────────────────────────────────────────────────
-  const cancelSchedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+  const cancelSchedule = await fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {});
   const cancelSchedJob = cancelSchedule[country];
   if (cancelSchedJob && Array.isArray(cancelSchedJob.entry_ids) && cancelSchedJob.entry_ids.includes(entry.id)) {
     return res.status(409).json({
@@ -3146,7 +3296,7 @@ app.post('/api/ops/cancel', requireAuth, async (req, res) => {
   }
 
   // ── Open-PR lock guard ───────────────────────────────────────────────────────
-  const cancelHistory = await fetchGitHubJson('data/ops/history.json', {});
+  const cancelHistory = await fetchGitHubJsonStrict('data/ops/history.json', {});
   const cancelIsInOpenPR = (cancelHistory[country] || []).some(
     h => h.pr_status === 'pending_merge' && h.id === entry.id
   );
@@ -3203,7 +3353,7 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
   const targetUser = req.body.user;
   if (!targetUser) return res.status(400).json({ error: 'user field required to identify buffer queue' });
 
-  const buffer  = await fetchGitHubJson('data/ops/buffer.json', {});
+  const buffer  = await fetchGitHubJsonStrict('data/ops/buffer.json', {});
   const entries = (buffer[country] && buffer[country][targetUser]) || [];
   const entry   = entries[index];
 
@@ -3252,7 +3402,7 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
 
   // ── Scheduled-PR lock guard ──────────────────────────────────────────────────
   // Reject modifications to entries that are already frozen by a scheduled PR.
-  const schedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+  const schedule = await fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {});
   const schedJob = schedule[country];
   if (schedJob && Array.isArray(schedJob.entry_ids) && schedJob.entry_ids.includes(entry.id)) {
     return res.status(409).json({
@@ -3262,7 +3412,7 @@ app.post('/api/ops/validate', requireAuth, async (req, res) => {
 
   // ── Open-PR lock guard ───────────────────────────────────────────────────────
   // Reject modifications to entries already submitted into an open PR.
-  const history = await fetchGitHubJson('data/ops/history.json', {});
+  const history = await fetchGitHubJsonStrict('data/ops/history.json', {});
   const isInOpenPR = (history[country] || []).some(
     h => h.pr_status === 'pending_merge' && h.id === entry.id
   );
@@ -4073,8 +4223,8 @@ app.post('/api/admin/remove-country', requireAuth, async (req, res) => {
   // ── 1. Read all data sources from GitHub ─────────────────────────────────
   const [processData, history, buffer, settings, countries] = await Promise.all([
     fetchGitHubJson(`data/processes/${country}.json`, null),
-    fetchGitHubJson('data/ops/history.json', {}),
-    fetchGitHubJson('data/ops/buffer.json', {}),
+    fetchGitHubJsonStrict('data/ops/history.json', {}),
+    fetchGitHubJsonStrict('data/ops/buffer.json', {}),
     fetchGitHubJson('data/ops/settings.json', {}),
     fetchGitHubJson('config/countries.json', [])
   ]);
@@ -4183,7 +4333,7 @@ app.post('/api/ops/archive/history', requireAuth, async (req, res) => {
   }
 
   const [history, archive] = await Promise.all([
-    fetchGitHubJson('data/ops/history.json', {}),
+    fetchGitHubJsonStrict('data/ops/history.json', {}),
     fetchGitHubJson('data/ops/archive/history_archive.json', [])
   ]);
 
@@ -4220,7 +4370,7 @@ app.post('/api/ops/archive/logs', requireAuth, async (req, res) => {
   }
 
   const [history, archive] = await Promise.all([
-    fetchGitHubJson('data/ops/history.json', {}),
+    fetchGitHubJsonStrict('data/ops/history.json', {}),
     fetchGitHubJson('data/ops/archive/logs_archive.json', [])
   ]);
 
@@ -4572,7 +4722,7 @@ async function _preflightAppendCheck(country, newEntries, activePR) {
 
   // 5b. Check history for pending_merge entries for this PR (belt-and-suspenders)
   try {
-    const history = await fetchGitHubJson('data/ops/history.json', {});
+    const history = await fetchGitHubJsonStrict('data/ops/history.json', {});
     const activePRHistory = (history[country] || []).filter(
       h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
     );
@@ -4845,8 +4995,8 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
   }
 
   const [buffer, schedule] = await Promise.all([
-    fetchGitHubJson('data/ops/buffer.json', {}),
-    fetchGitHubJson(PR_SCHEDULE_PATH, {})
+    fetchGitHubJsonStrict('data/ops/buffer.json', {}),
+    fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {})
   ]);
 
   // Block if already scheduled (applies to both Mode A and Mode B)
@@ -4888,7 +5038,7 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
   // The executor also runs _preflightAppendCheck which reads the authoritative
   // PR branch content at execution time (the final safety net).
   if (isAppendMode) {
-    const history = await fetchGitHubJson('data/ops/history.json', {});
+    const history = await fetchGitHubJsonStrict('data/ops/history.json', {});
 
     // Source 1: history entries pending_merge for this PR
     const activePRHistory = (history[country] || []).filter(
@@ -4992,7 +5142,7 @@ app.delete('/api/ops/pr/schedule/:country', requireAuth, async (req, res) => {
   const _undoScope = await _assertCountryAllowed(req.user, country);
   if (!_undoScope.ok) return res.status(_undoScope.status).json({ error: _undoScope.error });
 
-  const schedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+  const schedule = await fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {});
   if (!schedule[country]) {
     return res.status(404).json({ error: 'No scheduled PR found for this country' });
   }
@@ -5642,7 +5792,7 @@ app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
           promoteResult.promoted.forEach(({ staged, final }) => { pathMap[staged] = final; });
           await _rewriteProductionMediaPaths(country, pathMap);
           // Step 3: Update history JSON with rewritten HTML (matchingEntries mutated in-place)
-          const historyPost = await fetchGitHubJson('data/ops/history.json', {});
+          const historyPost = await fetchGitHubJsonStrict('data/ops/history.json', {});
           if (historyPost[country]) {
             matchingEntries.forEach(updated => {
               const idx = historyPost[country].findIndex(h => h.id === updated.id);
@@ -6029,7 +6179,7 @@ app.post('/api/admin/pr/sync-published', requireAuth, async (req, res) => {
     }
 
     // 3. Update History entries
-    const history = await fetchGitHubJson('data/ops/history.json', {});
+    const history = await fetchGitHubJsonStrict('data/ops/history.json', {});
     const matching = (history[country] || []).filter(
       h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
     );
@@ -6114,7 +6264,7 @@ app.post('/api/admin/pr/sync-refused', requireAuth, async (req, res) => {
     }
 
     // 2. Update History entries
-    const history = await fetchGitHubJson('data/ops/history.json', {});
+    const history = await fetchGitHubJsonStrict('data/ops/history.json', {});
     const matching = (history[country] || []).filter(
       h => h.prNumber === prNumber && h.pr_status === 'pending_merge'
     );
@@ -6263,7 +6413,7 @@ app.post('/api/admin/pr/retry-create', requireAuth, async (req, res) => {
 
   try {
     // Re-use the same pre-flight and create flow as approve-and-merge
-    const buffer       = await fetchGitHubJson('data/ops/buffer.json', {});
+    const buffer       = await fetchGitHubJsonStrict('data/ops/buffer.json', {});
     const countryBuf   = buffer[country] || {};
     const allEntries   = Object.values(countryBuf).flat();
     const mergeUsers   = await fetchGitHubJson('config/users.json', []);
@@ -6408,7 +6558,7 @@ async function _runScheduledPRExecutor() {
   }
   _executorRunning = true;
   try {
-    const schedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+    const schedule = await fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {});
     const now      = Date.now();
     const due      = Object.entries(schedule).filter(
       ([, job]) => new Date(job.execute_after).getTime() <= now
@@ -6422,7 +6572,7 @@ async function _runScheduledPRExecutor() {
       console.log(`[PR executor] Executing scheduled ${isAppend ? `append (batch ${job.batch_id})` : 'PR'} for "${country}" (scheduled by ${job.created_by})`);
 
       try {
-        const buffer     = await fetchGitHubJson('data/ops/buffer.json', {});
+        const buffer     = await fetchGitHubJsonStrict('data/ops/buffer.json', {});
         const countryBuf = buffer[country] || {};
         const allEntries = Object.values(countryBuf).flat();
         // Apply role-based scope: executor fires on behalf of the job creator
@@ -6437,7 +6587,7 @@ async function _runScheduledPRExecutor() {
         const scopedPending = scopedAll.filter(e => e.status === 'pending');
 
         // Remove the job from the schedule regardless of outcome — avoids retry loops
-        const freshSchedule = await fetchGitHubJson(PR_SCHEDULE_PATH, {});
+        const freshSchedule = await fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {});
         delete freshSchedule[country];
         await commitJsonToMainBranch(PR_SCHEDULE_PATH, freshSchedule, `ops: complete ${isAppend ? 'append' : 'PR'} schedule job for ${country}`);
 
