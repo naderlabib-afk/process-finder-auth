@@ -45,7 +45,7 @@ function ghBlob(data)    { return { sha: 'sha0_large', content: Buffer.from(JSON
 // These are exact copies of the implementations in server.js.
 // They receive the mockFetch as `fetch` so we can intercept GitHub calls.
 
-async function fetchGitHubJsonStrict(fetch, filePath, fallback = null) {
+async function fetchGitHubJsonStrict(fetch, filePath, fallback = null, { allowNotFound = false } = {}) {
   let lastStatus = null;
   let lastErr    = null;
 
@@ -53,8 +53,16 @@ async function fetchGitHubJsonStrict(fetch, filePath, fallback = null) {
     try {
       const res = await fetch(`https://api.github.test/repos/owner/repo/contents/${filePath}`);
 
-      // File genuinely absent — return fallback (safe; not a transient error)
-      if (res.status === 404) return fallback;
+      // File genuinely absent (HTTP 404)
+      if (res.status === 404) {
+        if (allowNotFound) {
+          return fallback;
+        }
+        throw Object.assign(
+          new Error(`Required GitHub file not found: "${filePath}"`),
+          { code: 'GITHUB_FILE_NOT_FOUND', filePath, httpStatus: 404 }
+        );
+      }
 
       if (res.ok) {
         const fileInfo = await res.json();
@@ -183,6 +191,7 @@ async function fetchGitHubJsonStrict(fetch, filePath, fallback = null) {
 
     } catch (err) {
       const isExpectedCode = [
+        'GITHUB_FILE_NOT_FOUND',
         'GITHUB_CONTENTS_FETCH_FAILED',
         'GITHUB_INLINE_CONTENT_MISSING',
         'GITHUB_BLOB_FETCH_FAILED',
@@ -295,6 +304,21 @@ async function adminPreflightHistoryRead(fetch, country, prNumber) {
   return { ok: true, matchingEntries, historyPre };
 }
 
+async function getOpsHistoryRoute(fetch) {
+  try {
+    const history = await fetchGitHubJsonStrict(fetch, HISTORY_FILE);
+    return { status: 200, body: history };
+  } catch (err) {
+    return {
+      status: 502,
+      body: {
+        error: 'Failed to read authoritative History from GitHub',
+        code: 'GITHUB_HISTORY_READ_FAILED'
+      }
+    };
+  }
+}
+
 async function rollbackRoute(fetch, country, historyIndex) {
   let historyForRead;
   try {
@@ -372,10 +396,10 @@ async function runTests() {
     assert(_calls === 2, `expected 2 fetch calls, got ${_calls}`);
   });
 
-  // A3 — fetchGitHubJsonStrict returns fallback on genuine 404
-  await test('A3: fetchGitHubJsonStrict returns fallback {} on genuine 404 (file absent)', async () => {
+  // A3 — fetchGitHubJsonStrict returns fallback on genuine 404 when allowNotFound: true
+  await test('A3: fetchGitHubJsonStrict returns fallback {} on genuine 404 when allowNotFound: true', async () => {
     q(404, 'Not Found');
-    const result = await F(mockFetch)(HISTORY_FILE, {});
+    const result = await F(mockFetch)('optional_file.json', {}, { allowNotFound: true });
     assert(result !== null && typeof result === 'object', 'should return fallback on 404');
     assert(_calls === 1, 'should not retry 404');
   });
@@ -678,6 +702,125 @@ async function runTests() {
       await F(mockFetch)(HISTORY_FILE, {});
     } catch (_) { threw = true; }
     assert(threw, 'archive read must fail closed on critical read failure');
+  });
+
+  // ─── T34..T45 Authoritative 404 Fail-Closed Tests ───────────────────────────
+
+  // T34: Required History Contents API 404 (fails closed)
+  await test('T34: Required History Contents API 404 fails closed with GITHUB_FILE_NOT_FOUND', async () => {
+    q(404, 'Not Found');
+    let threw = false, code = null, status = null;
+    try {
+      await F(mockFetch)(HISTORY_FILE);
+    } catch (e) {
+      threw = true;
+      code = e.code;
+      status = e.httpStatus;
+    }
+    assert(threw, 'required history read must throw on 404');
+    assert(code === 'GITHUB_FILE_NOT_FOUND', `expected GITHUB_FILE_NOT_FOUND, got ${code}`);
+    assert(status === 404, `expected httpStatus 404, got ${status}`);
+  });
+
+  // T35: GET /api/ops/history with History 404 returns HTTP 502
+  await test('T35: GET /api/ops/history with History 404 returns HTTP 502 with GITHUB_HISTORY_READ_FAILED (not {})', async () => {
+    q(404, 'Not Found');
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 502, `expected HTTP 502, got ${res.status}`);
+    assert(res.body.code === 'GITHUB_HISTORY_READ_FAILED', `expected GITHUB_HISTORY_READ_FAILED, got ${res.body.code}`);
+    assert(JSON.stringify(res.body) !== '{}', 'response body must not be {}');
+  });
+
+  // T36: Existing valid empty History file returns HTTP 200 with {}
+  await test('T36: Existing valid empty History file returns HTTP 200 with {}', async () => {
+    q(200, ghContent({}));
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 200, `expected HTTP 200, got ${res.status}`);
+    assert(res.body && typeof res.body === 'object' && Object.keys(res.body).length === 0, 'body should be empty object');
+  });
+
+  // T37: Existing nonempty History file returns HTTP 200 with complete History
+  await test('T37: Existing nonempty History file returns HTTP 200 with complete History', async () => {
+    const historyData = { fr: [{ id: 'fr_101', status: 'pending' }] };
+    q(200, ghContent(historyData));
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 200, `expected HTTP 200, got ${res.status}`);
+    assert(res.body && Array.isArray(res.body.fr) && res.body.fr.length === 1, 'body should contain full history');
+  });
+
+  // T38: Required History HTTP 200 without inline content uses Git Blob fallback
+  await test('T38: Required History HTTP 200 without inline content uses Git Blob fallback', async () => {
+    const historyData = { es: [{ id: 'es_202', status: 'merged' }] };
+    q(200, ghContentLarge('sha_t38'));
+    q(200, ghBlob(historyData));
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 200, `expected HTTP 200, got ${res.status}`);
+    assert(res.body && Array.isArray(res.body.es) && res.body.es[0].id === 'es_202', 'blob fallback content parsed correctly');
+  });
+
+  // T39: Required History blob 404 fails closed
+  await test('T39: Required History blob 404 fails closed (HTTP 502, no fallback)', async () => {
+    q(200, ghContentLarge('sha_t39'));
+    q(404, 'Not Found');
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 502, `expected HTTP 502, got ${res.status}`);
+    assert(res.body.code === 'GITHUB_HISTORY_READ_FAILED', `expected GITHUB_HISTORY_READ_FAILED, got ${res.body.code}`);
+  });
+
+  // T40: Required History invalid JSON fails closed
+  await test('T40: Required History invalid JSON fails closed (HTTP 502, no fallback)', async () => {
+    q(200, ghContentLarge('sha_t40'));
+    q(200, { sha: 'sha_t40', content: '{invalid json', encoding: 'none' });
+    const res = await getOpsHistoryRoute(mockFetch);
+    assert(res.status === 502, `expected HTTP 502, got ${res.status}`);
+    assert(res.body.code === 'GITHUB_HISTORY_READ_FAILED', `expected GITHUB_HISTORY_READ_FAILED, got ${res.body.code}`);
+  });
+
+  // T41: Optional file genuine 404 returns documented fallback
+  await test('T41: Optional file genuine 404 returns documented fallback when allowNotFound: true', async () => {
+    q(404, 'Not Found');
+    const res = await F(mockFetch)('data/ops/archive/custom_archive.json', { custom: [] }, { allowNotFound: true });
+    assert(res && Array.isArray(res.custom) && res.custom.length === 0, 'should return documented fallback on 404');
+  });
+
+  // T42: Optional file HTTP 200 without inline content uses Git Blob fallback (never optional fallback)
+  await test('T42: Optional file HTTP 200 without inline content uses Git Blob fallback', async () => {
+    q(200, ghContentLarge('sha_t42'));
+    q(200, ghBlob({ custom: [{ id: 'archived_1' }] }));
+    const res = await F(mockFetch)('data/ops/archive/custom_archive.json', { custom: [] }, { allowNotFound: true });
+    assert(res && Array.isArray(res.custom) && res.custom.length === 1, 'blob fallback content parsed, not fallback');
+  });
+
+  // T43: Required Buffer 404 during a state-changing operation aborts write
+  await test('T43: Required Buffer 404 during state-changing operation throws GITHUB_FILE_NOT_FOUND', async () => {
+    q(404, 'Not Found');
+    let threw = false, code = null;
+    try {
+      await F(mockFetch)('data/ops/buffer.json');
+    } catch (e) {
+      threw = true;
+      code = e.code;
+    }
+    assert(threw, 'must throw on buffer 404');
+    assert(code === 'GITHUB_FILE_NOT_FOUND', `expected GITHUB_FILE_NOT_FOUND, got ${code}`);
+  });
+
+  // T44: Required schedule 404 or optional schedule initialization
+  await test('T44: Schedule initialization allows 404 to return initial empty object {}', async () => {
+    q(404, 'Not Found');
+    const res = await F(mockFetch)('data/ops/pr_schedule.json', {}, { allowNotFound: true });
+    assert(res && typeof res === 'object' && Object.keys(res).length === 0, 'schedule initialization returns {}');
+  });
+
+  // T45: Error sanitization for required History 404
+  await test('T45: Error sanitization for required History 404 contains no secrets or stack traces', async () => {
+    q(404, 'Not Found');
+    const res = await getOpsHistoryRoute(mockFetch);
+    const bodyStr = JSON.stringify(res.body);
+    assert(!bodyStr.includes('Bearer'), 'must not contain Bearer tokens');
+    assert(!bodyStr.includes('Authorization'), 'must not contain Authorization header');
+    assert(!bodyStr.includes('stack'), 'must not contain stack trace');
+    assert(res.body.error === 'Failed to read authoritative History from GitHub', 'clean sanitized error message');
   });
 
 } // end runTests

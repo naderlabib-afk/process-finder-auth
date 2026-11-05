@@ -296,7 +296,7 @@ async function getGitHubFileContent(filePath, { retries = 3 } = {}) {
  */
 async function fetchGitHubJson(filePath, fallback = null) {
   try {
-    return await fetchGitHubJsonStrict(filePath, fallback);
+    return await fetchGitHubJsonStrict(filePath, fallback, { allowNotFound: true });
   } catch (err) {
     console.error(`[GitHub] fetchGitHubJson failed for "${filePath}":`, err.message);
     return fallback;
@@ -308,15 +308,23 @@ async function fetchGitHubJson(filePath, fallback = null) {
  *
  * Unlike fetchGitHubJson, this function:
  *   - Never silently returns a fallback on a GitHub read failure.
- *   - Throws a structured error if the file cannot be loaded after
- *     retries, so the caller is forced to handle the failure explicitly.
- *   - Still returns the fallback when the file genuinely does not exist on
- *     GitHub (HTTP 404), because "file missing" is a real, safe state.
+ *   - Throws a structured error if the file cannot be loaded after retries.
+ *   - By default (allowNotFound: false), throws GITHUB_FILE_NOT_FOUND on HTTP 404
+ *     for required authoritative state files (e.g. history.json, buffer.json).
+ *   - When explicitly configured via { allowNotFound: true }, returns the fallback
+ *     value on genuine HTTP 404 (for documented optional/initialization files).
  *   - Correctly handles large files (>1 MiB) where the Contents API
  *     returns metadata and a file SHA but no inline content, by falling
  *     back to the Git Blobs API.
+ *
+ * @param {string}  filePath                GitHub-relative path
+ * @param {*}       [fallback=null]         Value returned only on genuine 404 when allowNotFound is true
+ * @param {Object}  [options={}]            Options object
+ * @param {boolean} [options.allowNotFound=false] Whether genuine 404 is allowed to return fallback
+ * @returns {Promise<*>}                    Parsed JSON, or fallback on 404 (if allowNotFound is true)
+ * @throws  {Error}                         If the read fails or if a required file is 404
  */
-async function fetchGitHubJsonStrict(filePath, fallback = null) {
+async function fetchGitHubJsonStrict(filePath, fallback = null, { allowNotFound = false } = {}) {
   let lastStatus = null;
   let lastErr    = null;
 
@@ -327,8 +335,16 @@ async function fetchGitHubJsonStrict(filePath, fallback = null) {
         { headers: ghHeaders() }
       );
 
-      // File genuinely absent — return fallback (safe; not a transient error)
-      if (res.status === 404) return fallback;
+      // File genuinely absent (HTTP 404)
+      if (res.status === 404) {
+        if (allowNotFound) {
+          return fallback;
+        }
+        throw Object.assign(
+          new Error(`Required GitHub file not found: "${filePath}"`),
+          { code: 'GITHUB_FILE_NOT_FOUND', filePath, httpStatus: 404 }
+        );
+      }
 
       if (res.ok) {
         const fileInfo = await res.json();
@@ -467,6 +483,7 @@ async function fetchGitHubJsonStrict(filePath, fallback = null) {
 
     } catch (err) {
       const isExpectedCode = [
+        'GITHUB_FILE_NOT_FOUND',
         'GITHUB_CONTENTS_FETCH_FAILED',
         'GITHUB_INLINE_CONTENT_MISSING',
         'GITHUB_BLOB_FETCH_FAILED',
@@ -515,6 +532,12 @@ async function fetchGitHubJsonStrict(filePath, fallback = null) {
  */
 async function _readUsersConfigStrict() {
   const FILE_PATH = 'config/users.json';
+  const _missing = () => ({
+    ok: false,
+    status: 500,
+    code: 'CONFIG_MISSING',
+    message: 'The authorization configuration could not be found. Please contact an administrator.'
+  });
   const _unavailable = (status, httpStatus) => ({
     ok: false,
     status,
@@ -531,16 +554,17 @@ async function _readUsersConfigStrict() {
 
   let raw;
   try {
-    // No fallback passed — fetchGitHubJsonStrict defaults fallback to `null`
-    // and returns that fallback ONLY on a genuine GitHub 404 for this path.
     raw = await fetchGitHubJsonStrict(FILE_PATH);
   } catch (err) {
     let result;
-    if (err.code === 'GITHUB_READ_HTTP_ERROR' || err.code === 'GITHUB_CONTENTS_FETCH_FAILED') {
+    if (err.code === 'GITHUB_FILE_NOT_FOUND') {
+      // Required users config file missing entirely -> 500 CONFIG_MISSING
+      result = _missing();
+    } else if (err.code === 'GITHUB_READ_HTTP_ERROR' || err.code === 'GITHUB_CONTENTS_FETCH_FAILED') {
       // Non-retryable HTTP failure (401/403/etc.) — thrown immediately, no retry.
       result = _unavailable(502, err.httpStatus);
     } else if (err.code === 'GITHUB_EMPTY_CONTENT' || err.code === 'GITHUB_INLINE_CONTENT_MISSING' || err.code === 'GITHUB_FILE_CONTENT_EMPTY' || err.code === 'GITHUB_JSON_PARSE_FAILED') {
-      // GitHub returned 200 but no content field — malformed upstream response.
+      // Malformed upstream response.
       result = _invalid();
     } else if (err.code === 'GITHUB_READ_EXHAUSTED' || err.code === 'GITHUB_CRITICAL_FILE_READ_FAILED' || err.code === 'GITHUB_BLOB_FETCH_FAILED') {
       // Retries exhausted.
@@ -2187,10 +2211,7 @@ app.get('/api/ops/buffer', requireAuth, async (req, res) => {
 
 app.get('/api/ops/history', requireAuth, async (req, res) => {
   try {
-    const history = await fetchGitHubJsonStrict('data/ops/history.json', null);
-    if (history === null) {
-      return res.json({});
-    }
+    const history = await fetchGitHubJsonStrict('data/ops/history.json');
     res.json(history);
   } catch (err) {
     console.error('[API] GET /api/ops/history read failure:', err.message);
@@ -4995,8 +5016,8 @@ app.post('/api/ops/pr/schedule', requireAuth, async (req, res) => {
   }
 
   const [buffer, schedule] = await Promise.all([
-    fetchGitHubJsonStrict('data/ops/buffer.json', {}),
-    fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {})
+    fetchGitHubJsonStrict('data/ops/buffer.json'),
+    fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {}, { allowNotFound: true })
   ]);
 
   // Block if already scheduled (applies to both Mode A and Mode B)
@@ -5142,8 +5163,8 @@ app.delete('/api/ops/pr/schedule/:country', requireAuth, async (req, res) => {
   const _undoScope = await _assertCountryAllowed(req.user, country);
   if (!_undoScope.ok) return res.status(_undoScope.status).json({ error: _undoScope.error });
 
-  const schedule = await fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {});
-  if (!schedule[country]) {
+  const schedule = await fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {}, { allowNotFound: true });
+  if (!schedule || !schedule[country]) {
     return res.status(404).json({ error: 'No scheduled PR found for this country' });
   }
 
@@ -6558,7 +6579,7 @@ async function _runScheduledPRExecutor() {
   }
   _executorRunning = true;
   try {
-    const schedule = await fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {});
+    const schedule = await fetchGitHubJsonStrict(PR_SCHEDULE_PATH, {}, { allowNotFound: true });
     const now      = Date.now();
     const due      = Object.entries(schedule).filter(
       ([, job]) => new Date(job.execute_after).getTime() <= now
