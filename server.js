@@ -5812,16 +5812,26 @@ app.post('/api/admin/pr/approve', requireAuth, async (req, res) => {
           const pathMap = {};
           promoteResult.promoted.forEach(({ staged, final }) => { pathMap[staged] = final; });
           await _rewriteProductionMediaPaths(country, pathMap);
-          // Step 3: Update history JSON with rewritten HTML (matchingEntries mutated in-place)
+          // Step 3: Update history JSON with rewritten HTML (matchingEntries mutated in-place).
+          // Process IDs repeat across separate Publish Requests, so each record is targeted
+          // by composite identity (id + prNumber + pr_status) and every target is resolved
+          // and verified BEFORE anything is written. Fail closed: on any doubt, skip the write.
           const historyPost = await fetchGitHubJsonStrict('data/ops/history.json', {});
           if (historyPost[country]) {
-            matchingEntries.forEach(updated => {
-              const idx = historyPost[country].findIndex(h => h.id === updated.id);
-              if (idx !== -1) historyPost[country][idx] = updated;
-            });
-            await commitJsonToMainBranch('data/ops/history.json', historyPost,
-              `ops: rewrite staged→final media refs after PR #${prNumber} approved`
-            ).catch(e => console.warn('[media promote] history rewrite failed:', e.message));
+            const plan = _planApprovedHistoryMediaUpdate(
+              historyPost, country, matchingEntries, prNumber, promoteResult.promoted.map(p => p.staged)
+            );
+            if (plan.ok) {
+              await commitJsonToMainBranch('data/ops/history.json', plan.history,
+                `ops: rewrite staged→final media refs after PR #${prNumber} approved`
+              ).catch(e => console.warn('[media promote] history rewrite failed:', e.message));
+            } else {
+              console.warn(`[media promote] History media-ref rewrite SKIPPED for PR #${prNumber} (${country}): ${plan.code} — ${plan.detail}`);
+              await appendActivityLog({
+                event: 'media-history-target-failed', by: approver, country, prNumber,
+                code: plan.code, detail: plan.detail, expected: matchingEntries.length
+              }).catch(() => {});
+            }
           }
           appendActivityLog({
             event: 'media-promoted', by: approver, country, prNumber,
@@ -6981,6 +6991,71 @@ async function _isMediaReferenced(mediaPath, excludeProcessId = null, excludeBuf
 }
 
 /**
+ * Plan the post-approval History update that writes media-rewritten records back.
+ *
+ * Process IDs legitimately repeat across separate Publish Requests, so a record is
+ * identified by the composite (id + prNumber + pr_status === 'merged'), never by ID
+ * alone. Two phases, no writes here (pure, in-memory):
+ *   1. RESOLVE  — every approved record must map to EXACTLY ONE History index; no two
+ *                 records may share an index. Zero or multiple matches => fail closed.
+ *   2. REPLACE  — apply only to the pre-resolved indexes on a copy, then verify the
+ *                 result before returning it.
+ * Never falls back to ID-only matching and never takes "the first" of several matches.
+ *
+ * @returns {{ok:true, history:Object, indexes:number[]} | {ok:false, code:string, detail:string}}
+ *          `detail` carries ids/indexes only — never process content.
+ */
+function _planApprovedHistoryMediaUpdate(history, country, approvedEntries, prNumber, promotedStagedPaths = []) {
+  const fail = (code, detail) => ({ ok: false, code, detail });
+  const bucket = history && history[country];
+  if (!Array.isArray(bucket)) return fail('BUCKET_MISSING', `no History bucket for country "${country}"`);
+  if (!Array.isArray(approvedEntries) || approvedEntries.length === 0) return fail('NO_APPROVED_ENTRIES', 'no approved entries to resolve');
+  const pr = Number(prNumber);
+  if (!Number.isInteger(pr)) return fail('INVALID_PR_NUMBER', 'prNumber is not an integer');
+
+  // Phase 1 — resolution
+  const indexes = [];
+  const taken = new Set();
+  for (const updated of approvedEntries) {
+    if (!updated || typeof updated.id !== 'string' || !updated.id) return fail('INVALID_ENTRY', 'approved entry has no id');
+    const hits = [];
+    bucket.forEach((h, i) => {
+      if (h && h.id === updated.id && Number(h.prNumber) === pr && h.pr_status === 'merged') hits.push(i);
+    });
+    if (hits.length === 0) return fail('NO_MATCH', `no merged History record for id=${updated.id} prNumber=${pr}`);
+    if (hits.length > 1) return fail('AMBIGUOUS_MATCH', `${hits.length} merged History records for id=${updated.id} prNumber=${pr} at indexes [${hits.join(',')}]`);
+    if (taken.has(hits[0])) return fail('SHARED_INDEX', `two approved entries resolve to index ${hits[0]}`);
+    taken.add(hits[0]);
+    indexes.push(hits[0]);
+  }
+
+  // Phase 2 — replacement on a copy
+  const nextBucket = bucket.slice();
+  approvedEntries.forEach((updated, k) => { nextBucket[indexes[k]] = updated; });
+  const next = Object.assign({}, history, { [country]: nextBucket });
+
+  // Verification before anything may be committed
+  if (nextBucket.length !== bucket.length) return fail('COUNT_CHANGED', 'History record count would change');
+  const targetSet = new Set(indexes);
+  for (let i = 0; i < bucket.length; i++) {
+    if (!targetSet.has(i) && nextBucket[i] !== bucket[i]) return fail('NON_TARGET_CHANGED', `non-target record at index ${i} would change`);
+  }
+  for (const key of Object.keys(history)) {
+    if (key !== country && next[key] !== history[key]) return fail('OTHER_BUCKET_CHANGED', `bucket "${key}" would change`);
+  }
+  const prCount = arr => arr.filter(h => h && Number(h.prNumber) === pr).length;
+  if (prCount(nextBucket) !== prCount(bucket)) return fail('PR_RECORD_COUNT_CHANGED', `records carrying prNumber ${pr} would change`);
+  for (let k = 0; k < indexes.length; k++) {
+    const r = nextBucket[indexes[k]];
+    if (r.id !== approvedEntries[k].id || Number(r.prNumber) !== pr || r.pr_status !== 'merged') return fail('TARGET_IDENTITY_CHANGED', `target index ${indexes[k]} identity mismatch`);
+    const html = (r.process && typeof r.process.process === 'string') ? r.process.process : '';
+    if (promotedStagedPaths.some(sp => html.includes(sp))) return fail('STAGED_PATH_REMAINS', `target index ${indexes[k]} still references a promoted staged path`);
+  }
+  return { ok: true, history: next, indexes };
+}
+
+
+/**
  * Promote staged media files to final paths after Publish Request approval.
  * For each staged src ref in matchingEntries' process HTML:
  *   1. Read staged file from GitHub
@@ -7961,6 +8036,7 @@ if (require.main !== module) {
     _stagedToFinalPath,
     _extractMediaRefs,
     _isAllowedPRPath,
+    _planApprovedHistoryMediaUpdate,
     validateProcessEntry,
     // constants
     MEDIA_MAX_IMAGES_PER_PROCESS: 3,
